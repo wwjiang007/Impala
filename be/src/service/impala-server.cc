@@ -1159,6 +1159,7 @@ void ImpalaServer::SessionState::ToThrift(const TUniqueId& session_id,
   // proxy user is authorized to delegate as this user.
   if (!do_as_user.empty()) state->__set_delegated_user(do_as_user);
   state->network_address = network_address;
+  state->__set_kudu_latest_observed_ts(kudu_latest_observed_ts);
 }
 
 void ImpalaServer::CancelFromThreadPool(uint32_t thread_id,
@@ -1598,7 +1599,11 @@ ImpalaServer::QueryStateRecord::QueryStateRecord(const QueryExecState& exec_stat
   }
 
   // Save the query fragments so that the plan can be visualised.
-  fragments = exec_state.exec_request().query_exec_request.fragments;
+  for (const TPlanExecInfo& plan_exec_info:
+      exec_state.exec_request().query_exec_request.plan_exec_info) {
+    fragments.insert(fragments.end(),
+        plan_exec_info.fragments.begin(), plan_exec_info.fragments.end());
+  }
   all_rows_returned = exec_state.eos();
   last_active_time = exec_state.last_active();
 }
@@ -1625,6 +1630,8 @@ void ImpalaServer::ConnectionStart(
     session_state->session_type = TSessionType::BEESWAX;
     session_state->network_address = connection_context.network_address;
     session_state->default_query_options = default_query_options_;
+    session_state->kudu_latest_observed_ts = 0;
+
     // If the username was set by a lower-level transport, use it.
     if (!connection_context.username.empty()) {
       session_state->connected_user = connection_context.username;

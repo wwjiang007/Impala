@@ -379,8 +379,7 @@ Status ImpalaServer::QueryExecState::ExecLocalCatalogOp(
 Status ImpalaServer::QueryExecState::ExecQueryOrDmlRequest(
     const TQueryExecRequest& query_exec_request) {
   // we always need at least one plan fragment
-  DCHECK(query_exec_request.fragments.size() > 0
-      || query_exec_request.mt_plan_exec_info.size() > 0);
+  DCHECK(query_exec_request.plan_exec_info.size() > 0);
 
   if (query_exec_request.__isset.query_plan) {
     stringstream plan_ss;
@@ -426,11 +425,6 @@ Status ImpalaServer::QueryExecState::ExecQueryOrDmlRequest(
     }
     summary_profile_.AddInfoString(TABLES_WITH_CORRUPT_STATS_KEY, ss.str());
   }
-
-  bool is_mt_exec = query_exec_request.query_ctx.request.query_options.mt_dop > 0;
-  const TPlanFragment& fragment = is_mt_exec
-      ? query_exec_request.mt_plan_exec_info[0].fragments[0]
-      : query_exec_request.fragments[0];
 
   {
     lock_guard<mutex> l(lock_);
@@ -537,6 +531,15 @@ void ImpalaServer::QueryExecState::Done() {
   query_events_->MarkEvent("Unregister query");
 
   if (coord_.get() != NULL) {
+    // Update latest observed Kudu timestamp stored in the session.
+    uint64_t latest_kudu_ts = coord_->GetLatestKuduInsertTimestamp();
+    if (latest_kudu_ts > 0) {
+      VLOG_RPC << "Updating session latest observed Kudu timestamp: " << latest_kudu_ts;
+      lock_guard<mutex> session_lock(session_->lock);
+      session_->kudu_latest_observed_ts = std::max<uint64_t>(
+          session_->kudu_latest_observed_ts, latest_kudu_ts);
+    }
+
     // Release any reserved resources.
     Status status = exec_env_->scheduler()->Release(schedule_.get());
     if (!status.ok()) {
@@ -956,7 +959,7 @@ void ImpalaServer::QueryExecState::SetCreateTableAsSelectResultSet() {
   if (catalog_op_executor_->ddl_exec_response()->new_table_created) {
     DCHECK(coord_.get());
     for (const PartitionStatusMap::value_type& p: coord_->per_partition_status()) {
-      total_num_rows_inserted += p.second.num_appended_rows;
+      total_num_rows_inserted += p.second.num_modified_rows;
     }
   }
   const string& summary_msg = Substitute("Inserted $0 row(s)", total_num_rows_inserted);

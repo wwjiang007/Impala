@@ -154,17 +154,59 @@ bool BloomFilter::BucketFind(
   return true;
 }
 
+namespace {
+// Computes out[i] |= in[i] for the arrays 'in' and 'out' of length 'n' using AVX
+// instructions. 'n' must be a multiple of 32.
+void __attribute__((target("avx")))
+OrEqualArrayAvx(size_t n, const char* __restrict__ in, char* __restrict__ out) {
+  constexpr size_t AVX_REGISTER_BYTES = sizeof(__m256d);
+  DCHECK_EQ(n % AVX_REGISTER_BYTES, 0) << "Invalid Bloom Filter directory size";
+  const char* const in_end = in + n;
+  for (; in != in_end; (in += AVX_REGISTER_BYTES), (out += AVX_REGISTER_BYTES)) {
+    const double* double_in = reinterpret_cast<const double*>(in);
+    double* double_out = reinterpret_cast<double*>(out);
+    _mm256_storeu_pd(double_out,
+        _mm256_or_pd(_mm256_loadu_pd(double_out), _mm256_loadu_pd(double_in)));
+  }
+}
+} //namespace
 
 void BloomFilter::Or(const TBloomFilter& in, TBloomFilter* out) {
   DCHECK(out != NULL);
   DCHECK_EQ(in.log_heap_space, out->log_heap_space);
+  if (&in == out) return;
   out->always_true |= in.always_true;
   if (out->always_true) {
     out->directory.resize(0);
     return;
   }
-
-  for (int i = 0; i < in.directory.size(); ++i) out->directory[i] |= in.directory[i];
+  DCHECK_EQ(in.directory.size(), out->directory.size())
+      << "Equal log heap space " << in.log_heap_space
+      << ", but different directory sizes: " << in.directory.size() << ", "
+      << out->directory.size();
+  // The trivial loop out[i] |= in[i] should auto-vectorize with gcc at -O3, but it is not
+  // written in a way that is very friendly to auto-vectorization. Instead, we manually
+  // vectorize, increasing the speed by up to 56x.
+  //
+  // TODO: Tune gcc flags to auto-vectorize the trivial loop instead of hand-vectorizing
+  // it. This might not be possible.
+  if (CpuInfo::IsSupported(CpuInfo::AVX)) {
+    OrEqualArrayAvx(in.directory.size(), &in.directory[0], &out->directory[0]);
+  } else {
+    const __m128i* simd_in = reinterpret_cast<const __m128i*>(&in.directory[0]);
+    const __m128i* const simd_in_end =
+        reinterpret_cast<const __m128i*>(&in.directory[0] + in.directory.size());
+    __m128i* simd_out = reinterpret_cast<__m128i*>(&out->directory[0]);
+    // in.directory has a size (in bytes) that is a multiple of 32. Since sizeof(__m128i)
+    // == 16, we can do two _mm_or_si128's in each iteration without checking array
+    // bounds.
+    while (simd_in != simd_in_end) {
+      for (int i = 0; i < 2; ++i, ++simd_in, ++simd_out) {
+        _mm_storeu_si128(
+            simd_out, _mm_or_si128(_mm_loadu_si128(simd_out), _mm_loadu_si128(simd_in)));
+      }
+    }
+  }
 }
 
 // The following three methods are derived from
@@ -187,14 +229,13 @@ int BloomFilter::MinLogSpace(const size_t ndv, const double fpp) {
   const double m = -k * ndv / log(1 - pow(fpp, 1.0 / k));
 
   // Handle case where ndv == 1 => ceil(log2(m/8)) < 0.
-  return max(0, static_cast<int>(ceil(log2(m/8))));
+  return max(0, static_cast<int>(ceil(log2(m / 8))));
 }
 
 double BloomFilter::FalsePositiveProb(const size_t ndv, const int log_heap_space) {
-  return pow(
-      1 - exp((-1.0 * static_cast<double>(BUCKET_WORDS) * static_cast<double>(ndv)) /
-              static_cast<double>(1ull << (log_heap_space + 3))),
+  return pow(1 - exp((-1.0 * static_cast<double>(BUCKET_WORDS) * static_cast<double>(ndv))
+                     / static_cast<double>(1ull << (log_heap_space + 3))),
       BUCKET_WORDS);
 }
 
-}  // namespace impala
+} // namespace impala

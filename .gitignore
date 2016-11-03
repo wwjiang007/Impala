@@ -13,7 +13,7 @@ org.eclipse.jdt.ui.prefs
 load-*-generated.sql
 bin/version.info
 
-# Cloudera distcc options
+# distcc options
 .impala_compiler_opts
 
 pprof.out
@@ -57,4 +57,3 @@ hs_err_pid*.log
 # Vim related files
 .*.swp
 .vimrc
-be/.ycm_extra_conf.py
