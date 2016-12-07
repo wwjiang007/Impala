@@ -59,8 +59,8 @@ ir_functions = [
    "_ZN6impala26PartitionedAggregationNode22ProcessBatchNoGroupingEPNS_8RowBatchE"],
   ["PART_AGG_NODE_PROCESS_BATCH_STREAMING",
    "_ZN6impala26PartitionedAggregationNode21ProcessBatchStreamingEbNS_13TPrefetchMode4typeEPNS_8RowBatchES4_PNS_12HashTableCtxEPi"],
-  ["PART_AGG_NODE_GET_EXPR_CTX",
-   "_ZNK6impala26PartitionedAggregationNode17GetAggExprContextEi"],
+  ["PART_AGG_NODE_GET_EXPR_CTXS",
+   "_ZNK6impala26PartitionedAggregationNode18GetAggExprContextsEi"],
   ["AVG_UPDATE_BIGINT",
    "_ZN6impala18AggregateFunctions9AvgUpdateIN10impala_udf9BigIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE"],
   ["AVG_UPDATE_DOUBLE",
@@ -186,6 +186,8 @@ ir_functions = [
    "_ZNK6impala11HdfsScanner14GetConjunctCtxEi"],
   ["PROCESS_SCRATCH_BATCH",
    "_ZN6impala18HdfsParquetScanner19ProcessScratchBatchEPNS_8RowBatchE"],
+  ["PARQUET_SCANNER_EVAL_RUNTIME_FILTER",
+   "_ZN6impala18HdfsParquetScanner17EvalRuntimeFilterEiPNS_8TupleRowE"],
   ["STRING_TO_BOOL", "IrStringToBool"],
   ["STRING_TO_INT8", "_Z14IrStringToInt8PKciPN6impala12StringParser11ParseResultE"],
   ["STRING_TO_INT16", "IrStringToInt16"],
@@ -200,9 +202,11 @@ ir_functions = [
   ["TOPN_NODE_INSERT_BATCH",
    "_ZN6impala8TopNNode11InsertBatchEPNS_8RowBatchE"],
   ["MEMPOOL_ALLOCATE",
-   "_ZN6impala7MemPool8AllocateILb0EEEPhl"],
+   "_ZN6impala7MemPool8AllocateILb0EEEPhli"],
   ["MEMPOOL_CHECKED_ALLOCATE",
-   "_ZN6impala7MemPool8AllocateILb1EEEPhl"]
+   "_ZN6impala7MemPool8AllocateILb1EEEPhli"],
+  ["RUNTIME_FILTER_EVAL",
+   "_ZNK6impala13RuntimeFilter4EvalEPvRKNS_10ColumnTypeE"]
 ]
 
 enums_preamble = '\

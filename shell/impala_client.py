@@ -345,8 +345,11 @@ class ImpalaClient(object):
         if not result.has_more:
           break
 
-  def close_insert(self, last_query_handle):
-    """Fetches the results of an INSERT query"""
+  def close_dml(self, last_query_handle):
+    """Fetches the results of a DML query. Returns a tuple containing the
+       number of rows modified and the number of row errors, in that order. If the DML
+       operation doesn't return 'num_row_errors', then the second element in the tuple
+       is None."""
     rpc_result = self._do_rpc(
         lambda: self.imp_service.CloseInsert(last_query_handle))
     insert_result, status = rpc_result
@@ -355,7 +358,7 @@ class ImpalaClient(object):
       raise RPCException()
 
     num_rows = sum([int(k) for k in insert_result.rows_modified.values()])
-    return num_rows
+    return (num_rows, insert_result.num_row_errors)
 
   def close_query(self, last_query_handle, query_handle_closed=False):
     """Close the query handle"""
@@ -450,7 +453,7 @@ class ImpalaClient(object):
 
   def expect_result_metadata(self, query_str):
     """ Given a query string, return True if impalad expects result metadata"""
-    excluded_query_types = ['use', 'alter', 'drop']
+    excluded_query_types = ['use', 'drop']
     if True in set(map(query_str.startswith, excluded_query_types)):
       return False
     return True

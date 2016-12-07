@@ -112,9 +112,18 @@ Status DataSink::CreateDataSink(ObjectPool* pool,
   return Status::OK();
 }
 
-void DataSink::MergeInsertStats(const TInsertStats& src_stats,
+void DataSink::MergeDmlStats(const TInsertStats& src_stats,
     TInsertStats* dst_stats) {
   dst_stats->bytes_written += src_stats.bytes_written;
+  if (src_stats.__isset.kudu_stats) {
+    if (!dst_stats->__isset.kudu_stats) dst_stats->__set_kudu_stats(TKuduDmlStats());
+    if (!dst_stats->kudu_stats.__isset.num_row_errors) {
+      dst_stats->kudu_stats.__set_num_row_errors(0);
+    }
+
+    dst_stats->kudu_stats.__set_num_row_errors(
+        dst_stats->kudu_stats.num_row_errors + src_stats.kudu_stats.num_row_errors);
+  }
   if (src_stats.__isset.parquet_stats) {
     if (dst_stats->__isset.parquet_stats) {
       MergeMapValues<string, int64_t>(src_stats.parquet_stats.per_column_size,
@@ -125,7 +134,7 @@ void DataSink::MergeInsertStats(const TInsertStats& src_stats,
   }
 }
 
-string DataSink::OutputInsertStats(const PartitionStatusMap& stats,
+string DataSink::OutputDmlStats(const PartitionStatusMap& stats,
     const string& prefix) {
   const char* indent = "  ";
   stringstream ss;
@@ -148,6 +157,10 @@ string DataSink::OutputInsertStats(const PartitionStatusMap& stats,
 
     if (!val.second.__isset.stats) continue;
     const TInsertStats& stats = val.second.stats;
+    if (stats.__isset.kudu_stats) {
+      ss << "NumRowErrors: " << stats.kudu_stats.num_row_errors << endl;
+    }
+
     ss << indent << "BytesWritten: "
        << PrettyPrinter::Print(stats.bytes_written, TUnit::BYTES);
     if (stats.__isset.parquet_stats) {
@@ -163,12 +176,13 @@ string DataSink::OutputInsertStats(const PartitionStatusMap& stats,
   return ss.str();
 }
 
-Status DataSink::Prepare(RuntimeState* state, MemTracker* mem_tracker) {
-  DCHECK(mem_tracker != NULL);
+Status DataSink::Prepare(RuntimeState* state, MemTracker* parent_mem_tracker) {
+  DCHECK(parent_mem_tracker != NULL);
   profile_ = state->obj_pool()->Add(new RuntimeProfile(state->obj_pool(), GetName()));
-  mem_tracker_ = mem_tracker;
+  const string& name = GetName();
+  mem_tracker_.reset(new MemTracker(profile_, -1, name, parent_mem_tracker));
   expr_mem_tracker_.reset(
-      new MemTracker(-1, Substitute("$0 Exprs", GetName()), mem_tracker, false));
+      new MemTracker(-1, Substitute("$0 Exprs", name), mem_tracker_.get(), false));
   return Status::OK();
 }
 
@@ -177,6 +191,10 @@ void DataSink::Close(RuntimeState* state) {
   if (expr_mem_tracker_ != NULL) {
     expr_mem_tracker_->UnregisterFromParent();
     expr_mem_tracker_.reset();
+  }
+  if (mem_tracker_ != NULL) {
+    mem_tracker_->UnregisterFromParent();
+    mem_tracker_.reset();
   }
   closed_ = true;
 }

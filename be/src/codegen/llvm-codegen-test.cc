@@ -42,9 +42,9 @@ class LlvmCodeGenTest : public testing:: Test {
     ObjectPool pool;
     Status status;
     for (int i = 0; i < 10; ++i) {
-      LlvmCodeGen object1(&pool, "Test");
-      LlvmCodeGen object2(&pool, "Test");
-      LlvmCodeGen object3(&pool, "Test");
+      LlvmCodeGen object1(&pool, NULL, "Test");
+      LlvmCodeGen object2(&pool, NULL, "Test");
+      LlvmCodeGen object3(&pool, NULL, "Test");
 
       ASSERT_OK(object1.Init(unique_ptr<Module>(new Module("Test", object1.context()))));
       ASSERT_OK(object2.Init(unique_ptr<Module>(new Module("Test", object2.context()))));
@@ -53,16 +53,16 @@ class LlvmCodeGenTest : public testing:: Test {
   }
 
   // Wrapper to call private test-only methods on LlvmCodeGen object
-  static Status CreateFromFile(ObjectPool* pool, const string& filename,
-      scoped_ptr<LlvmCodeGen>* codegen) {
-    return LlvmCodeGen::CreateFromFile(pool, filename, "test", codegen);
+  static Status CreateFromFile(
+      ObjectPool* pool, const string& filename, scoped_ptr<LlvmCodeGen>* codegen) {
+    return LlvmCodeGen::CreateFromFile(pool, NULL, filename, "test", codegen);
   }
 
   static LlvmCodeGen* CreateCodegen(ObjectPool* pool) {
-    LlvmCodeGen* codegen = pool->Add(new LlvmCodeGen(pool, "Test"));
+    LlvmCodeGen* codegen = pool->Add(new LlvmCodeGen(pool, NULL, "Test"));
     if (codegen != NULL) {
-      Status status = codegen->Init(
-          unique_ptr<Module>(new Module("Test", codegen->context())));
+      Status status =
+          codegen->Init(unique_ptr<Module>(new Module("Test", codegen->context())));
       if (!status.ok()) return NULL;
     }
     return codegen;
@@ -82,10 +82,7 @@ class LlvmCodeGenTest : public testing:: Test {
     return codegen->VerifyFunction(fn);
   }
 
-  static Status FinalizeModule(LlvmCodeGen* codegen) {
-    return codegen->FinalizeModule();
-  }
-
+  static Status FinalizeModule(LlvmCodeGen* codegen) { return codegen->FinalizeModule(); }
 };
 
 // Simple test to just make and destroy llvmcodegen objects.  LLVM
@@ -109,7 +106,8 @@ TEST_F(LlvmCodeGenTest, BadIRFile) {
   ObjectPool pool;
   string module_file = "NonExistentFile.ir";
   scoped_ptr<LlvmCodeGen> codegen;
-  EXPECT_FALSE(LlvmCodeGenTest::CreateFromFile(&pool, module_file.c_str(), &codegen).ok());
+  EXPECT_FALSE(
+      LlvmCodeGenTest::CreateFromFile(&pool, module_file.c_str(), &codegen).ok());
 }
 
 // IR for the generated linner loop
@@ -124,7 +122,7 @@ TEST_F(LlvmCodeGenTest, BadIRFile) {
 // The random int in there is the address of jitted_counter
 Function* CodegenInnerLoop(LlvmCodeGen* codegen, int64_t* jitted_counter, int delta) {
   LLVMContext& context = codegen->context();
-  LlvmCodeGen::LlvmBuilder builder(context);
+  LlvmBuilder builder(context);
 
   LlvmCodeGen::FnPrototype fn_prototype(codegen, "JittedInnerLoop", codegen->void_type());
   Function* jitted_loop_call = fn_prototype.GeneratePrototype();
@@ -173,10 +171,10 @@ TEST_F(LlvmCodeGenTest, ReplaceFnCall) {
   ASSERT_OK(LlvmCodeGenTest::CreateFromFile(&pool, module_file.c_str(), &codegen));
   EXPECT_TRUE(codegen.get() != NULL);
 
-  Function* loop_call = codegen->GetFunction(loop_call_name);
+  Function* loop_call = codegen->GetFunction(loop_call_name, false);
   EXPECT_TRUE(loop_call != NULL);
   EXPECT_TRUE(loop_call->arg_empty());
-  Function* loop = codegen->GetFunction(loop_name);
+  Function* loop = codegen->GetFunction(loop_name, false);
   EXPECT_TRUE(loop != NULL);
   EXPECT_EQ(loop->arg_size(), 1);
 
@@ -261,7 +259,7 @@ Function* CodegenStringTest(LlvmCodeGen* codegen) {
 
   LlvmCodeGen::FnPrototype prototype(codegen, "StringTest", codegen->GetType(TYPE_INT));
   prototype.AddArgument(LlvmCodeGen::NamedVariable("str", string_val_ptr_type));
-  LlvmCodeGen::LlvmBuilder builder(codegen->context());
+  LlvmBuilder builder(codegen->context());
 
   Value* str;
   Function* interop_fn = prototype.GeneratePrototype(&builder, &str);
@@ -289,7 +287,7 @@ TEST_F(LlvmCodeGenTest, StringValue) {
   ObjectPool pool;
 
   scoped_ptr<LlvmCodeGen> codegen;
-  ASSERT_OK(LlvmCodeGen::CreateImpalaCodegen(&pool, "test", &codegen));
+  ASSERT_OK(LlvmCodeGen::CreateImpalaCodegen(&pool, NULL, "test", &codegen));
   EXPECT_TRUE(codegen.get() != NULL);
 
   string str("Test");
@@ -332,7 +330,7 @@ TEST_F(LlvmCodeGenTest, MemcpyTest) {
   ObjectPool pool;
 
   scoped_ptr<LlvmCodeGen> codegen;
-  ASSERT_OK(LlvmCodeGen::CreateImpalaCodegen(&pool, "test", &codegen));
+  ASSERT_OK(LlvmCodeGen::CreateImpalaCodegen(&pool, NULL, "test", &codegen));
   ASSERT_TRUE(codegen.get() != NULL);
 
   LlvmCodeGen::FnPrototype prototype(codegen.get(), "MemcpyTest", codegen->void_type());
@@ -340,7 +338,7 @@ TEST_F(LlvmCodeGenTest, MemcpyTest) {
   prototype.AddArgument(LlvmCodeGen::NamedVariable("src", codegen->ptr_type()));
   prototype.AddArgument(LlvmCodeGen::NamedVariable("n", codegen->GetType(TYPE_INT)));
 
-  LlvmCodeGen::LlvmBuilder builder(codegen->context());
+  LlvmBuilder builder(codegen->context());
 
   char src[] = "abcd";
   char dst[] = "aaaa";
@@ -379,13 +377,13 @@ TEST_F(LlvmCodeGenTest, HashTest) {
   // Loop to test both the sse4 on/off paths
   for (int i = 0; i < 2; ++i) {
     scoped_ptr<LlvmCodeGen> codegen;
-    ASSERT_OK(LlvmCodeGen::CreateImpalaCodegen(&pool, "test", &codegen));
+    ASSERT_OK(LlvmCodeGen::CreateImpalaCodegen(&pool, NULL, "test", &codegen));
     ASSERT_TRUE(codegen.get() != NULL);
 
-    Value* llvm_data1 = codegen->CastPtrToLlvmPtr(codegen->ptr_type(),
-        const_cast<char*>(data1));
-    Value* llvm_data2 = codegen->CastPtrToLlvmPtr(codegen->ptr_type(),
-        const_cast<char*>(data2));
+    Value* llvm_data1 =
+        codegen->CastPtrToLlvmPtr(codegen->ptr_type(), const_cast<char*>(data1));
+    Value* llvm_data2 =
+        codegen->CastPtrToLlvmPtr(codegen->ptr_type(), const_cast<char*>(data2));
     Value* llvm_len1 = codegen->GetIntConstant(TYPE_INT, strlen(data1));
     Value* llvm_len2 = codegen->GetIntConstant(TYPE_INT, strlen(data2));
 
@@ -396,9 +394,9 @@ TEST_F(LlvmCodeGenTest, HashTest) {
 
     // Create a codegen'd function that hashes all the types and returns the results.
     // The tuple/values to hash are baked into the codegen for simplicity.
-    LlvmCodeGen::FnPrototype prototype(codegen.get(), "HashTest",
-        codegen->GetType(TYPE_INT));
-    LlvmCodeGen::LlvmBuilder builder(codegen->context());
+    LlvmCodeGen::FnPrototype prototype(
+        codegen.get(), "HashTest", codegen->GetType(TYPE_INT));
+    LlvmBuilder builder(codegen->context());
 
     // Test both byte-size specific hash functions and the generic loop hash function
     Function* fn_fixed = prototype.GeneratePrototype(&builder, NULL);

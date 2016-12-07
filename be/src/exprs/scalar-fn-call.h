@@ -54,6 +54,7 @@ class ScalarFnCall: public Expr {
 
  protected:
   friend class Expr;
+  friend class RuntimeState;
 
   ScalarFnCall(const TExprNode& node);
   virtual Status Prepare(RuntimeState* state, const RowDescriptor& desc,
@@ -64,6 +65,8 @@ class ScalarFnCall: public Expr {
   virtual void Close(RuntimeState* state, ExprContext* context,
       FunctionContext::FunctionStateScope scope = FunctionContext::FRAGMENT_LOCAL);
 
+  /// Needs to be kept in sync with the FE understanding of constness in
+  /// FuctionCallExpr.java.
   virtual bool IsConstant() const;
 
   virtual BooleanVal GetBooleanVal(ExprContext* context, const TupleRow*);
@@ -82,6 +85,11 @@ class ScalarFnCall: public Expr {
   /// argument.
   /// If this function does not have varargs, it is set to -1.
   int vararg_start_idx_;
+
+  /// Vector of all non-constant children expressions that need to be evaluated for
+  /// each input row. The first element of each pair is the child expression and the
+  /// second element in the value it must be evaluated into.
+  std::vector<std::pair<Expr*, impala_udf::AnyVal*>> non_constant_children_;
 
   /// Function pointer to the JIT'd function produced by GetCodegendComputeFn().
   /// Has signature *Val (ExprContext*, const TupleRow*), and calls the scalar
@@ -106,24 +114,36 @@ class ScalarFnCall: public Expr {
     return vararg_start_idx_ >= 0 ? vararg_start_idx_ : children_.size();
   }
 
+  int NumVarArgs() const { return children_.size() - NumFixedArgs(); }
+
+  const ColumnType& VarArgsType() const {
+    DCHECK_GE(NumVarArgs(), 1);
+    return children_.back()->type();
+  }
+
   /// Loads the native or IR function from HDFS and puts the result in *udf.
   Status GetUdf(LlvmCodeGen* codegen, llvm::Function** udf);
 
   /// Loads the native or IR function 'symbol' from HDFS and puts the result in *fn.
   /// If the function is loaded from an IR module, it cannot be called until the module
-  /// has been JIT'd (i.e. after Prepare() has completed).
-  Status GetFunction(RuntimeState* state, const std::string& symbol, void** fn);
+  /// has been JIT'd (i.e. after GetCodegendComputeFn() has been called).
+  Status GetFunction(LlvmCodeGen* codegen, const std::string& symbol, void** fn);
 
-  /// Evaluates the children exprs and stores the results in input_vals. Used in the
-  /// interpreted path.
-  void EvaluateChildren(ExprContext* context, const TupleRow* row,
-                        std::vector<impala_udf::AnyVal*>* input_vals);
+  /// Loads the Prepare() and Close() functions for this ScalarFnCall. They could be
+  /// native or IR functions. To load IR functions, the codegen object must have
+  /// been created and any external LLVM module must have been linked already.
+  Status LoadPrepareAndCloseFn(LlvmCodeGen* codegen);
+
+  /// Evaluates the non-constant children exprs. Used in the interpreted path.
+  void EvaluateNonConstantChildren(ExprContext* context, const TupleRow* row);
 
   /// Function to call scalar_fn_. Used in the interpreted path.
-  template<typename RETURN_TYPE>
+  template <typename RETURN_TYPE>
   RETURN_TYPE InterpretEval(ExprContext* context, const TupleRow* row);
-};
 
+  /// Computes the size of the varargs buffer in bytes (0 bytes if no varargs).
+  int ComputeVarArgsBufferSize() const;
+};
 }
 
 #endif

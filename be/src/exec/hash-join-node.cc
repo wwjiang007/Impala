@@ -134,23 +134,23 @@ Status HashJoinNode::Prepare(RuntimeState* state) {
   AddExprCtxsToFree(other_join_conjunct_ctxs_);
 
   // TODO: default buckets
-  const bool stores_nulls = join_op_ == TJoinOp::RIGHT_OUTER_JOIN ||
-      join_op_ == TJoinOp::FULL_OUTER_JOIN ||
-      std::accumulate(is_not_distinct_from_.begin(), is_not_distinct_from_.end(), false,
-                      std::logical_or<bool>());
+  const bool stores_nulls = join_op_ == TJoinOp::RIGHT_OUTER_JOIN
+      || join_op_ == TJoinOp::FULL_OUTER_JOIN
+      || std::accumulate(is_not_distinct_from_.begin(), is_not_distinct_from_.end(),
+                                false, std::logical_or<bool>());
   hash_tbl_.reset(new OldHashTable(state, build_expr_ctxs_, probe_expr_ctxs_,
-          filter_expr_ctxs_,
-          child(1)->row_desc().tuple_descriptors().size(), stores_nulls,
-          is_not_distinct_from_, state->fragment_hash_seed(), mem_tracker(), filters_));
+      filter_expr_ctxs_, child(1)->row_desc().tuple_descriptors().size(), stores_nulls,
+      is_not_distinct_from_, state->fragment_hash_seed(), mem_tracker(), filters_));
   build_pool_.reset(new MemPool(mem_tracker()));
-  if (!state->codegen_enabled()) {
-    runtime_profile()->AddCodegenMsg(false, "disabled by query option DISABLE_CODEGEN");
-  }
+  AddCodegenDisabledMessage(state);
   return Status::OK();
 }
 
 void HashJoinNode::Codegen(RuntimeState* state) {
-  DCHECK(state->codegen_enabled());
+  DCHECK(state->ShouldCodegen());
+  ExecNode::Codegen(state);
+  if (IsNodeCodegenDisabled()) return;
+
   LlvmCodeGen* codegen = state->codegen();
   DCHECK(codegen != NULL);
   bool build_codegen_enabled = false;
@@ -180,7 +180,6 @@ void HashJoinNode::Codegen(RuntimeState* state) {
   }
   runtime_profile()->AddCodegenMsg(build_codegen_enabled, "", "Build Side");
   runtime_profile()->AddCodegenMsg(probe_codegen_enabled, "", "Probe Side");
-  ExecNode::Codegen(state);
 }
 
 Status HashJoinNode::Reset(RuntimeState* state) {
@@ -548,7 +547,7 @@ Function* HashJoinNode::CodegenCreateOutputRow(LlvmCodeGen* codegen) {
   prototype.AddArgument(LlvmCodeGen::NamedVariable("build_arg", tuple_row_ptr_type));
 
   LLVMContext& context = codegen->context();
-  LlvmCodeGen::LlvmBuilder builder(context);
+  LlvmBuilder builder(context);
   Value* args[4];
   Function* fn = prototype.GeneratePrototype(&builder, args);
   Value* out_row_arg = builder.CreateBitCast(args[1], tuple_row_working_type, "out");
@@ -560,8 +559,9 @@ Function* HashJoinNode::CodegenCreateOutputRow(LlvmCodeGen* codegen) {
 
   // Copy probe row
   codegen->CodegenMemcpy(&builder, out_row_arg, probe_row_arg, probe_tuple_row_size_);
-  Value* build_row_idx[] = { codegen->GetIntConstant(TYPE_INT, num_probe_tuples) };
-  Value* build_row_dst = builder.CreateGEP(out_row_arg, build_row_idx, "build_dst_ptr");
+  Value* build_row_idx[] = {codegen->GetIntConstant(TYPE_INT, num_probe_tuples)};
+  Value* build_row_dst =
+      builder.CreateInBoundsGEP(out_row_arg, build_row_idx, "build_dst_ptr");
 
   // Copy build row.
   BasicBlock* build_not_null_block = BasicBlock::Create(context, "build_not_null", fn);
@@ -578,9 +578,8 @@ Function* HashJoinNode::CodegenCreateOutputRow(LlvmCodeGen* codegen) {
     // to work.
     builder.SetInsertPoint(build_null_block);
     for (int i = 0; i < num_build_tuples; ++i) {
-      Value* array_idx[] =
-          { codegen->GetIntConstant(TYPE_INT, i + num_probe_tuples) };
-      Value* dst = builder.CreateGEP(out_row_arg, array_idx, "dst_tuple_ptr");
+      Value* array_idx[] = {codegen->GetIntConstant(TYPE_INT, i + num_probe_tuples)};
+      Value* dst = builder.CreateInBoundsGEP(out_row_arg, array_idx, "dst_tuple_ptr");
       builder.CreateStore(codegen->null_ptr_value(), dst);
     }
     builder.CreateRetVoid();

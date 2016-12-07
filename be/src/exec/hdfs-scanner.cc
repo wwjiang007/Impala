@@ -332,6 +332,7 @@ Status HdfsScanner::CodegenWriteCompleteTuple(HdfsScanNodeBase* node,
         node->hdfs_table()->null_column_value().data(),
         node->hdfs_table()->null_column_value().size(), true, state->strict_mode());
     if (fn == NULL) return Status("CodegenWriteSlot failed.");
+    if (i >= LlvmCodeGen::CODEGEN_INLINE_EXPRS_THRESHOLD) codegen->SetNoInline(fn);
     slot_fns.push_back(fn);
   }
 
@@ -380,7 +381,7 @@ Status HdfsScanner::CodegenWriteCompleteTuple(HdfsScanNodeBase* node,
   prototype.AddArgument(LlvmCodeGen::NamedVariable("error_in_row", uint8_ptr_type));
 
   LLVMContext& context = codegen->context();
-  LlvmCodeGen::LlvmBuilder builder(context);
+  LlvmBuilder builder(context);
   Value* args[8];
   Function* fn = prototype.GeneratePrototype(&builder, &args[0]);
 
@@ -411,8 +412,8 @@ Status HdfsScanner::CodegenWriteCompleteTuple(HdfsScanNodeBase* node,
   // Put tuple in tuple_row
   Value* tuple_row_typed =
       builder.CreateBitCast(tuple_row_arg, PointerType::get(tuple_ptr_type, 0));
-  Value* tuple_row_idxs[] = { codegen->GetIntConstant(TYPE_INT, node->tuple_idx()) };
-  Value* tuple_in_row_addr = builder.CreateGEP(tuple_row_typed, tuple_row_idxs);
+  Value* tuple_row_idxs[] = {codegen->GetIntConstant(TYPE_INT, node->tuple_idx())};
+  Value* tuple_in_row_addr = builder.CreateInBoundsGEP(tuple_row_typed, tuple_row_idxs);
   builder.CreateStore(tuple_arg, tuple_in_row_addr);
   builder.CreateBr(parse_block);
 
@@ -447,11 +448,12 @@ Status HdfsScanner::CodegenWriteCompleteTuple(HdfsScanNodeBase* node,
         codegen->GetIntConstant(TYPE_INT, 1),
       };
       Value* error_idxs[] = {
-        codegen->GetIntConstant(TYPE_INT, slot_idx),
+          codegen->GetIntConstant(TYPE_INT, slot_idx),
       };
-      Value* data_ptr = builder.CreateGEP(fields_arg, data_idxs, "data_ptr");
-      Value* len_ptr = builder.CreateGEP(fields_arg, len_idxs, "len_ptr");
-      Value* error_ptr = builder.CreateGEP(errors_arg, error_idxs, "slot_error_ptr");
+      Value* data_ptr = builder.CreateInBoundsGEP(fields_arg, data_idxs, "data_ptr");
+      Value* len_ptr = builder.CreateInBoundsGEP(fields_arg, len_idxs, "len_ptr");
+      Value* error_ptr =
+          builder.CreateInBoundsGEP(errors_arg, error_idxs, "slot_error_ptr");
       Value* data = builder.CreateLoad(data_ptr, "data");
       Value* len = builder.CreateLoad(len_ptr, "len");
 
@@ -486,6 +488,10 @@ Status HdfsScanner::CodegenWriteCompleteTuple(HdfsScanNodeBase* node,
         fn->eraseFromParent();
         return status;
       }
+      if (node->materialized_slots().size() + conjunct_idx
+          >= LlvmCodeGen::CODEGEN_INLINE_EXPRS_THRESHOLD) {
+        codegen->SetNoInline(conjunct_fn);
+      }
 
       Function* get_ctx_fn =
           codegen->GetFunction(IRFunction::HDFS_SCANNER_GET_CONJUNCT_CTX, false);
@@ -504,6 +510,10 @@ Status HdfsScanner::CodegenWriteCompleteTuple(HdfsScanNodeBase* node,
   builder.SetInsertPoint(eval_fail_block);
   builder.CreateRet(codegen->false_value());
 
+  if (node->materialized_slots().size() + conjunct_ctxs.size()
+      > LlvmCodeGen::CODEGEN_INLINE_EXPR_BATCH_THRESHOLD) {
+    codegen->SetNoInline(fn);
+  }
   *write_complete_tuple_fn = codegen->FinalizeFunction(fn);
   if (*write_complete_tuple_fn == NULL) {
     return Status("Failed to finalize write_complete_tuple_fn.");

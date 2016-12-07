@@ -368,7 +368,7 @@ Coordinator::Coordinator(const QuerySchedule& schedule, ExecEnv* exec_env,
     obj_pool_(new ObjectPool()),
     query_events_(events),
     filter_routing_table_complete_(false),
-    filter_mode_(schedule_.query_options().runtime_filter_mode),
+    filter_mode_(schedule.query_options().runtime_filter_mode),
     torn_down_(false) {}
 
 Coordinator::~Coordinator() {
@@ -1090,7 +1090,7 @@ Status Coordinator::Wait() {
   if (needs_finalization_) RETURN_IF_ERROR(FinalizeQuery());
 
   query_profile_->AddInfoString(
-      "Insert Stats", DataSink::OutputInsertStats(per_partition_status_, "\n"));
+      "DML Stats", DataSink::OutputDmlStats(per_partition_status_, "\n"));
   // For DML queries, when Wait is done, the query is complete.  Report aggregate
   // query profiles at this point.
   // TODO: make sure ReportQuerySummary gets called on error
@@ -1103,6 +1103,13 @@ Status Coordinator::GetNext(QueryResultSet* results, int max_rows, bool* eos) {
   VLOG_ROW << "GetNext() query_id=" << query_id_;
   DCHECK(has_called_wait_);
   SCOPED_TIMER(query_profile_->total_time_counter());
+
+  if (returned_all_results_) {
+    // May be called after the first time we set *eos. Re-set *eos and return here;
+    // already torn-down root_sink_ so no more work to do.
+    *eos = true;
+    return Status::OK();
+  }
 
   DCHECK(root_sink_ != nullptr)
       << "GetNext() called without result sink. Perhaps Prepare() failed and was not "
@@ -1215,7 +1222,6 @@ void Coordinator::InitExecSummary() {
 }
 
 void Coordinator::InitExecProfiles() {
-  const TQueryExecRequest& request = schedule_.request();
   vector<const TPlanFragment*> fragments;
   schedule_.GetTPlanFragments(&fragments);
   fragment_profiles_.resize(fragments.size());
@@ -1490,7 +1496,7 @@ Status Coordinator::UpdateFragmentExecStatus(const TReportExecStatusParams& para
 
       if (partition.second.__isset.stats) {
         if (!status->__isset.stats) status->__set_stats(TInsertStats());
-        DataSink::MergeInsertStats(partition.second.stats, &status->stats);
+        DataSink::MergeDmlStats(partition.second.stats, &status->stats);
       }
     }
     files_to_move_.insert(

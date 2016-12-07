@@ -42,6 +42,7 @@ class LlvmCodeGen;
 class MemTracker;
 class ObjectPool;
 class RuntimeFilterBank;
+class ScalarFnCall;
 class Status;
 class TimestampValue;
 class TQueryOptions;
@@ -61,8 +62,10 @@ typedef std::map<std::string, TInsertStats> PartitionInsertStats;
 /// deleted.
 typedef std::map<std::string, std::string> FileMoveMap;
 
-/// A collection of items that are part of the global state of a
-/// query and shared across all execution nodes of that query.
+/// A collection of items that are part of the global state of a query and shared across
+/// all execution nodes of that query. After initialisation, callers must call
+/// ReleaseResources() to ensure that all resources are correctly freed before
+/// destruction.
 class RuntimeState {
  public:
   RuntimeState(const TExecPlanFragmentParams& fragment_params, ExecEnv* exec_env);
@@ -155,11 +158,47 @@ class RuntimeState {
   /// Returns runtime state profile
   RuntimeProfile* runtime_profile() { return &profile_; }
 
-  /// Returns true if codegen is enabled for this query.
-  bool codegen_enabled() const { return !query_options().disable_codegen; }
-
   /// Returns the LlvmCodeGen object for this fragment instance.
   LlvmCodeGen* codegen() { return codegen_.get(); }
+
+  /// Add ScalarFnCall expression 'udf' to be codegen'd later if it's not disabled by
+  /// query option. This is for cases in which the UDF cannot be interpreted or if the
+  /// plan fragment doesn't contain any codegen enabled operator.
+  void AddScalarFnToCodegen(ScalarFnCall* udf) { scalar_fns_to_codegen_.push_back(udf); }
+
+  /// Returns true if there are ScalarFnCall expressions in the fragments which can't be
+  /// interpreted. This should only be used after the Prepare() phase in which all
+  /// expressions' Prepare() are invoked.
+  bool ScalarFnNeedsCodegen() const { return !scalar_fns_to_codegen_.empty(); }
+
+  /// Returns true if there is a hint to disable codegen. This can be true for single node
+  /// optimization or expression evaluation request from FE to BE (see fe-support.cc).
+  /// Note that this internal flag is advisory and it may be ignored if the fragment has
+  /// any UDF which cannot be interpreted. See ScalarFnCall::Prepare() for details.
+  inline bool CodegenHasDisableHint() const {
+    return query_ctx().disable_codegen_hint;
+  }
+
+  /// Returns true iff there is a hint to disable codegen and all expressions in the
+  /// fragment can be interpreted. This should only be used after the Prepare() phase
+  /// in which all expressions' Prepare() are invoked.
+  inline bool CodegenDisabledByHint() const {
+    return CodegenHasDisableHint() && !ScalarFnNeedsCodegen();
+  }
+
+  /// Returns true if codegen is disabled by query option.
+  inline bool CodegenDisabledByQueryOption() const {
+    return query_options().disable_codegen;
+  }
+
+  /// Returns true if codegen should be enabled for this fragment. Codegen is enabled
+  /// if all the following conditions hold:
+  /// 1. it's enabled by query option
+  /// 2. it's not disabled by internal hints or there are expressions in the fragment
+  ///    which cannot be interpreted.
+  inline bool ShouldCodegen() const {
+    return !CodegenDisabledByQueryOption() && !CodegenDisabledByHint();
+  }
 
   /// Takes ownership of a scan node's reader context and plan fragment executor will call
   /// UnregisterReaderContexts() to unregister it when the fragment is closed. The IO
@@ -195,6 +234,12 @@ class RuntimeState {
     return error_log_.size() < query_options().max_errors;
   }
 
+  /// Returns true if there are entries in the error log.
+  bool HasErrors() {
+    boost::lock_guard<SpinLock> l(error_log_lock_);
+    return !error_log_.empty();
+  }
+
   /// Returns the error log lines as a string joined with '\n'.
   std::string ErrorLog();
 
@@ -214,15 +259,20 @@ class RuntimeState {
   bool is_cancelled() const { return is_cancelled_; }
   void set_is_cancelled(bool v) { is_cancelled_ = v; }
 
-  RuntimeProfile::Counter* total_cpu_timer() { return total_cpu_timer_; }
   RuntimeProfile::Counter* total_storage_wait_timer() {
     return total_storage_wait_timer_;
   }
+
   RuntimeProfile::Counter* total_network_send_timer() {
     return total_network_send_timer_;
   }
+
   RuntimeProfile::Counter* total_network_receive_timer() {
     return total_network_receive_timer_;
+  }
+
+  RuntimeProfile::ThreadCounters* total_thread_statistics() const {
+   return total_thread_statistics_;
   }
 
   /// Sets query_status_ with err_msg if no error has been set yet.
@@ -257,6 +307,15 @@ class RuntimeState {
   /// Create a codegen object accessible via codegen() if it doesn't exist already.
   Status CreateCodegen();
 
+  /// Codegen all ScalarFnCall expressions in 'scalar_fns_to_codegen_'. If codegen fails
+  /// for any expressions, return immediately with the error status. Once IMPALA-4233 is
+  /// fixed, it's not fatal to fail codegen if the expression can be interpreted.
+  /// TODO: Fix IMPALA-4233
+  Status CodegenScalarFns();
+
+  /// Release resources and prepare this object for destruction.
+  void ReleaseResources();
+
  private:
   /// Allow TestEnv to set block_mgr manually for testing.
   friend class TestEnv;
@@ -271,7 +330,7 @@ class RuntimeState {
 
   static const int DEFAULT_BATCH_SIZE = 1024;
 
-  DescriptorTbl* desc_tbl_;
+  DescriptorTbl* desc_tbl_ = nullptr;
   boost::scoped_ptr<ObjectPool> obj_pool_;
 
   /// Lock protecting error_log_
@@ -292,9 +351,12 @@ class RuntimeState {
   ExecEnv* exec_env_;
   boost::scoped_ptr<LlvmCodeGen> codegen_;
 
+  /// Contains all ScalarFnCall expressions which need to be codegen'd.
+  vector<ScalarFnCall*> scalar_fns_to_codegen_;
+
   /// Thread resource management object for this fragment's execution.  The runtime
   /// state is responsible for returning this pool to the thread mgr.
-  ThreadResourceMgr::ResourcePool* resource_pool_;
+  ThreadResourceMgr::ResourcePool* resource_pool_ = nullptr;
 
   /// Temporary Hdfs files created, and where they should be moved to ultimately.
   /// Mapping a filename to a blank destination causes it to be deleted.
@@ -305,9 +367,6 @@ class RuntimeState {
 
   RuntimeProfile profile_;
 
-  /// Total CPU time (across all threads), including all wait times.
-  RuntimeProfile::Counter* total_cpu_timer_;
-
   /// Total time waiting in storage (across all threads)
   RuntimeProfile::Counter* total_storage_wait_timer_;
 
@@ -316,6 +375,9 @@ class RuntimeState {
 
   /// Total time spent receiving over the network (across all threads)
   RuntimeProfile::Counter* total_network_receive_timer_;
+
+  /// Total CPU utilization for all threads in this plan fragment.
+  RuntimeProfile::ThreadCounters* total_thread_statistics_;
 
   /// MemTracker that is shared by all fragment instances running on this host.
   /// The query mem tracker must be released after the instance_mem_tracker_.
@@ -359,6 +421,7 @@ class RuntimeState {
 
   /// prohibit copies
   RuntimeState(const RuntimeState&);
+
 };
 
 #define RETURN_IF_CANCELLED(state) \

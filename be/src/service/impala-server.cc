@@ -207,8 +207,6 @@ const char* ImpalaServer::SQLSTATE_SYNTAX_ERROR_OR_ACCESS_VIOLATION = "42000";
 const char* ImpalaServer::SQLSTATE_GENERAL_ERROR = "HY000";
 const char* ImpalaServer::SQLSTATE_OPTIONAL_FEATURE_NOT_IMPLEMENTED = "HYC00";
 
-const int MAX_NM_MISSED_HEARTBEATS = 5;
-
 // Work item for ImpalaServer::cancellation_thread_pool_.
 class CancellationWork {
  public:
@@ -221,7 +219,7 @@ class CancellationWork {
 
   const TUniqueId& query_id() const { return query_id_; }
   const Status& cause() const { return cause_; }
-  const bool unregister() const { return unregister_; }
+  bool unregister() const { return unregister_; }
 
   bool operator<(const CancellationWork& other) const {
     return query_id_ < other.query_id_;
@@ -377,10 +375,9 @@ Status ImpalaServer::LogLineageRecord(const QueryExecState& query_exec_state) {
   } else {
     return Status::OK();
   }
-  // Set the query end time in TLineageGraph
-  time_t utc_end_time;
-  query_exec_state.end_time().ToUnixTimeInUTC(&utc_end_time);
-  lineage_graph.__set_ended(utc_end_time);
+  // Set the query end time in TLineageGraph. Must use UNIX time directly rather than
+  // e.g. converting from query_exec_state.end_time() (IMPALA-4440).
+  lineage_graph.__set_ended(UnixMillis() / 1000);
   string lineage_record;
   LineageUtil::TLineageToJSON(lineage_graph, &lineage_record);
   const Status& status = lineage_logger_->AppendEntry(lineage_record);
@@ -567,13 +564,13 @@ Status ImpalaServer::GetRuntimeProfileStr(const TUniqueId& query_id,
   DCHECK(output != NULL);
   // Search for the query id in the active query map
   {
-    lock_guard<mutex> l(query_exec_state_map_lock_);
-    QueryExecStateMap::const_iterator exec_state = query_exec_state_map_.find(query_id);
-    if (exec_state != query_exec_state_map_.end()) {
+    shared_ptr<QueryExecState> exec_state = GetQueryExecState(query_id, false);
+    if (exec_state.get() != nullptr) {
+      lock_guard<mutex> l(*exec_state->lock());
       if (base64_encoded) {
-        exec_state->second->profile().SerializeToArchiveString(output);
+        exec_state->profile().SerializeToArchiveString(output);
       } else {
-        exec_state->second->profile().PrettyPrint(output);
+        exec_state->profile().PrettyPrint(output);
       }
       return Status::OK();
     }
@@ -634,14 +631,14 @@ Status ImpalaServer::GetExecSummary(const TUniqueId& query_id, TExecSummary* res
   return Status::OK();
 }
 
-void ImpalaServer::LogFileFlushThread() {
+[[noreturn]] void ImpalaServer::LogFileFlushThread() {
   while (true) {
     sleep(5);
     profile_logger_->Flush();
   }
 }
 
-void ImpalaServer::AuditEventLoggerFlushThread() {
+[[noreturn]] void ImpalaServer::AuditEventLoggerFlushThread() {
   while (true) {
     sleep(5);
     Status status = audit_event_logger_->Flush();
@@ -655,7 +652,7 @@ void ImpalaServer::AuditEventLoggerFlushThread() {
   }
 }
 
-void ImpalaServer::LineageLoggerFlushThread() {
+[[noreturn]] void ImpalaServer::LineageLoggerFlushThread() {
   while (true) {
     sleep(5);
     Status status = lineage_logger_->Flush();
@@ -779,7 +776,7 @@ Status ImpalaServer::ExecuteInternal(
   exec_state->reset(new QueryExecState(query_ctx, exec_env_, exec_env_->frontend(),
       this, session_state));
 
-  (*exec_state)->query_events()->MarkEvent("Start execution");
+  (*exec_state)->query_events()->MarkEvent("Query submitted");
 
   TExecRequest result;
   {
@@ -838,6 +835,7 @@ Status ImpalaServer::ExecuteInternal(
 void ImpalaServer::PrepareQueryContext(TQueryCtx* query_ctx) {
   query_ctx->__set_pid(getpid());
   query_ctx->__set_now_string(TimestampValue::LocalTime().DebugString());
+  query_ctx->__set_start_unix_millis(UnixMillis());
   query_ctx->__set_coord_address(MakeNetworkAddress(FLAGS_hostname, FLAGS_be_port));
 
   // Creating a random_generator every time is not free, but
@@ -1606,6 +1604,7 @@ ImpalaServer::QueryStateRecord::QueryStateRecord(const QueryExecState& exec_stat
   }
   all_rows_returned = exec_state.eos();
   last_active_time = exec_state.last_active();
+  request_pool = exec_state.request_pool();
 }
 
 bool ImpalaServer::QueryStateRecordLessThan::operator() (
@@ -1623,7 +1622,7 @@ void ImpalaServer::ConnectionStart(
     shared_ptr<SessionState> session_state;
     session_state.reset(new SessionState);
     session_state->closed = false;
-    session_state->start_time = TimestampValue::LocalTime();
+    session_state->start_time_ms = UnixMillis();
     session_state->last_accessed_ms = UnixMillis();
     session_state->database = "default";
     session_state->session_timeout = FLAGS_idle_session_timeout;
@@ -1655,24 +1654,32 @@ void ImpalaServer::ConnectionStart(
 
 void ImpalaServer::ConnectionEnd(
     const ThriftServer::ConnectionContext& connection_context) {
-  unique_lock<mutex> l(connection_to_sessions_map_lock_);
-  ConnectionToSessionMap::iterator it =
-      connection_to_sessions_map_.find(connection_context.connection_id);
 
-  // Not every connection must have an associated session
-  if (it == connection_to_sessions_map_.end()) return;
+  vector<TUniqueId> sessions_to_close;
+  {
+    unique_lock<mutex> l(connection_to_sessions_map_lock_);
+    ConnectionToSessionMap::iterator it =
+        connection_to_sessions_map_.find(connection_context.connection_id);
+
+    // Not every connection must have an associated session
+    if (it == connection_to_sessions_map_.end()) return;
+
+    // We don't expect a large number of sessions per connection, so we copy it, so that
+    // we can drop the map lock early.
+    sessions_to_close = it->second;
+    connection_to_sessions_map_.erase(it);
+  }
 
   LOG(INFO) << "Connection from client " << connection_context.network_address
-            << " closed, closing " << it->second.size() << " associated session(s)";
+            << " closed, closing " << sessions_to_close.size() << " associated session(s)";
 
-  for (const TUniqueId& session_id: it->second) {
+  for (const TUniqueId& session_id: sessions_to_close) {
     Status status = CloseSessionInternal(session_id, true);
     if (!status.ok()) {
       LOG(WARNING) << "Error closing session " << session_id << ": "
                    << status.GetDetail();
     }
   }
-  connection_to_sessions_map_.erase(it);
 }
 
 void ImpalaServer::RegisterSessionTimeout(int32_t session_timeout) {
@@ -1682,7 +1689,7 @@ void ImpalaServer::RegisterSessionTimeout(int32_t session_timeout) {
   session_timeout_cv_.notify_one();
 }
 
-void ImpalaServer::ExpireSessions() {
+[[noreturn]] void ImpalaServer::ExpireSessions() {
   while (true) {
     {
       unique_lock<mutex> timeout_lock(session_timeout_lock_);
@@ -1733,7 +1740,7 @@ void ImpalaServer::ExpireSessions() {
   }
 }
 
-void ImpalaServer::ExpireQueries() {
+[[noreturn]] void ImpalaServer::ExpireQueries() {
   while (true) {
     // The following block accomplishes three things:
     //

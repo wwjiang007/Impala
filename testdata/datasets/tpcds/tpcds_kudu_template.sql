@@ -1,3 +1,20 @@
+---- Licensed to the Apache Software Foundation (ASF) under one
+---- or more contributor license agreements.  See the NOTICE file
+---- distributed with this work for additional information
+---- regarding copyright ownership.  The ASF licenses this file
+---- to you under the Apache License, Version 2.0 (the
+---- "License"); you may not use this file except in compliance
+---- with the License.  You may obtain a copy of the License at
+----
+----   http://www.apache.org/licenses/LICENSE-2.0
+----
+---- Unless required by applicable law or agreed to in writing,
+---- software distributed under the License is distributed on an
+---- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+---- KIND, either express or implied.  See the License for the
+---- specific language governing permissions and limitations
+---- under the License.
+
 ---- Template SQL statements to create and load TPCDS tables in KUDU.
 ---- TODO: Use range partitioning for some tables
 ---- TODO: Remove the 'kudu.master_addresses' from TBLPROPERTIES once CM properly sets
@@ -32,7 +49,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.store_sales (
   ss_net_profit DOUBLE,
   PRIMARY KEY (ss_ticket_number, ss_item_sk)
 )
-DISTRIBUTE BY HASH (ss_ticket_number,ss_item_sk) INTO {buckets} BUCKETS
+PARTITION BY HASH (ss_ticket_number,ss_item_sk) INTO {buckets} BUCKETS
+STORED AS KUDU
 TBLPROPERTIES ('kudu.master_addresses' = '{kudu_master}:7051');
 
 INSERT INTO {target_db_name}.store_sales
@@ -97,9 +115,10 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.web_sales (
   ws_net_paid_inc_ship DOUBLE,
   ws_net_paid_inc_ship_tax DOUBLE,
   ws_net_profit DOUBLE,
-  PRIMARY KEY (wd_order_number, ws_item_sk)
+  PRIMARY KEY (ws_order_number, ws_item_sk)
 )
-DISTRIBUTE BY HASH (ws_order_number,ws_item_sk) INTO {buckets} BUCKETS
+PARTITION BY HASH (ws_order_number,ws_item_sk) INTO {buckets} BUCKETS
+STORED AS KUDU
 TBLPROPERTIES ('kudu.master_addresses' = '{kudu_master}:7051');
 
 INSERT INTO {target_db_name}.web_sales
@@ -178,7 +197,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.catalog_sales (
   cs_net_profit DOUBLE,
   PRIMARY KEY (cs_order_number, cs_item_sk)
 )
-DISTRIBUTE BY HASH (cs_order_number,cs_item_sk) INTO {buckets} BUCKETS
+PARTITION BY HASH (cs_order_number,cs_item_sk) INTO {buckets} BUCKETS
+STORED AS KUDU
 TBLPROPERTIES ('kudu.master_addresses' = '{kudu_master}:7051');
 
 INSERT INTO {target_db_name}.catalog_sales
@@ -243,7 +263,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.store_returns (
   sr_net_loss DOUBLE,
   PRIMARY KEY (sr_ticket_number, sr_item_sk)
 )
-DISTRIBUTE BY HASH (sr_ticket_number,sr_item_sk) INTO {buckets} BUCKETS
+PARTITION BY HASH (sr_ticket_number,sr_item_sk) INTO {buckets} BUCKETS
+STORED AS KUDU
 TBLPROPERTIES ('kudu.master_addresses'='{kudu_master}:7051');
 
 INSERT INTO {target_db_name}.store_returns
@@ -298,7 +319,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.web_returns (
   wr_net_loss DOUBLE,
   PRIMARY KEY (wr_order_number, wr_item_sk)
 )
-DISTRIBUTE BY HASH (wr_order_number,wr_item_sk) INTO {buckets} BUCKETS
+PARTITION BY HASH (wr_order_number,wr_item_sk) INTO {buckets} BUCKETS
+STORED AS KUDU
 TBLPROPERTIES ('kudu.master_addresses'='{kudu_master}:7051');
 
 INSERT INTO {target_db_name}.web_returns
@@ -360,7 +382,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.catalog_returns (
   cr_net_loss DOUBLE,
   PRIMARY KEY (cr_order_number, cr_item_sk)
 )
-DISTRIBUTE BY HASH (cr_order_number,cr_item_sk) INTO {buckets} BUCKETS
+PARTITION BY HASH (cr_order_number,cr_item_sk) INTO {buckets} BUCKETS
+STORED AS KUDU
 TBLPROPERTIES ('kudu.master_addresses'='{kudu_master}:7051');
 
 INSERT INTO {target_db_name}.catalog_returns
@@ -402,7 +425,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.inventory (
   inv_quantity_on_hand BIGINT,
   PRIMARY KEY (inv_date_sk, inv_item_sk, inv_warehouse_sk)
 )
-DISTRIBUTE BY HASH (inv_item_sk,inv_date_sk,inv_warehouse_sk) INTO {buckets} BUCKETS
+PARTITION BY HASH (inv_item_sk,inv_date_sk,inv_warehouse_sk) INTO {buckets} BUCKETS
+STORED AS KUDU
 TBLPROPERTIES ('kudu.master_addresses'='{kudu_master}:7051');
 
 INSERT INTO {target_db_name}.inventory SELECT * FROM {source_db_name}.inventory;
@@ -429,7 +453,8 @@ CREATE TABLE {target_db_name}.customer (
   c_email_address STRING,
   c_last_review_date BIGINT
 )
-DISTRIBUTE BY HASH (c_customer_sk) INTO {buckets} BUCKETS
+PARTITION BY HASH (c_customer_sk) INTO {buckets} BUCKETS
+STORED AS KUDU
 TBLPROPERTIES ('kudu.master_addresses'='{kudu_master}:7051');
 
 INSERT INTO {target_db_name}.customer SELECT * FROM {source_db_name}.customer;
@@ -450,7 +475,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.customer_address (
   ca_gmt_offset DOUBLE,
   ca_location_type STRING
 )
-DISTRIBUTE BY HASH (ca_address_sk) INTO {buckets} BUCKETS
+PARTITION BY HASH (ca_address_sk) INTO {buckets} BUCKETS
+STORED AS KUDU
 TBLPROPERTIES ('kudu.master_addresses'='{kudu_master}:7051');
 
 INSERT INTO {target_db_name}.customer_address
@@ -468,7 +494,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.customer_demographics (
   cd_dep_employed_count BIGINT,
   cd_dep_college_count BIGINT
 )
-DISTRIBUTE BY HASH (cd_demo_sk) INTO {buckets} BUCKETS
+PARTITION BY HASH (cd_demo_sk) INTO {buckets} BUCKETS
+STORED AS KUDU
 TBLPROPERTIES ('kudu.master_addresses'='{kudu_master}:7051');
 
 INSERT INTO {target_db_name}.customer_demographics
@@ -505,7 +532,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.date_dim (
   d_current_quarter STRING,
   d_current_year STRING
 )
-DISTRIBUTE BY HASH (d_date_sk) INTO {buckets} BUCKETS
+PARTITION BY HASH (d_date_sk) INTO {buckets} BUCKETS
+STORED AS KUDU
 TBLPROPERTIES ('kudu.master_addresses'='{kudu_master}:7051');
 
 INSERT INTO {target_db_name}.date_dim SELECT * FROM {source_db_name}.date_dim;
@@ -518,7 +546,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.household_demographics (
   hd_dep_count BIGINT,
   hd_vehicle_count BIGINT
 )
-DISTRIBUTE BY HASH (hd_demo_sk) INTO {buckets} BUCKETS
+PARTITION BY HASH (hd_demo_sk) INTO {buckets} BUCKETS
+STORED AS KUDU
 TBLPROPERTIES ('kudu.master_addresses'='{kudu_master}:7051');
 
 INSERT INTO {target_db_name}.household_demographics
@@ -549,7 +578,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.item (
   i_manager_id BIGINT,
   i_product_name STRING
 )
-DISTRIBUTE BY HASH (i_item_sk) INTO {buckets} BUCKETS
+PARTITION BY HASH (i_item_sk) INTO {buckets} BUCKETS
+STORED AS KUDU
 TBLPROPERTIES ('kudu.master_addresses'='{kudu_master}:7051');
 
 INSERT INTO {target_db_name}.item SELECT * FROM {source_db_name}.item;
@@ -576,7 +606,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.promotion (
   p_purpose STRING,
   p_discount_active STRING
 )
-DISTRIBUTE BY HASH (p_promo_sk) INTO {buckets} BUCKETS
+PARTITION BY HASH (p_promo_sk) INTO {buckets} BUCKETS
+STORED AS KUDU
 TBLPROPERTIES ('kudu.master_addresses'='{kudu_master}:7051');
 
 INSERT INTO {target_db_name}.promotion
@@ -634,7 +665,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.store (
   s_gmt_offset DOUBLE,
   s_tax_precentage DOUBLE
 )
-DISTRIBUTE BY HASH (s_store_sk) INTO {buckets} BUCKETS
+PARTITION BY HASH (s_store_sk) INTO {buckets} BUCKETS
+STORED AS KUDU
 TBLPROPERTIES ('kudu.master_addresses'='{kudu_master}:7051');
 
 INSERT INTO {target_db_name}.store SELECT * FROM {source_db_name}.store;
@@ -652,7 +684,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.time_dim (
   t_sub_shift STRING,
   t_meal_time STRING
 )
-DISTRIBUTE BY HASH (t_time_sk) INTO {buckets} BUCKETS
+PARTITION BY HASH (t_time_sk) INTO {buckets} BUCKETS
+STORED AS KUDU
 TBLPROPERTIES ('kudu.master_addresses'='{kudu_master}:7051');
 
 INSERT INTO {target_db_name}.time_dim SELECT * FROM {source_db_name}.time_dim;
@@ -691,7 +724,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.call_center (
   cc_gmt_offset DOUBLE,
   cc_tax_percentage DOUBLE
 )
-DISTRIBUTE BY HASH (cc_call_center_sk) INTO {buckets} BUCKETS
+PARTITION BY HASH (cc_call_center_sk) INTO {buckets} BUCKETS
+STORED AS KUDU
 TBLPROPERTIES ('kudu.master_addresses'='{kudu_master}:7051');
 
 INSERT INTO {target_db_name}.call_center SELECT * FROM {source_db_name}.call_center;
@@ -708,7 +742,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.catalog_page (
   cp_description STRING,
   cp_type STRING
 )
-DISTRIBUTE BY HASH (cp_catalog_page_sk) INTO {buckets} BUCKETS
+PARTITION BY HASH (cp_catalog_page_sk) INTO {buckets} BUCKETS
+STORED AS KUDU
 TBLPROPERTIES ('kudu.master_addresses'='{kudu_master}:7051');
 
 INSERT INTO {target_db_name}.catalog_page SELECT * FROM {source_db_name}.catalog_page;
@@ -719,7 +754,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.income_band (
   ib_lower_bound BIGINT,
   ib_upper_bound BIGINT
 )
-DISTRIBUTE BY HASH (ib_income_band_sk) INTO {buckets} BUCKETS
+PARTITION BY HASH (ib_income_band_sk) INTO {buckets} BUCKETS
+STORED AS KUDU
 TBLPROPERTIES ('kudu.master_addresses'='{kudu_master}:7051');
 
 INSERT INTO {target_db_name}.income_band SELECT * FROM {source_db_name}.income_band;
@@ -730,7 +766,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.reason (
   r_reason_id STRING,
   r_reason_desc STRING
 )
-DISTRIBUTE BY HASH (r_reason_sk) INTO {buckets} BUCKETS
+PARTITION BY HASH (r_reason_sk) INTO {buckets} BUCKETS
+STORED AS KUDU
 TBLPROPERTIES ('kudu.master_addresses'='{kudu_master}:7051');
 
 INSERT INTO {target_db_name}.reason SELECT * FROM {source_db_name}.reason;
@@ -744,7 +781,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.ship_mode (
   sm_carrier STRING,
   sm_contract STRING
 )
-DISTRIBUTE BY HASH (sm_ship_mode_sk) INTO {buckets} BUCKETS
+PARTITION BY HASH (sm_ship_mode_sk) INTO {buckets} BUCKETS
+STORED AS KUDU
 TBLPROPERTIES ('kudu.master_addresses'='{kudu_master}:7051');
 
 INSERT INTO {target_db_name}.ship_mode SELECT * FROM {source_db_name}.ship_mode;
@@ -766,7 +804,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.warehouse (
   w_country STRING,
   w_gmt_offset DOUBLE
 )
-DISTRIBUTE BY HASH (w_warehouse_sk) INTO {buckets} BUCKETS
+PARTITION BY HASH (w_warehouse_sk) INTO {buckets} BUCKETS
+STORED AS KUDU
 TBLPROPERTIES ('kudu.master_addresses'='{kudu_master}:7051');
 
 INSERT INTO {target_db_name}.warehouse SELECT * FROM {source_db_name}.warehouse;
@@ -788,7 +827,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.web_page (
   wp_image_count BIGINT,
   wp_max_ad_count BIGINT
 )
-DISTRIBUTE BY HASH (wp_web_page_sk) INTO {buckets} BUCKETS
+PARTITION BY HASH (wp_web_page_sk) INTO {buckets} BUCKETS
+STORED AS KUDU
 TBLPROPERTIES ('kudu.master_addresses'='{kudu_master}:7051');
 
 INSERT INTO {target_db_name}.web_page SELECT * FROM {source_db_name}.web_page;
@@ -822,7 +862,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.web_site (
   web_gmt_offset DOUBLE,
   web_tax_percentage DOUBLE
 )
-DISTRIBUTE BY HASH (web_site_sk) INTO {buckets} BUCKETS
+PARTITION BY HASH (web_site_sk) INTO {buckets} BUCKETS
+STORED AS KUDU
 TBLPROPERTIES ('kudu.master_addresses'='{kudu_master}:7051');
 
 INSERT INTO {target_db_name}.web_site SELECT * FROM {source_db_name}.web_site;

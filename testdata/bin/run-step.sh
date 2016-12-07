@@ -24,6 +24,7 @@
 # outputs if there is an error.
 # Usage: run-step <step description> <log file name> <cmd> <arg1> <arg2> ...
 # LOG_DIR must be set to a writable directory for logs.
+
 function run-step {
   local MSG=$1
   shift
@@ -36,13 +37,16 @@ function run-step {
   fi
   local LOG=${LOG_DIR}/${LOG_FILE_NAME}
 
-  echo -n "${MSG} (logging to ${LOG})... "
+  echo "${MSG} (logging to ${LOG})... "
   echo "Log for command '$@'" > ${LOG}
+  START_TIME=$SECONDS
   if ! "$@" >> ${LOG} 2>&1 ; then
-    echo "FAILED"
-    echo "'$@' failed. Tail of log:"
+    ELAPSED_TIME=$(($SECONDS - $START_TIME))
+    echo "    FAILED (Took: $(($ELAPSED_TIME/60)) min $(($ELAPSED_TIME%60)) sec)"
+    echo "    '$@' failed. Tail of log:"
     tail -n50 ${LOG}
     return 1
   fi
-  echo OK
+  ELAPSED_TIME=$(($SECONDS - $START_TIME))
+  echo "    OK (Took: $(($ELAPSED_TIME/60)) min $(($ELAPSED_TIME%60)) sec)"
 }

@@ -343,7 +343,7 @@ Function* CodegenCrcHash(LlvmCodeGen* codegen, bool mixed) {
   prototype.AddArgument(
       LlvmCodeGen::NamedVariable("results", codegen->GetPtrType(TYPE_INT)));
 
-  LlvmCodeGen::LlvmBuilder builder(codegen->context());
+  LlvmBuilder builder(codegen->context());
   Value* args[3];
   Function* fn = prototype.GeneratePrototype(&builder, &args[0]);
 
@@ -429,7 +429,7 @@ int main(int argc, char **argv) {
 
   Status status;
   scoped_ptr<LlvmCodeGen> codegen;
-  status = LlvmCodeGen::CreateImpalaCodegen(&obj_pool, "test", &codegen);
+  status = LlvmCodeGen::CreateImpalaCodegen(&obj_pool, NULL, "test", &codegen);
   if (!status.ok()) {
     cout << "Could not start codegen.";
     return -1;

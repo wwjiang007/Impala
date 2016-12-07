@@ -17,8 +17,9 @@
 
 package org.apache.impala.analysis;
 
-import java.util.List;
+import java.util.Collections;
 import java.util.EnumSet;
+import java.util.List;
 
 import org.apache.impala.authorization.Privilege;
 import org.apache.impala.catalog.Db;
@@ -26,9 +27,12 @@ import org.apache.impala.catalog.HdfsTable;
 import org.apache.impala.catalog.KuduTable;
 import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
 import org.apache.impala.catalog.Table;
+import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
+import org.apache.impala.rewrite.ExprRewriter;
 import org.apache.impala.service.CatalogOpExecutor;
 import org.apache.impala.thrift.THdfsFileFormat;
+
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
@@ -78,8 +82,8 @@ public class CreateTableAsSelectStmt extends StatementBase {
         pkvs.add(new PartitionKeyValue(key, null));
       }
     }
-    insertStmt_ = new InsertStmt(null, createStmt.getTblName(), false, pkvs,
-        null, queryStmt, null, false);
+    insertStmt_ = InsertStmt.createInsert(
+        null, createStmt.getTblName(), false, pkvs, null, queryStmt, null);
   }
 
   public QueryStmt getQueryStmt() { return insertStmt_.getQueryStmt(); }
@@ -145,7 +149,7 @@ public class CreateTableAsSelectStmt extends StatementBase {
               "mismatch: %s != %s", partitionLabel, colLabel));
         }
 
-        ColumnDef colDef = new ColumnDef(colLabel, null, null);
+        ColumnDef colDef = new ColumnDef(colLabel, null);
         colDef.setType(tmpQueryStmt.getBaseTblResultExprs().get(i).getType());
         createStmt_.getPartitionColumnDefs().add(colDef);
       }
@@ -157,8 +161,8 @@ public class CreateTableAsSelectStmt extends StatementBase {
     int colCnt = tmpQueryStmt.getColLabels().size();
     createStmt_.getColumnDefs().clear();
     for (int i = 0; i < colCnt; ++i) {
-      ColumnDef colDef = new ColumnDef(
-          tmpQueryStmt.getColLabels().get(i), null, null);
+      ColumnDef colDef = new ColumnDef(tmpQueryStmt.getColLabels().get(i), null,
+          Collections.<ColumnDef.Option, Object>emptyMap());
       colDef.setType(tmpQueryStmt.getBaseTblResultExprs().get(i).getType());
       createStmt_.getColumnDefs().add(colDef);
     }
@@ -189,7 +193,8 @@ public class CreateTableAsSelectStmt extends StatementBase {
       Table tmpTable = null;
       if (KuduTable.isKuduTable(msTbl)) {
         tmpTable = KuduTable.createCtasTarget(db, msTbl, createStmt_.getColumnDefs(),
-            createStmt_.getTblPrimaryKeyColumnNames(), createStmt_.getDistributeParams());
+            createStmt_.getTblPrimaryKeyColumnNames(),
+            createStmt_.getKuduPartitionParams());
       } else {
         // TODO: Creating a tmp table using load() is confusing.
         // Refactor it to use a 'createCtasTarget()' function similar to Kudu table.
@@ -206,6 +211,24 @@ public class CreateTableAsSelectStmt extends StatementBase {
 
     // Finally, run analysis on the insert statement.
     insertStmt_.analyze(analyzer);
+  }
+
+  @Override
+  public List<Expr> getResultExprs() { return insertStmt_.getResultExprs(); }
+
+  @Override
+  public void castResultExprs(List<Type> types) throws AnalysisException {
+    super.castResultExprs(types);
+    // Set types of column definitions.
+    List<ColumnDef> colDefs = createStmt_.getColumnDefs();
+    Preconditions.checkState(colDefs.size() == types.size());
+    for (int i = 0; i < types.size(); ++i) colDefs.get(i).setType(types.get(i));
+  }
+
+  @Override
+  public void rewriteExprs(ExprRewriter rewriter) throws AnalysisException {
+    Preconditions.checkState(isAnalyzed());
+    insertStmt_.rewriteExprs(rewriter);
   }
 
   @Override

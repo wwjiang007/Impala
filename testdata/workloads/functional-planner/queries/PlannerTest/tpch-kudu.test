@@ -725,8 +725,8 @@ PLAN-ROOT SINK
 |  hash predicates: o_orderkey = l_orderkey
 |
 |--01:SCAN KUDU [tpch_kudu.lineitem]
-|     predicates: l_shipmode IN ('MAIL', 'SHIP'), l_commitdate < l_receiptdate, l_shipdate < l_commitdate
-|     kudu predicates: l_receiptdate < '1995-01-01', l_receiptdate >= '1994-01-01'
+|     predicates: l_commitdate < l_receiptdate, l_shipdate < l_commitdate
+|     kudu predicates: l_shipmode IN ('MAIL', 'SHIP'), l_receiptdate < '1995-01-01', l_receiptdate >= '1994-01-01'
 |
 00:SCAN KUDU [tpch_kudu.orders]
 ====
@@ -917,7 +917,8 @@ PLAN-ROOT SINK
 |  hash predicates: ps_partkey = p_partkey
 |
 |--01:SCAN KUDU [tpch_kudu.part]
-|     predicates: p_size IN (49, 14, 23, 45, 19, 3, 36, 9), p_brand != 'Brand#45', NOT p_type LIKE 'MEDIUM POLISHED%'
+|     predicates: p_brand != 'Brand#45', NOT p_type LIKE 'MEDIUM POLISHED%'
+|     kudu predicates: p_size IN (49, 14, 23, 45, 19, 3, 36, 9)
 |
 00:SCAN KUDU [tpch_kudu.partsupp]
 ====
@@ -1074,11 +1075,13 @@ PLAN-ROOT SINK
 |
 02:HASH JOIN [INNER JOIN]
 |  hash predicates: l_partkey = p_partkey
-|  other predicates: ((p_brand = 'Brand#12' AND p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG') AND l_quantity >= 1 AND l_quantity <= 11 AND p_size BETWEEN 1 AND 5 AND l_shipmode IN ('AIR', 'AIR REG') AND l_shipinstruct = 'DELIVER IN PERSON') OR (p_brand = 'Brand#23' AND p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK') AND l_quantity >= 10 AND l_quantity <= 20 AND p_size BETWEEN 1 AND 10 AND l_shipmode IN ('AIR', 'AIR REG') AND l_shipinstruct = 'DELIVER IN PERSON') OR (p_brand = 'Brand#34' AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG') AND l_quantity >= 20 AND l_quantity <= 30 AND p_size BETWEEN 1 AND 15 AND l_shipmode IN ('AIR', 'AIR REG') AND l_shipinstruct = 'DELIVER IN PERSON'))
+|  other predicates: ((p_brand = 'Brand#12' AND p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG') AND l_quantity >= 1 AND l_quantity <= 11 AND p_size <= 5) OR (p_brand = 'Brand#23' AND p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK') AND l_quantity >= 10 AND l_quantity <= 20 AND p_size <= 10) OR (p_brand = 'Brand#34' AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG') AND l_quantity >= 20 AND l_quantity <= 30 AND p_size <= 15))
 |
 |--01:SCAN KUDU [tpch_kudu.part]
+|     kudu predicates: p_size >= 1
 |
 00:SCAN KUDU [tpch_kudu.lineitem]
+   kudu predicates: l_shipmode IN ('AIR', 'AIR REG'), l_shipinstruct = 'DELIVER IN PERSON'
 ====
 # Q20 - Potential Part Promotion Query
 select

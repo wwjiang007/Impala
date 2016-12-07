@@ -25,9 +25,9 @@
 #include <gutil/strings/substitute.h>
 
 #include <llvm/ADT/Triple.h>
-#include <llvm/Analysis/TargetTransformInfo.h>
 #include <llvm/Analysis/InstructionSimplify.h>
 #include <llvm/Analysis/Passes.h>
+#include <llvm/Analysis/TargetTransformInfo.h>
 #include <llvm/Bitcode/ReaderWriter.h>
 #include <llvm/ExecutionEngine/ExecutionEngine.h>
 #include <llvm/ExecutionEngine/MCJIT.h>
@@ -52,17 +52,18 @@
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include <llvm/Transforms/Utils/Cloning.h>
 
-#include "common/logging.h"
 #include "codegen/codegen-anyval.h"
 #include "codegen/codegen-symbol-emitter.h"
 #include "codegen/impala-ir-data.h"
 #include "codegen/instruction-counter.h"
 #include "codegen/mcjit-mem-mgr.h"
+#include "common/logging.h"
 #include "impala-ir/impala-ir-names.h"
 #include "runtime/descriptors.h"
 #include "runtime/hdfs-fs-cache.h"
 #include "runtime/lib-cache.h"
 #include "runtime/mem-pool.h"
+#include "runtime/mem-tracker.h"
 #include "runtime/string-value.h"
 #include "runtime/timestamp-value.h"
 #include "util/cpu-info.h"
@@ -76,7 +77,7 @@
 using namespace llvm;
 using namespace strings;
 using std::fstream;
-using std::unique_ptr;
+using std::move;
 
 DEFINE_bool(print_llvm_ir_instruction_count, false,
     "if true, prints the instruction counts of all JIT'd functions");
@@ -102,8 +103,8 @@ string LlvmCodeGen::cpu_name_;
 vector<string> LlvmCodeGen::cpu_attrs_;
 unordered_set<string> LlvmCodeGen::gv_ref_ir_fns_;
 
-static void LlvmCodegenHandleError(void* user_data, const std::string& reason,
-    bool gen_crash_diag) {
+[[noreturn]] static void LlvmCodegenHandleError(
+    void* user_data, const std::string& reason, bool gen_crash_diag) {
   LOG(FATAL) << "LLVM hit fatal error: " << reason.c_str();
 }
 
@@ -200,7 +201,7 @@ void LlvmCodeGen::InitializeLlvm(bool load_backend) {
 
   ObjectPool init_pool;
   scoped_ptr<LlvmCodeGen> init_codegen;
-  Status status = LlvmCodeGen::CreateFromMemory(&init_pool, "init", &init_codegen);
+  Status status = LlvmCodeGen::CreateFromMemory(&init_pool, NULL, "init", &init_codegen);
   ParseGVForFunctions(init_codegen->module_, &gv_ref_ir_fns_);
 
   // Validate the module by verifying that functions for all IRFunction::Type
@@ -213,16 +214,18 @@ void LlvmCodeGen::InitializeLlvm(bool load_backend) {
   }
 }
 
-LlvmCodeGen::LlvmCodeGen(ObjectPool* pool, const string& id) :
-  id_(id),
-  profile_(pool, "CodeGen"),
-  optimizations_enabled_(false),
-  is_corrupt_(false),
-  is_compiled_(false),
-  context_(new llvm::LLVMContext()),
-  module_(NULL),
-  loaded_functions_(IRFunction::FN_END, NULL) {
-
+LlvmCodeGen::LlvmCodeGen(
+    ObjectPool* pool, MemTracker* parent_mem_tracker, const string& id)
+  : id_(id),
+    profile_(pool, "CodeGen"),
+    mem_tracker_(new MemTracker(&profile_, -1, "CodeGen", parent_mem_tracker)),
+    optimizations_enabled_(false),
+    is_corrupt_(false),
+    is_compiled_(false),
+    context_(new llvm::LLVMContext()),
+    module_(NULL),
+    memory_manager_(NULL),
+    loaded_functions_(IRFunction::FN_END, NULL) {
   DCHECK(llvm_initialized_) << "Must call LlvmCodeGen::InitializeLlvm first.";
 
   load_module_timer_ = ADD_TIMER(&profile_, "LoadTime");
@@ -235,9 +238,9 @@ LlvmCodeGen::LlvmCodeGen(ObjectPool* pool, const string& id) :
   num_instructions_ = ADD_COUNTER(&profile_, "NumInstructions", TUnit::UNIT);
 }
 
-Status LlvmCodeGen::CreateFromFile(ObjectPool* pool,
+Status LlvmCodeGen::CreateFromFile(ObjectPool* pool, MemTracker* parent_mem_tracker,
     const string& file, const string& id, scoped_ptr<LlvmCodeGen>* codegen) {
-  codegen->reset(new LlvmCodeGen(pool, id));
+  codegen->reset(new LlvmCodeGen(pool, parent_mem_tracker, id));
   SCOPED_TIMER((*codegen)->profile_.total_time_counter());
 
   unique_ptr<Module> loaded_module;
@@ -246,9 +249,9 @@ Status LlvmCodeGen::CreateFromFile(ObjectPool* pool,
   return (*codegen)->Init(std::move(loaded_module));
 }
 
-Status LlvmCodeGen::CreateFromMemory(ObjectPool* pool, const string& id,
-    scoped_ptr<LlvmCodeGen>* codegen) {
-  codegen->reset(new LlvmCodeGen(pool, id));
+Status LlvmCodeGen::CreateFromMemory(ObjectPool* pool, MemTracker* parent_mem_tracker,
+    const string& id, scoped_ptr<LlvmCodeGen>* codegen) {
+  codegen->reset(new LlvmCodeGen(pool, parent_mem_tracker, id));
   SCOPED_TIMER((*codegen)->profile_.total_time_counter());
 
   // Select the appropriate IR version. We cannot use LLVM IR with SSE4.2 instructions on
@@ -375,9 +378,9 @@ void LlvmCodeGen::StripGlobalCtorsDtors(llvm::Module* module) {
   if (destructors != NULL) destructors->eraseFromParent();
 }
 
-Status LlvmCodeGen::CreateImpalaCodegen(
-    ObjectPool* pool, const string& id, scoped_ptr<LlvmCodeGen>* codegen_ret) {
-  RETURN_IF_ERROR(CreateFromMemory(pool, id, codegen_ret));
+Status LlvmCodeGen::CreateImpalaCodegen(ObjectPool* pool, MemTracker* parent_mem_tracker,
+    const string& id, scoped_ptr<LlvmCodeGen>* codegen_ret) {
+  RETURN_IF_ERROR(CreateFromMemory(pool, parent_mem_tracker, id, codegen_ret));
   LlvmCodeGen* codegen = codegen_ret->get();
 
   // Parse module for cross compiled functions and types
@@ -422,8 +425,9 @@ Status LlvmCodeGen::Init(unique_ptr<Module> module) {
   EngineBuilder builder(std::move(module));
   builder.setEngineKind(EngineKind::JIT);
   builder.setOptLevel(opt_level);
-  builder.setMCJITMemoryManager(
-      unique_ptr<ImpalaMCJITMemoryManager>(new ImpalaMCJITMemoryManager()));
+  unique_ptr<ImpalaMCJITMemoryManager> memory_manager(new ImpalaMCJITMemoryManager);
+  memory_manager_ = memory_manager.get();
+  builder.setMCJITMemoryManager(move(memory_manager));
   builder.setMCPU(cpu_name_);
   builder.setMAttrs(cpu_attrs_);
   builder.setErrorStr(&error_string_);
@@ -464,6 +468,10 @@ void LlvmCodeGen::SetupJITListeners() {
 }
 
 LlvmCodeGen::~LlvmCodeGen() {
+  if (memory_manager_ != NULL) mem_tracker_->Release(memory_manager_->bytes_tracked());
+  if (mem_tracker_->parent() != NULL) mem_tracker_->UnregisterFromParent();
+  mem_tracker_.reset();
+
   // Execution engine executes callback on event listener, so tear down engine first.
   execution_engine_.reset();
   symbol_emitter_.reset();
@@ -564,7 +572,7 @@ Value* LlvmCodeGen::CastPtrToLlvmPtr(Type* type, const void* ptr) {
   return ConstantExpr::getIntToPtr(const_int, type);
 }
 
-Value* LlvmCodeGen::GetIntConstant(PrimitiveType type, uint64_t val) {
+Constant* LlvmCodeGen::GetIntConstant(PrimitiveType type, uint64_t val) {
   switch (type) {
     case TYPE_TINYINT:
       return ConstantInt::get(context(), APInt(8, val));
@@ -580,7 +588,7 @@ Value* LlvmCodeGen::GetIntConstant(PrimitiveType type, uint64_t val) {
   }
 }
 
-Value* LlvmCodeGen::GetIntConstant(int num_bytes, uint64_t low_bits, uint64_t high_bits) {
+Constant* LlvmCodeGen::GetIntConstant(int num_bytes, uint64_t low_bits, uint64_t high_bits) {
   DCHECK_GE(num_bytes, 1);
   DCHECK_LE(num_bytes, 16);
   DCHECK(BitUtil::IsPowerOf2(num_bytes));
@@ -588,9 +596,19 @@ Value* LlvmCodeGen::GetIntConstant(int num_bytes, uint64_t low_bits, uint64_t hi
   return ConstantInt::get(context(), APInt(8 * num_bytes, vals));
 }
 
+Value* LlvmCodeGen::GetStringConstant(LlvmBuilder* builder, char* data, int len) {
+  // Create a global string with private linkage.
+  Constant* const_string =
+      ConstantDataArray::getString(context(), StringRef(data, len), false);
+  GlobalVariable* gv = new GlobalVariable(
+      *module_, const_string->getType(), true, GlobalValue::PrivateLinkage, const_string);
+  // Get a pointer to the first element of the string.
+  return builder->CreateConstInBoundsGEP2_32(NULL, gv, 0, 0, "");
+}
+
 AllocaInst* LlvmCodeGen::CreateEntryBlockAlloca(Function* f, const NamedVariable& var) {
   IRBuilder<> tmp(&f->getEntryBlock(), f->getEntryBlock().begin());
-  AllocaInst* alloca = tmp.CreateAlloca(var.type, 0, var.name.c_str());
+  AllocaInst* alloca = tmp.CreateAlloca(var.type, NULL, var.name.c_str());
   if (var.type == GetType(CodegenAnyVal::LLVM_DECIMALVAL_NAME)) {
     // Generated functions may manipulate DecimalVal arguments via SIMD instructions such
     // as 'movaps' that require 16-byte memory alignment. LLVM uses 8-byte alignment by
@@ -600,10 +618,20 @@ AllocaInst* LlvmCodeGen::CreateEntryBlockAlloca(Function* f, const NamedVariable
   return alloca;
 }
 
+AllocaInst* LlvmCodeGen::CreateEntryBlockAlloca(
+    const LlvmBuilder& builder, Type* type, const char* name) {
+  return CreateEntryBlockAlloca(
+      builder.GetInsertBlock()->getParent(), NamedVariable(name, type));
+}
+
 AllocaInst* LlvmCodeGen::CreateEntryBlockAlloca(const LlvmBuilder& builder, Type* type,
-                                                const char* name) {
-  return CreateEntryBlockAlloca(builder.GetInsertBlock()->getParent(),
-                                NamedVariable(name, type));
+    int num_entries, int alignment, const char* name) {
+  Function* fn = builder.GetInsertBlock()->getParent();
+  IRBuilder<> tmp(&fn->getEntryBlock(), fn->getEntryBlock().begin());
+  AllocaInst* alloca =
+      tmp.CreateAlloca(type, GetIntConstant(TYPE_INT, num_entries), name);
+  alloca->setAlignment(alignment);
+  return alloca;
 }
 
 void LlvmCodeGen::CreateIfElseBlocks(Function* fn, const string& if_name,
@@ -651,7 +679,7 @@ Status LlvmCodeGen::MaterializeFunction(Function *fn) {
   return MaterializeFunctionHelper(fn);
 }
 
-Function* LlvmCodeGen::GetFunction(const string& symbol) {
+Function* LlvmCodeGen::GetFunction(const string& symbol, bool clone) {
   Function* fn = module_->getFunction(symbol.c_str());
   if (fn == NULL) {
     LOG(ERROR) << "Unable to locate function " << symbol;
@@ -659,6 +687,7 @@ Function* LlvmCodeGen::GetFunction(const string& symbol) {
   }
   Status status = MaterializeFunction(fn);
   if (UNLIKELY(!status.ok())) return NULL;
+  if (clone) return CloneFunction(fn);
   return fn;
 }
 
@@ -732,8 +761,14 @@ bool LlvmCodeGen::VerifyFunction(Function* fn) {
   return true;
 }
 
-LlvmCodeGen::FnPrototype::FnPrototype(LlvmCodeGen* codegen, const string& name,
-    Type* ret_type) : codegen_(codegen), name_(name), ret_type_(ret_type) {
+void LlvmCodeGen::SetNoInline(llvm::Function* function) const {
+  function->removeFnAttr(llvm::Attribute::AlwaysInline);
+  function->addFnAttr(llvm::Attribute::NoInline);
+}
+
+LlvmCodeGen::FnPrototype::FnPrototype(
+    LlvmCodeGen* codegen, const string& name, Type* ret_type)
+  : codegen_(codegen), name_(name), ret_type_(ret_type) {
   DCHECK(!codegen_->is_compiled_) << "Not valid to add additional functions";
 }
 
@@ -906,10 +941,15 @@ Status LlvmCodeGen::FinalizeModule() {
 
   // Don't waste time optimizing module if there are no functions to JIT. This can happen
   // if the codegen object is created but no functions are successfully codegen'd.
-  if (fns_to_jit_compile_.empty()) return Status::OK();
+  if (fns_to_jit_compile_.empty()) {
+    DestroyModule();
+    return Status::OK();
+  }
 
   RETURN_IF_ERROR(FinalizeLazyMaterialization());
-  if (optimizations_enabled_ && !FLAGS_disable_optimization_passes) OptimizeModule();
+  if (optimizations_enabled_ && !FLAGS_disable_optimization_passes) {
+    RETURN_IF_ERROR(OptimizeModule());
+  }
 
   if (FLAGS_opt_module_dir.size() != 0) {
     string path = FLAGS_opt_module_dir + "/" + id_ + "_opt.ll";
@@ -928,17 +968,28 @@ Status LlvmCodeGen::FinalizeModule() {
     execution_engine_->finalizeObject();
   }
 
-  // Get pointers to all codegen'd functions.
+  // Get pointers to all codegen'd functions
   for (int i = 0; i < fns_to_jit_compile_.size(); ++i) {
     Function* function = fns_to_jit_compile_[i].first;
     void* jitted_function = execution_engine_->getPointerToFunction(function);
     DCHECK(jitted_function != NULL) << "Failed to jit " << function->getName().data();
     *fns_to_jit_compile_[i].second = jitted_function;
   }
+
+  DestroyModule();
+
+  // Track the memory consumed by the compiled code.
+  int64_t bytes_allocated = memory_manager_->bytes_allocated();
+  if (!mem_tracker_->TryConsume(bytes_allocated)) {
+    const string& msg = Substitute(
+        "Failed to allocate '$0' bytes for compiled code module", bytes_allocated);
+    return mem_tracker_->MemLimitExceeded(NULL, msg, bytes_allocated);
+  }
+  memory_manager_->set_bytes_tracked(bytes_allocated);
   return Status::OK();
 }
 
-void LlvmCodeGen::OptimizeModule() {
+Status LlvmCodeGen::OptimizeModule() {
   SCOPED_TIMER(optimization_timer_);
 
   // This pass manager will construct optimizations passes that are "typical" for
@@ -982,6 +1033,14 @@ void LlvmCodeGen::OptimizeModule() {
   COUNTER_SET(num_functions_, counter.GetCount(InstructionCounter::TOTAL_FUNCTIONS));
   COUNTER_SET(num_instructions_, counter.GetCount(InstructionCounter::TOTAL_INSTS));
 
+  int64_t estimated_memory = ESTIMATED_OPTIMIZER_BYTES_PER_INST
+      * counter.GetCount(InstructionCounter::TOTAL_INSTS);
+  if (!mem_tracker_->TryConsume(estimated_memory)) {
+    const string& msg = Substitute(
+        "Codegen failed to reserve '$0' bytes for optimization", estimated_memory);
+    return mem_tracker_->MemLimitExceeded(NULL, msg, estimated_memory);
+  }
+
   // Create and run function pass manager
   unique_ptr<legacy::FunctionPassManager> fn_pass_manager(
       new legacy::FunctionPassManager(module_));
@@ -1006,6 +1065,22 @@ void LlvmCodeGen::OptimizeModule() {
       VLOG(1) << counter.PrintCounters();
     }
   }
+
+  mem_tracker_->Release(estimated_memory);
+  return Status::OK();
+}
+
+void LlvmCodeGen::DestroyModule() {
+  // Clear all references to LLVM objects owned by the module.
+  loaded_functions_.clear();
+  codegend_functions_.clear();
+  registered_exprs_map_.clear();
+  registered_exprs_.clear();
+  llvm_intrinsics_.clear();
+  hash_fns_.clear();
+  fns_to_jit_compile_.clear();
+  execution_engine_->removeModule(module_);
+  module_ = NULL;
 }
 
 void LlvmCodeGen::AddFunctionToJit(Function* fn, void** fn_ptr) {
@@ -1237,7 +1312,8 @@ Value* LlvmCodeGen::CodegenAllocate(LlvmBuilder* builder, MemPool* pool, Value* 
   Function* allocate_fn = GetFunction(IRFunction::MEMPOOL_ALLOCATE, false);
   PointerType* pool_type = GetPtrType(MemPool::LLVM_CLASS_NAME);
   Value* pool_val = CastPtrToLlvmPtr(pool_type, pool);
-  Value* fn_args[] = { pool_val, size };
+  Value* alignment = GetIntConstant(TYPE_INT, MemPool::DEFAULT_ALIGNMENT);
+  Value* fn_args[] = {pool_val, size, alignment};
   return builder->CreateCall(allocate_fn, fn_args, name);
 }
 
@@ -1314,15 +1390,15 @@ Function* LlvmCodeGen::GetHashFunction(int num_bytes) {
       Value* ptr = builder.CreateBitCast(data, GetPtrType(TYPE_BIGINT));
       int i = 0;
       while (num_bytes >= 8) {
-        Value* index[] = { GetIntConstant(TYPE_INT, i++) };
-        Value* d = builder.CreateLoad(builder.CreateGEP(ptr, index));
+        Value* index[] = {GetIntConstant(TYPE_INT, i++)};
+        Value* d = builder.CreateLoad(builder.CreateInBoundsGEP(ptr, index));
         result_64 = builder.CreateCall(crc64_fn, ArrayRef<Value*>({result_64, d}));
         num_bytes -= 8;
       }
       result = builder.CreateTrunc(result_64, GetType(TYPE_INT));
-      Value* index[] = { GetIntConstant(TYPE_INT, i * 8) };
+      Value* index[] = {GetIntConstant(TYPE_INT, i * 8)};
       // Update data to past the 8-byte chunks
-      data = builder.CreateGEP(data, index);
+      data = builder.CreateInBoundsGEP(data, index);
     }
 
     if (num_bytes >= 4) {
@@ -1330,8 +1406,8 @@ Function* LlvmCodeGen::GetHashFunction(int num_bytes) {
       Value* ptr = builder.CreateBitCast(data, GetPtrType(TYPE_INT));
       Value* d = builder.CreateLoad(ptr);
       result = builder.CreateCall(crc32_fn, ArrayRef<Value*>({result, d}));
-      Value* index[] = { GetIntConstant(TYPE_INT, 4) };
-      data = builder.CreateGEP(data, index);
+      Value* index[] = {GetIntConstant(TYPE_INT, 4)};
+      data = builder.CreateInBoundsGEP(data, index);
       num_bytes -= 4;
     }
 
@@ -1340,8 +1416,8 @@ Function* LlvmCodeGen::GetHashFunction(int num_bytes) {
       Value* ptr = builder.CreateBitCast(data, GetPtrType(TYPE_SMALLINT));
       Value* d = builder.CreateLoad(ptr);
       result = builder.CreateCall(crc16_fn, ArrayRef<Value*>({result, d}));
-      Value* index[] = { GetIntConstant(TYPE_INT, 2) };
-      data = builder.CreateGEP(data, index);
+      Value* index[] = {GetIntConstant(TYPE_INT, 2)};
+      data = builder.CreateInBoundsGEP(data, index);
       num_bytes -= 2;
     }
 
@@ -1409,6 +1485,14 @@ Value* LlvmCodeGen::GetPtrTo(LlvmBuilder* builder, Value* v, const char* name) {
   return ptr;
 }
 
+Constant* LlvmCodeGen::ConstantToGVPtr(Type* type, Constant* ir_constant,
+    const string& name) {
+  GlobalVariable* gv = new GlobalVariable(*module_, type, true,
+      GlobalValue::PrivateLinkage, ir_constant, name);
+  return ConstantExpr::getGetElementPtr(NULL, gv,
+      ArrayRef<Constant*>({GetIntConstant(TYPE_INT, 0)}));
+}
+
 }
 
 namespace boost {
@@ -1416,7 +1500,7 @@ namespace boost {
 /// Handler for exceptions in cross-compiled functions.
 /// When boost is configured with BOOST_NO_EXCEPTIONS, it calls this handler instead of
 /// throwing the exception.
-void throw_exception(std::exception const &e) {
+[[noreturn]] void throw_exception(std::exception const& e) {
   LOG(FATAL) << "Cannot handle exceptions in codegen'd code " << e.what();
 }
 

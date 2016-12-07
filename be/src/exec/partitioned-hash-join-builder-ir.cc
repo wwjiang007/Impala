@@ -50,7 +50,7 @@ Status PhjBuilder::ProcessBuildBatch(
         // append it to the null_aware partition. We will need it later.
         if (UNLIKELY(
                 !AppendRow(null_aware_partition_->build_rows(), build_row, &status))) {
-          return std::move(status);
+          return status;
         }
       }
       continue;
@@ -58,20 +58,14 @@ Status PhjBuilder::ProcessBuildBatch(
     if (build_filters) {
       DCHECK_EQ(ctx->level(), 0)
           << "Runtime filters should not be built during repartitioning.";
-      for (const FilterContext& ctx : filters_) {
-        // TODO: codegen expr evaluation and hashing
-        if (ctx.local_bloom_filter == NULL) continue;
-        void* e = ctx.expr->GetValue(build_row);
-        uint32_t filter_hash = RawValue::GetHashValue(
-            e, ctx.expr->root()->type(), RuntimeFilterBank::DefaultHashSeed());
-        ctx.local_bloom_filter->Insert(filter_hash);
-      }
+      // TODO: unroll loop and codegen expr evaluation and hashing (IMPALA-3360).
+      for (const FilterContext& ctx : filters_) ctx.Insert(build_row);
     }
     const uint32_t hash = expr_vals_cache->CurExprValuesHash();
     const uint32_t partition_idx = hash >> (32 - NUM_PARTITIONING_BITS);
     Partition* partition = hash_partitions_[partition_idx];
     if (UNLIKELY(!AppendRow(partition->build_rows(), build_row, &status))) {
-      return std::move(status);
+      return status;
     }
   }
   return Status::OK();

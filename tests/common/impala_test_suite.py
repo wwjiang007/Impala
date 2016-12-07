@@ -43,7 +43,10 @@ from tests.common.test_dimensions import (
     create_exec_option_dimension,
     get_dataset_from_workload,
     load_table_info_dimension)
-from tests.common.test_result_verifier import verify_raw_results, verify_runtime_profile
+from tests.common.test_result_verifier import (
+    apply_error_match_filter,
+    verify_raw_results,
+    verify_runtime_profile)
 from tests.common.test_vector import TestDimension
 from tests.performance.query import Query
 from tests.performance.query_exec_functions import execute_using_jdbc
@@ -199,7 +202,7 @@ class ImpalaTestSuite(BaseTestSuite):
     Verifies that at least one of the strings in 'expected_str' is a substring of the
     actual exception string 'actual_str'.
     """
-    actual_str = actual_str.replace('\n', '')
+    actual_str = ''.join(apply_error_match_filter([actual_str.replace('\n', '')]))
     for expected_str in expected_strs:
       # In error messages, some paths are always qualified and some are not.
       # So, allow both $NAMENODE and $FILESYSTEM_PREFIX to be used in CATCH.
@@ -211,7 +214,8 @@ class ImpalaTestSuite(BaseTestSuite):
       # Strip newlines so we can split error message into multiple lines
       expected_str = expected_str.replace('\n', '')
       if expected_str in actual_str: return
-    assert False, 'Unexpected exception string: %s' % actual_str
+    assert False, 'Unexpected exception string. Expected: %s\nNot found in actual: %s' % \
+      (expected_str, actual_str)
 
   def __verify_results_and_errors(self, vector, test_section, result, use_db):
     """Verifies that both results and error sections are as expected. Rewrites both
@@ -328,7 +332,11 @@ class ImpalaTestSuite(BaseTestSuite):
           self.__restore_query_options(query_options_changed, target_impalad_client)
 
       if 'CATCH' in test_section:
-        assert test_section['CATCH'].strip() == ''
+        expected_str = " or ".join(test_section['CATCH']).strip() \
+          .replace('$FILESYSTEM_PREFIX', FILESYSTEM_PREFIX) \
+          .replace('$NAMENODE', NAMENODE) \
+          .replace('$IMPALA_HOME', IMPALA_HOME)
+        assert False, "Expected exception: %s" % expected_str
 
       assert result is not None
       assert result.success
@@ -337,6 +345,11 @@ class ImpalaTestSuite(BaseTestSuite):
       if encoding: result.data = [row.decode(encoding) for row in result.data]
       # Replace $NAMENODE in the expected results with the actual namenode URI.
       if 'RESULTS' in test_section:
+        # Combining 'RESULTS' with 'DML_RESULTS" is currently unsupported because
+        # __verify_results_and_errors calls verify_raw_results which always checks
+        # ERRORS, TYPES, LABELS, etc. which doesn't make sense if there are two
+        # different result sets to consider (IMPALA-4471).
+        assert 'DML_RESULTS' not in test_section
         self.__verify_results_and_errors(vector, test_section, result, use_db)
       else:
         # TODO: Can't validate errors without expected results for now.
@@ -349,6 +362,17 @@ class ImpalaTestSuite(BaseTestSuite):
             .replace('$IMPALA_HOME', IMPALA_HOME)
       if 'RUNTIME_PROFILE' in test_section:
         verify_runtime_profile(test_section['RUNTIME_PROFILE'], result.runtime_profile)
+
+      if 'DML_RESULTS' in test_section:
+        assert 'ERRORS' not in test_section
+        # The limit is specified to ensure the queries aren't unbounded. We shouldn't have
+        # test files that are checking the contents of tables larger than that anyways.
+        dml_results_query = "select * from %s limit 1000" % \
+            test_section['DML_RESULTS_TABLE']
+        dml_result = self.__execute_query(target_impalad_client, dml_results_query)
+        verify_raw_results(test_section, dml_result,
+            vector.get_value('table_format').file_format,
+            pytest.config.option.update_results, result_section='DML_RESULTS')
     if pytest.config.option.update_results:
       output_file = os.path.join('/tmp', test_file_name.replace('/','_') + ".test")
       write_test_file(output_file, sections, encoding=encoding)
@@ -466,24 +490,23 @@ class ImpalaTestSuite(BaseTestSuite):
     assert len(result.data) <= 1, 'Multiple values returned from scalar'
     return result.data[0] if len(result.data) == 1 else None
 
-  def exec_and_compare_hive_and_impala_hs2(self, stmt):
+  def exec_and_compare_hive_and_impala_hs2(self, stmt, compare = lambda x, y: x == y):
     """Compare Hive and Impala results when executing the same statment over HS2"""
     # execute_using_jdbc expects a Query object. Convert the query string into a Query
     # object
     query = Query()
     query.query_str = stmt
     # Run the statement targeting Hive
-    exec_opts = JdbcQueryExecConfig(impalad=HIVE_HS2_HOST_PORT)
+    exec_opts = JdbcQueryExecConfig(impalad=HIVE_HS2_HOST_PORT, transport='SASL')
     hive_results = execute_using_jdbc(query, exec_opts).data
 
     # Run the statement targeting Impala
-    exec_opts = JdbcQueryExecConfig(impalad=IMPALAD_HS2_HOST_PORT)
+    exec_opts = JdbcQueryExecConfig(impalad=IMPALAD_HS2_HOST_PORT, transport='NOSASL')
     impala_results = execute_using_jdbc(query, exec_opts).data
 
     # Compare the results
     assert (impala_results is not None) and (hive_results is not None)
-    for impala, hive in zip(impala_results, hive_results):
-      assert impala == hive
+    assert compare(impala_results, hive_results)
 
   def load_query_test_file(self, workload, file_name, valid_section_names=None,
       encoding=None):

@@ -80,10 +80,10 @@ Status HdfsAvroScanner::Open(ScannerContext* context) {
 Status HdfsAvroScanner::Codegen(HdfsScanNodeBase* node,
     const vector<ExprContext*>& conjunct_ctxs, Function** decode_avro_data_fn) {
   *decode_avro_data_fn = NULL;
-  DCHECK(node->runtime_state()->codegen_enabled());
+  DCHECK(node->runtime_state()->ShouldCodegen());
   LlvmCodeGen* codegen = node->runtime_state()->codegen();
   DCHECK(codegen != NULL);
-  Function* materialize_tuple_fn;
+  Function* materialize_tuple_fn = NULL;
   RETURN_IF_ERROR(CodegenMaterializeTuple(node, codegen, &materialize_tuple_fn));
   DCHECK(materialize_tuple_fn != NULL);
   RETURN_IF_ERROR(CodegenDecodeAvroData(codegen, materialize_tuple_fn,
@@ -562,7 +562,7 @@ Status HdfsAvroScanner::ProcessRange() {
     }
 
     if (decompressor_.get() != NULL && !decompressor_->reuse_output_buffer()) {
-      AttachPool(data_buffer_pool_.get(), true);
+      RETURN_IF_ERROR(AttachPool(data_buffer_pool_.get(), true));
     }
     RETURN_IF_ERROR(ReadSync());
   }
@@ -641,6 +641,7 @@ bool HdfsAvroScanner::MaterializeTuple(const AvroSchemaElement& record_schema,
         success = MaterializeTuple(element, pool, data, data_end, tuple);
         break;
       default:
+        success = false;
         DCHECK(false) << "Unsupported SchemaElement: " << type;
     }
     if (UNLIKELY(!success)) {
@@ -775,10 +776,10 @@ void HdfsAvroScanner::SetStatusValueOverflow(TErrorCode::type error_code, int64_
 // bail_out:           ; preds = %read_field11, %end_field3, %read_field2, %end_field,
 //   ret i1 false      ;         %read_field, %entry
 // }
-Status HdfsAvroScanner::CodegenMaterializeTuple(HdfsScanNodeBase* node,
-    LlvmCodeGen* codegen, Function** materialize_tuple_fn) {
+Status HdfsAvroScanner::CodegenMaterializeTuple(
+    HdfsScanNodeBase* node, LlvmCodeGen* codegen, Function** materialize_tuple_fn) {
   LLVMContext& context = codegen->context();
-  LlvmCodeGen::LlvmBuilder builder(context);
+  LlvmBuilder builder(context);
 
   Type* this_type = codegen->GetType(HdfsAvroScanner::LLVM_CLASS_NAME);
   DCHECK(this_type != NULL);
@@ -852,8 +853,7 @@ Status HdfsAvroScanner::CodegenReadRecord(
   }
   DCHECK_EQ(record.schema->type, AVRO_RECORD);
   LLVMContext& context = codegen->context();
-  LlvmCodeGen::LlvmBuilder* builder =
-      reinterpret_cast<LlvmCodeGen::LlvmBuilder*>(void_builder);
+  LlvmBuilder* builder = reinterpret_cast<LlvmBuilder*>(void_builder);
 
   // Codegen logic for parsing each field and, if necessary, populating a slot with the
   // result.
@@ -910,9 +910,8 @@ Status HdfsAvroScanner::CodegenReadRecord(
       // Write null field IR
       builder->SetInsertPoint(null_block);
       if (slot_idx != HdfsScanNode::SKIP_COLUMN) {
-        Function* set_null_fn = slot_desc->GetUpdateNullFn(codegen, true);
-        DCHECK(set_null_fn != NULL);
-        builder->CreateCall(set_null_fn, ArrayRef<Value*>({tuple_val}));
+        slot_desc->CodegenSetNullIndicator(
+            codegen, builder, tuple_val, codegen->true_value());
       }
       // LLVM requires all basic blocks to end with a terminating instruction
       builder->CreateBr(end_field_block);
@@ -923,7 +922,7 @@ Status HdfsAvroScanner::CodegenReadRecord(
 
     // Write read_field_block IR
     builder->SetInsertPoint(read_field_block);
-    Value* ret_val;
+    Value *ret_val = nullptr;
     if (field->schema->type == AVRO_RECORD) {
       BasicBlock* insert_before_block =
           (null_block != NULL) ? null_block : end_field_block;
@@ -943,11 +942,10 @@ Status HdfsAvroScanner::CodegenReadRecord(
 }
 
 Status HdfsAvroScanner::CodegenReadScalar(const AvroSchemaElement& element,
-    SlotDescriptor* slot_desc, LlvmCodeGen* codegen, void* void_builder,
-    Value* this_val, Value* pool_val, Value* tuple_val, Value* data_val,
-    Value* data_end_val, Value** ret_val) {
-  LlvmCodeGen::LlvmBuilder* builder =
-      reinterpret_cast<LlvmCodeGen::LlvmBuilder*>(void_builder);
+    SlotDescriptor* slot_desc, LlvmCodeGen* codegen, void* void_builder, Value* this_val,
+    Value* pool_val, Value* tuple_val, Value* data_val, Value* data_end_val,
+    Value** ret_val) {
+  LlvmBuilder* builder = reinterpret_cast<LlvmBuilder*>(void_builder);
   Function* read_field_fn;
   switch (element.schema->type) {
     case AVRO_BOOLEAN:

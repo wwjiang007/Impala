@@ -18,16 +18,17 @@
 package org.apache.impala.analysis;
 
 import java.util.ArrayList;
+import java.util.List;
 
 import org.apache.hadoop.hive.metastore.MetaStoreUtils;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import org.apache.impala.catalog.ArrayType;
 import org.apache.impala.catalog.StructField;
 import org.apache.impala.catalog.StructType;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TExprNode;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
@@ -87,7 +88,7 @@ public class Subquery extends Expr {
 
     // Set the subquery type based on the types of the exprs in the
     // result list of the associated SelectStmt.
-    ArrayList<Expr> stmtResultExprs = stmt_.getResultExprs();
+    List<Expr> stmtResultExprs = stmt_.getResultExprs();
     if (stmtResultExprs.size() == 1) {
       type_ = stmtResultExprs.get(0).getType();
       Preconditions.checkState(!type_.isComplexType());
@@ -109,7 +110,7 @@ public class Subquery extends Expr {
    * Check if the subquery's SelectStmt returns a single column of scalar type.
    */
   public boolean returnsScalarColumn() {
-    ArrayList<Expr> stmtResultExprs = stmt_.getResultExprs();
+    List<Expr> stmtResultExprs = stmt_.getResultExprs();
     if (stmtResultExprs.size() == 1 && stmtResultExprs.get(0).getType().isScalarType()) {
       return true;
     }
@@ -120,10 +121,10 @@ public class Subquery extends Expr {
    * Create a StrucType from the result expr list of a subquery's SelectStmt.
    */
   private StructType createStructTypeFromExprList() {
-    ArrayList<Expr> stmtResultExprs = stmt_.getResultExprs();
+    List<Expr> stmtResultExprs = stmt_.getResultExprs();
     ArrayList<StructField> structFields = Lists.newArrayList();
     // Check if we have unique labels
-    ArrayList<String> labels = stmt_.getColLabels();
+    List<String> labels = stmt_.getColLabels();
     boolean hasUniqueLabels = true;
     if (Sets.newHashSet(labels).size() != labels.size()) hasUniqueLabels = false;
 
@@ -147,6 +148,17 @@ public class Subquery extends Expr {
     }
     Preconditions.checkState(structFields.size() != 0);
     return new StructType(structFields);
+  }
+
+  /**
+   * Returns true if the toSql() of the Subqueries is identical. May return false for
+   * equivalent statements even due to minor syntactic differences like parenthesis.
+   * TODO: Switch to a less restrictive implementation.
+   */
+  @Override
+  public boolean equals(Object o) {
+    if (!super.equals(o)) return false;
+    return stmt_.toSql().equals(((Subquery)o).stmt_.toSql());
   }
 
   @Override

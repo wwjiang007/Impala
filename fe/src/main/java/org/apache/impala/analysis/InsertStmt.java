@@ -22,16 +22,12 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 
-import org.apache.impala.planner.TableSink;
-import com.google.common.collect.ImmutableList;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import org.apache.impala.authorization.Privilege;
 import org.apache.impala.authorization.PrivilegeRequestBuilder;
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.HBaseTable;
 import org.apache.impala.catalog.HdfsTable;
+import org.apache.impala.catalog.KuduColumn;
 import org.apache.impala.catalog.KuduTable;
 import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.Type;
@@ -39,6 +35,11 @@ import org.apache.impala.catalog.View;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.planner.DataSink;
+import org.apache.impala.planner.TableSink;
+import org.apache.impala.rewrite.ExprRewriter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Iterables;
@@ -46,7 +47,7 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 
 /**
- * Representation of a single insert statement, including the select statement
+ * Representation of a single insert or upsert statement, including the select statement
  * whose results are to be inserted.
  */
 public class InsertStmt extends StatementBase {
@@ -69,20 +70,22 @@ public class InsertStmt extends StatementBase {
   // auto-generate one (for insert into tbl()) during analysis.
   private final boolean needsGeneratedQueryStatement_;
 
-  // The column permutation is specified by writing INSERT INTO tbl(col3, col1, col2...)
+  // The column permutation is specified by writing:
+  //     (INSERT|UPSERT) INTO tbl(col3, col1, col2...)
   //
   // It is a mapping from select-list expr index to (non-partition) output column. If
   // null, will be set to the default permutation of all non-partition columns in Hive
-  // order.
+  // order or all columns for Kudu tables.
   //
   // A column is said to be 'mentioned' if it occurs either in the column permutation, or
   // the PARTITION clause. If columnPermutation is null, all non-partition columns are
   // considered mentioned.
   //
-  // Between them, the columnPermutation and the set of partitionKeyValues must mention to
+  // Between them, the columnPermutation and the set of partitionKeyValues must mention
   // every partition column in the target table exactly once. Other columns, if not
-  // explicitly mentioned, will be assigned NULL values. Partition columns are not
-  // defaulted to NULL by design, and are not just for NULL-valued partition slots.
+  // explicitly mentioned, will be assigned NULL values for INSERTs and left unassigned
+  // for UPSERTs. Partition columns are not defaulted to NULL by design, and are not just
+  // for NULL-valued partition slots.
   //
   // Dynamic partition keys may occur in either the permutation or the PARTITION
   // clause. Partition columns with static values may only be mentioned in the PARTITION
@@ -122,10 +125,21 @@ public class InsertStmt extends StatementBase {
   private boolean hasClusteredHint_ = false;
 
   // Output expressions that produce the final results to write to the target table. May
-  // include casts, and NullLiterals where an output column isn't explicitly mentioned.
-  // Set in prepareExpressions(). The i'th expr produces the i'th column of the target
-  // table.
+  // include casts. Set in prepareExpressions().
+  // If this is an INSERT on a non-Kudu table, it will contain one Expr for all
+  // non-partition columns of the target table with NullLiterals where an output
+  // column isn't explicitly mentioned. The i'th expr produces the i'th column of
+  // the target table.
+  //
+  // For Kudu tables (INSERT and UPSERT operations), it will contain one Expr per column
+  // mentioned in the query and mentionedColumns_ is used to map between the Exprs
+  // and columns in the target table.
   private ArrayList<Expr> resultExprs_ = Lists.newArrayList();
+
+  // Position mapping of exprs in resultExprs_ to columns in the target table -
+  // resultExprs_[i] produces the mentionedColumns_[i] column of the target table.
+  // Only used for Kudu tables, set in prepareExpressions().
+  private final List<Integer> mentionedColumns_ = Lists.newArrayList();
 
   // Set in analyze(). Exprs corresponding to key columns of Kudu tables. Empty for
   // non-Kudu tables.
@@ -134,12 +148,26 @@ public class InsertStmt extends StatementBase {
   // END: Members that need to be reset()
   /////////////////////////////////////////
 
-  // For tables with primary keys, indicates if duplicate key errors are ignored.
-  private final boolean ignoreDuplicates_;
+  // True iff this is an UPSERT operation. Only supported for Kudu tables.
+  private final boolean isUpsert_;
 
-  public InsertStmt(WithClause withClause, TableName targetTable, boolean overwrite,
+  public static InsertStmt createInsert(WithClause withClause, TableName targetTable,
+      boolean overwrite, List<PartitionKeyValue> partitionKeyValues,
+      List<String> planHints, QueryStmt queryStmt, List<String> columnPermutation) {
+    return new InsertStmt(withClause, targetTable, overwrite, partitionKeyValues,
+        planHints, queryStmt, columnPermutation, false);
+  }
+
+  public static InsertStmt createUpsert(WithClause withClause, TableName targetTable,
+      List<String> planHints, QueryStmt queryStmt, List<String> columnPermutation) {
+    return new InsertStmt(withClause, targetTable, false, null, planHints, queryStmt,
+        columnPermutation, true);
+  }
+
+  protected InsertStmt(WithClause withClause, TableName targetTable, boolean overwrite,
       List<PartitionKeyValue> partitionKeyValues, List<String> planHints,
-      QueryStmt queryStmt, List<String> columnPermutation, boolean ignoreDuplicates) {
+      QueryStmt queryStmt, List<String> columnPermutation, boolean isUpsert) {
+    Preconditions.checkState(!isUpsert || (!overwrite && partitionKeyValues == null));
     withClause_ = withClause;
     targetTableName_ = targetTable;
     originalTableName_ = targetTableName_;
@@ -150,7 +178,7 @@ public class InsertStmt extends StatementBase {
     needsGeneratedQueryStatement_ = (queryStmt == null);
     columnPermutation_ = columnPermutation;
     table_ = null;
-    ignoreDuplicates_ = ignoreDuplicates;
+    isUpsert_ = isUpsert;
   }
 
   /**
@@ -168,7 +196,7 @@ public class InsertStmt extends StatementBase {
     needsGeneratedQueryStatement_ = other.needsGeneratedQueryStatement_;
     columnPermutation_ = other.columnPermutation_;
     table_ = other.table_;
-    ignoreDuplicates_ = other.ignoreDuplicates_;
+    isUpsert_ = other.isUpsert_;
   }
 
   @Override
@@ -183,6 +211,7 @@ public class InsertStmt extends StatementBase {
     hasNoShuffleHint_ = false;
     hasClusteredHint_ = false;
     resultExprs_.clear();
+    mentionedColumns_.clear();
     primaryKeyExprs_.clear();
   }
 
@@ -208,8 +237,6 @@ public class InsertStmt extends StatementBase {
         // views and to ignore irrelevant ORDER BYs.
         Analyzer queryStmtAnalyzer = new Analyzer(analyzer);
         queryStmt_.analyze(queryStmtAnalyzer);
-        // Subqueries need to be rewritten by the StmtRewriter first.
-        if (analyzer.containsSubquery()) return;
         // Use getResultExprs() and not getBaseTblResultExprs() here because the final
         // substitution with TupleIsNullPredicate() wrapping happens in planning.
         selectListExprs = Expr.cloneList(queryStmt_.getResultExprs());
@@ -222,7 +249,7 @@ public class InsertStmt extends StatementBase {
 
     // Set target table and perform table-type specific analysis and auth checking.
     // Also checks if the target table is missing.
-    setTargetTable(analyzer);
+    analyzeTargetTable(analyzer);
 
     // Abort analysis if there are any missing tables beyond this point.
     if (!analyzer.getMissingTbls().isEmpty()) {
@@ -250,7 +277,9 @@ public class InsertStmt extends StatementBase {
     // Finally, prepareExpressions analyzes the expressions themselves, and confirms that
     // they are type-compatible with the target columns. Where columns are not mentioned
     // (and by this point, we know that missing columns are not partition columns),
-    // prepareExpressions assigns them a NULL literal expressions.
+    // prepareExpressions assigns them a NULL literal expressions, unless the target is
+    // a Kudu table, in which case we don't want to overwrite unmentioned columns with
+    // NULL.
 
     // An null permutation clause is the same as listing all non-partition columns in
     // order.
@@ -331,13 +360,12 @@ public class InsertStmt extends StatementBase {
 
   /**
    * Sets table_ based on targetTableName_ and performs table-type specific analysis:
-   * - Partition clause is invalid for unpartitioned Hdfs tables and HBase tables
-   * - Overwrite is invalid for HBase tables
-   * - Check INSERT privileges as well as write access to Hdfs paths
-   * - Cannot insert into a view
+   * - Cannot (in|up)sert into a view
+   * - Cannot (in|up)sert into a table with unsupported column types
+   * - Analysis specific to insert and upsert operations
    * Adds table_ to the analyzer's descriptor table if analysis succeeds.
    */
-  private void setTargetTable(Analyzer analyzer) throws AnalysisException {
+  private void analyzeTargetTable(Analyzer analyzer) throws AnalysisException {
     // If the table has not yet been set, load it from the Catalog. This allows for
     // callers to set a table to analyze that may not actually be created in the Catalog.
     // One example use case is CREATE TABLE AS SELECT which must run analysis on the
@@ -355,21 +383,42 @@ public class InsertStmt extends StatementBase {
           .allOf(Privilege.INSERT).toRequest());
     }
 
-    // We do not support inserting into views.
+    // We do not support (in|up)serting into views.
     if (table_ instanceof View) {
       throw new AnalysisException(
-          String.format("Impala does not support inserting into views: %s",
-          table_.getFullName()));
+          String.format("Impala does not support %sing into views: %s", getOpName(),
+              table_.getFullName()));
     }
 
+    // We do not support (in|up)serting into tables with unsupported column types.
     for (Column c: table_.getColumns()) {
       if (!c.getType().isSupported()) {
-        throw new AnalysisException(String.format("Unable to INSERT into target table " +
+        throw new AnalysisException(String.format("Unable to %s into target table " +
             "(%s) because the column '%s' has an unsupported type '%s'.",
-            targetTableName_, c.getName(), c.getType().toSql()));
+            getOpName(), targetTableName_, c.getName(), c.getType().toSql()));
       }
     }
 
+    // Perform operation-specific analysis.
+    if (isUpsert_) {
+      if (!(table_ instanceof KuduTable)) {
+        throw new AnalysisException("UPSERT is only supported for Kudu tables");
+      }
+    } else {
+      analyzeTableForInsert(analyzer);
+    }
+
+    // Add target table to descriptor table.
+    analyzer.getDescTbl().setTargetTable(table_);
+  }
+
+  /**
+   * Performs INSERT-specific table analysis:
+   * - Partition clause is invalid for unpartitioned or HBase tables
+   * - Check INSERT privileges as well as write access to Hdfs paths
+   * - Overwrite is invalid for HBase and Kudu tables
+   */
+  private void analyzeTableForInsert(Analyzer analyzer) throws AnalysisException {
     boolean isHBaseTable = (table_ instanceof HBaseTable);
     int numClusteringCols = isHBaseTable ? 0 : table_.getNumClusteringCols();
 
@@ -432,48 +481,28 @@ public class InsertStmt extends StatementBase {
     if (isHBaseTable && overwrite_) {
       throw new AnalysisException("HBase doesn't have a way to perform INSERT OVERWRITE");
     }
-
-    // Add target table to descriptor table.
-    analyzer.getDescTbl().setTargetTable(table_);
   }
 
   /**
-   * Checks that the column permutation + select list + static partition exprs +
-   * dynamic partition exprs collectively cover exactly all columns in the target table
-   * (not more of fewer).
+   * Checks that the column permutation + select list + static partition exprs + dynamic
+   * partition exprs collectively cover exactly all required columns in the target table,
+   * depending on the table type.
    */
   private void checkColumnCoverage(ArrayList<Column> selectExprTargetColumns,
       Set<String> mentionedColumnNames, int numSelectListExprs,
       int numStaticPartitionExprs) throws AnalysisException {
-    boolean isHBaseTable = (table_ instanceof HBaseTable);
-    int numClusteringCols = isHBaseTable ? 0 : table_.getNumClusteringCols();
-    // Check that all columns are mentioned by the permutation and partition clauses
+    // Check that all required cols are mentioned by the permutation and partition clauses
     if (selectExprTargetColumns.size() + numStaticPartitionExprs !=
         table_.getColumns().size()) {
       // We've already ruled out too many columns in the permutation and partition clauses
       // by checking that there are no duplicates and that every column mentioned actually
-      // exists. So all columns aren't mentioned in the query. If the unmentioned columns
-      // include partition columns, this is an error.
-      List<String> missingColumnNames = Lists.newArrayList();
-      for (Column column: table_.getColumns()) {
-        if (!mentionedColumnNames.contains(column.getName())) {
-          // HBase tables have a single row-key column which is always in position 0. It
-          // must be mentioned, since it is invalid to set it to NULL (which would
-          // otherwise happen by default).
-          if (isHBaseTable && column.getPosition() == 0) {
-            throw new AnalysisException("Row-key column '" + column.getName() +
-                "' must be explicitly mentioned in column permutation.");
-          }
-          if (column.getPosition() < numClusteringCols) {
-            missingColumnNames.add(column.getName());
-          }
-        }
-      }
-
-      if (!missingColumnNames.isEmpty()) {
-        throw new AnalysisException(
-            "Not enough partition columns mentioned in query. Missing columns are: " +
-            Joiner.on(", ").join(missingColumnNames));
+      // exists. So all columns aren't mentioned in the query.
+      if (table_ instanceof KuduTable) {
+        checkRequiredKuduColumns(mentionedColumnNames);
+      } else if (table_ instanceof HBaseTable) {
+        checkRequiredHBaseColumns(mentionedColumnNames);
+      } else if (table_.getNumClusteringCols() > 0) {
+        checkRequiredPartitionedColumns(mentionedColumnNames);
       }
     }
 
@@ -506,6 +535,66 @@ public class InsertStmt extends StatementBase {
   }
 
   /**
+   * For a Kudu table, checks that all key columns are mentioned.
+   */
+  private void checkRequiredKuduColumns(Set<String> mentionedColumnNames)
+      throws AnalysisException {
+    Preconditions.checkState(table_ instanceof KuduTable);
+    List<String> keyColumns = ((KuduTable) table_).getPrimaryKeyColumnNames();
+    List<String> missingKeyColumnNames = Lists.newArrayList();
+    for (Column column : table_.getColumns()) {
+      if (!mentionedColumnNames.contains(column.getName())
+          && keyColumns.contains(column.getName())) {
+        missingKeyColumnNames.add(column.getName());
+      }
+    }
+
+    if (!missingKeyColumnNames.isEmpty()) {
+      throw new AnalysisException(String.format(
+          "All primary key columns must be specified for %sing into Kudu tables. " +
+          "Missing columns are: %s", getOpName(),
+          Joiner.on(", ").join(missingKeyColumnNames)));
+    }
+  }
+
+  /**
+   * For an HBase table, checks that the row-key column is mentioned.
+   * HBase tables have a single row-key column which is always in position 0. It
+   * must be mentioned, since it is invalid to set it to NULL (which would
+   * otherwise happen by default).
+   */
+  private void checkRequiredHBaseColumns(Set<String> mentionedColumnNames)
+      throws AnalysisException {
+    Preconditions.checkState(table_ instanceof HBaseTable);
+    Column column = table_.getColumns().get(0);
+    if (!mentionedColumnNames.contains(column.getName())) {
+      throw new AnalysisException("Row-key column '" + column.getName() +
+          "' must be explicitly mentioned in column permutation.");
+    }
+  }
+
+  /**
+   * For partitioned tables, checks that all partition columns are mentioned.
+   */
+  private void checkRequiredPartitionedColumns(Set<String> mentionedColumnNames)
+      throws AnalysisException {
+    int numClusteringCols = table_.getNumClusteringCols();
+    List<String> missingPartitionColumnNames = Lists.newArrayList();
+    for (Column column : table_.getColumns()) {
+      if (!mentionedColumnNames.contains(column.getName())
+          && column.getPosition() < numClusteringCols) {
+        missingPartitionColumnNames.add(column.getName());
+      }
+    }
+
+    if (!missingPartitionColumnNames.isEmpty()) {
+      throw new AnalysisException(
+          "Not enough partition columns mentioned in query. Missing columns are: " +
+          Joiner.on(", ").join(missingPartitionColumnNames));
+    }
+  }
+
+  /**
    * Performs four final parts of the analysis:
    * 1. Checks type compatibility between all expressions and their targets
    *
@@ -514,7 +603,7 @@ public class InsertStmt extends StatementBase {
    *
    * 3. Populates resultExprs_ with type-compatible expressions, in Hive column order,
    * for all expressions in the select-list. Unmentioned columns are assigned NULL literal
-   * expressions.
+   * expressions, unless the target is a Kudu table.
    *
    * 4. Result exprs for key columns of Kudu tables are stored in primaryKeyExprs_.
    *
@@ -554,7 +643,7 @@ public class InsertStmt extends StatementBase {
           // tableColumns is guaranteed to exist after the earlier analysis checks
           Column tableColumn = table_.getColumn(pkv.getColName());
           Expr compatibleExpr = checkTypeCompatibility(
-              targetTableName_.toString(), tableColumn, pkv.getValue());
+              targetTableName_.toString(), tableColumn, pkv.getLiteralValue());
           tmpPartitionKeyExprs.add(compatibleExpr);
           tmpPartitionKeyNames.add(pkv.getColName());
         }
@@ -579,29 +668,42 @@ public class InsertStmt extends StatementBase {
       expr.analyze(analyzer);
     }
 
+    boolean isKuduTable = table_ instanceof KuduTable;
     // Finally, 'undo' the permutation so that the selectListExprs are in Hive column
-    // order, and add NULL expressions to all missing columns.
-    for (Column tblColumn: table_.getColumnsInHiveOrder()) {
+    // order, and add NULL expressions to all missing columns, unless this is an UPSERT.
+    ArrayList<Column> columns = table_.getColumnsInHiveOrder();
+    for (int col = 0; col < columns.size(); ++col) {
+      Column tblColumn = columns.get(col);
       boolean matchFound = false;
       for (int i = 0; i < selectListExprs.size(); ++i) {
         if (selectExprTargetColumns.get(i).getName().equals(tblColumn.getName())) {
           resultExprs_.add(selectListExprs.get(i));
+          if (isKuduTable) mentionedColumns_.add(col);
           matchFound = true;
           break;
         }
       }
       // If no match is found, either the column is a clustering column with a static
       // value, or it was unmentioned and therefore should have a NULL select-list
-      // expression.
+      // expression if this is an INSERT and the target is not a Kudu table.
       if (!matchFound) {
         if (tblColumn.getPosition() >= numClusteringCols) {
-          // Unmentioned non-clustering columns get NULL literals with the appropriate
-          // target type because Parquet cannot handle NULL_TYPE (IMPALA-617).
-          resultExprs_.add(NullLiteral.create(tblColumn.getType()));
+          if (isKuduTable) {
+            Preconditions.checkState(tblColumn instanceof KuduColumn);
+            KuduColumn kuduCol = (KuduColumn) tblColumn;
+            if (!kuduCol.hasDefaultValue() && !kuduCol.isNullable()) {
+              throw new AnalysisException("Missing values for column that is not " +
+                  "nullable and has no default value " + kuduCol.getName());
+            }
+          } else {
+            // Unmentioned non-clustering columns get NULL literals with the appropriate
+            // target type because Parquet cannot handle NULL_TYPE (IMPALA-617).
+            resultExprs_.add(NullLiteral.create(tblColumn.getType()));
+          }
         }
       }
       // Store exprs for Kudu key columns.
-      if (matchFound && table_ instanceof KuduTable) {
+      if (matchFound && isKuduTable) {
         KuduTable kuduTable = (KuduTable) table_;
         if (kuduTable.isPrimaryKeyColumn(tblColumn.getName())) {
           primaryKeyExprs_.add(Iterables.getLast(resultExprs_));
@@ -659,6 +761,17 @@ public class InsertStmt extends StatementBase {
     }
   }
 
+  @Override
+  public ArrayList<Expr> getResultExprs() { return resultExprs_; }
+
+  @Override
+  public void rewriteExprs(ExprRewriter rewriter) throws AnalysisException {
+    Preconditions.checkState(isAnalyzed());
+    queryStmt_.rewriteExprs(rewriter);
+  }
+
+  private String getOpName() { return isUpsert_ ? "UPSERT" : "INSERT"; }
+
   public List<String> getPlanHints() { return planHints_; }
   public TableName getTargetTableName() { return targetTableName_; }
   public Table getTargetTable() { return table_; }
@@ -674,14 +787,20 @@ public class InsertStmt extends StatementBase {
   public boolean hasShuffleHint() { return hasShuffleHint_; }
   public boolean hasNoShuffleHint() { return hasNoShuffleHint_; }
   public boolean hasClusteredHint() { return hasClusteredHint_; }
-  public ArrayList<Expr> getResultExprs() { return resultExprs_; }
   public ArrayList<Expr> getPrimaryKeyExprs() { return primaryKeyExprs_; }
+
+  public List<String> getMentionedColumns() {
+    List<String> result = Lists.newArrayList();
+    List<Column> columns = table_.getColumns();
+    for (Integer i: mentionedColumns_) result.add(columns.get(i).getName());
+    return result;
+  }
 
   public DataSink createDataSink() {
     // analyze() must have been called before.
     Preconditions.checkState(table_ != null);
-    return TableSink.create(table_, TableSink.Op.INSERT, partitionKeyExprs_,
-        ImmutableList.<Integer>of(), overwrite_, ignoreDuplicates_);
+    return TableSink.create(table_, isUpsert_ ? TableSink.Op.UPSERT : TableSink.Op.INSERT,
+        partitionKeyExprs_, mentionedColumns_, overwrite_, hasClusteredHint_);
   }
 
   /**
@@ -701,11 +820,10 @@ public class InsertStmt extends StatementBase {
 
     if (withClause_ != null) strBuilder.append(withClause_.toSql() + " ");
 
-    strBuilder.append("INSERT ");
+    strBuilder.append(getOpName() + " ");
     if (overwrite_) {
       strBuilder.append("OVERWRITE ");
     } else {
-      if (ignoreDuplicates_) strBuilder.append("IGNORE ");
       strBuilder.append("INTO ");
     }
     strBuilder.append("TABLE " + originalTableName_);

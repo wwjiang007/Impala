@@ -100,7 +100,7 @@ struct DebugOptions;
 ///
 /// TODO: move into separate subdirectory and move nested classes into separate files
 /// and unnest them
-class Coordinator {
+class Coordinator { // NOLINT: The member variables could be re-ordered to save space
  public:
   Coordinator(const QuerySchedule& schedule, ExecEnv* exec_env,
       RuntimeProfile::EventSequence* events);
@@ -121,8 +121,8 @@ class Coordinator {
   /// Fills 'results' with up to 'max_rows' rows. May return fewer than 'max_rows'
   /// rows, but will not return more.
   ///
-  /// If *eos is true, execution has completed and GetNext() must not be called
-  /// again.
+  /// If *eos is true, execution has completed. Subsequent calls to GetNext() will be a
+  /// no-op.
   ///
   /// GetNext() will not set *eos=true until all fragment instances have either completed
   /// or have failed.
@@ -199,6 +199,7 @@ class Coordinator {
     return exec_summary_;
   }
 
+  /// See the ImpalaServer class comment for the required lock acquisition order.
   SpinLock& GetExecSummaryLock() const { return exec_summary_lock_; }
 
   /// Receive a local filter update from a fragment instance. Aggregate that filter update
@@ -351,6 +352,7 @@ class Coordinator {
   boost::scoped_ptr<ObjectPool> obj_pool_;
 
   /// Execution summary for this query.
+  /// See the ImpalaServer class comment for the required lock acquisition order.
   mutable SpinLock exec_summary_lock_;
   TExecSummary exec_summary_;
 

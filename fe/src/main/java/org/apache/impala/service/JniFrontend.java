@@ -42,14 +42,18 @@ import org.apache.impala.catalog.DataSource;
 import org.apache.impala.catalog.Db;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.Role;
+import org.apache.impala.catalog.StructType;
+import org.apache.impala.catalog.Type;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.common.JniUtil;
+import org.apache.impala.thrift.TBackendGflags;
 import org.apache.impala.thrift.TBuildTestDescriptorTableParams;
 import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TDatabase;
 import org.apache.impala.thrift.TDescribeDbParams;
+import org.apache.impala.thrift.TDescribeOutputStyle;
 import org.apache.impala.thrift.TDescribeResult;
 import org.apache.impala.thrift.TDescribeTableParams;
 import org.apache.impala.thrift.TDescriptorTable;
@@ -115,18 +119,20 @@ public class JniFrontend {
   /**
    * Create a new instance of the Jni Frontend.
    */
-  public JniFrontend(boolean lazy, String serverName, String authorizationPolicyFile,
-      String sentryConfigFile, String authPolicyProviderClass, int impalaLogLevel,
-      int otherLogLevel, boolean allowAuthToLocal, String defaultKuduMasterHosts)
-      throws InternalException {
-    BackendConfig.setAuthToLocal(allowAuthToLocal);
-    GlogAppender.Install(TLogLevel.values()[impalaLogLevel],
-        TLogLevel.values()[otherLogLevel]);
+  public JniFrontend(byte[] thriftBackendConfig) throws ImpalaException, TException {
+    TBackendGflags cfg = new TBackendGflags();
+    JniUtil.deserializeThrift(protocolFactory_, cfg, thriftBackendConfig);
+
+    BackendConfig.create(cfg);
+
+    GlogAppender.Install(TLogLevel.values()[cfg.impala_log_lvl],
+        TLogLevel.values()[cfg.non_impala_java_vlog]);
 
     // Validate the authorization configuration before initializing the Frontend.
     // If there are any configuration problems Impala startup will fail.
-    AuthorizationConfig authConfig = new AuthorizationConfig(serverName,
-        authorizationPolicyFile, sentryConfigFile, authPolicyProviderClass);
+    AuthorizationConfig authConfig = new AuthorizationConfig(cfg.server_name,
+        cfg.authorization_policy_file, cfg.sentry_config,
+        cfg.authorization_policy_provider_class);
     authConfig.validateConfig();
     if (authConfig.isEnabled()) {
       LOG.info(String.format("Authorization is 'ENABLED' using %s",
@@ -137,7 +143,7 @@ public class JniFrontend {
     }
     LOG.info(JniUtil.getJavaVersion());
 
-    frontend_ = new Frontend(authConfig, defaultKuduMasterHosts);
+    frontend_ = new Frontend(authConfig, cfg.kudu_master_hosts);
   }
 
   /**
@@ -151,7 +157,9 @@ public class JniFrontend {
 
     StringBuilder explainString = new StringBuilder();
     TExecRequest result = frontend_.createExecRequest(queryCtx, explainString);
-    if (explainString.length() > 0) LOG.debug(explainString.toString());
+    if (explainString.length() > 0 && LOG.isTraceEnabled()) {
+      LOG.trace(explainString.toString());
+    }
 
     // TODO: avoid creating serializer for each query?
     TSerializer serializer = new TSerializer(protocolFactory_);
@@ -226,7 +234,7 @@ public class JniFrontend {
     TQueryCtx queryCtx = new TQueryCtx();
     JniUtil.deserializeThrift(protocolFactory_, queryCtx, thriftQueryContext);
     String plan = frontend_.getExplainString(queryCtx);
-    LOG.debug("Explain plan: " + plan);
+    if (LOG.isTraceEnabled()) LOG.trace("Explain plan: " + plan);
     return plan;
   }
 
@@ -443,9 +451,15 @@ public class JniFrontend {
     TDescribeTableParams params = new TDescribeTableParams();
     JniUtil.deserializeThrift(protocolFactory_, params, thriftDescribeTableParams);
 
-    TDescribeResult result = frontend_.describeTable(
-        params.getDb(), params.getTable_name(), params.getOutput_style(),
-        params.getResult_struct());
+    Preconditions.checkState(params.isSetTable_name() ^ params.isSetResult_struct());
+    TDescribeResult result = null;
+    if (params.isSetTable_name()) {
+      result = frontend_.describeTable(params.getTable_name(), params.output_style);
+    } else {
+      Preconditions.checkState(params.output_style == TDescribeOutputStyle.MINIMAL);
+      StructType structType = (StructType)Type.fromThrift(params.result_struct);
+      result = DescribeResultFactory.buildDescribeMinimalResult(structType);
+    }
 
     TSerializer serializer = new TSerializer(protocolFactory_);
     try {

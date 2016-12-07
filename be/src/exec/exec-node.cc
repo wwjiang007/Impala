@@ -129,6 +129,7 @@ ExecNode::ExecNode(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl
     rows_returned_counter_(NULL),
     rows_returned_rate_(NULL),
     containing_subplan_(NULL),
+    disable_codegen_(tnode.disable_codegen),
     is_closed_(false) {
   InitRuntimeProfile(PrintPlanNodeType(tnode.node_type));
 }
@@ -165,7 +166,7 @@ Status ExecNode::Prepare(RuntimeState* state) {
 }
 
 void ExecNode::Codegen(RuntimeState* state) {
-  DCHECK(state->codegen_enabled());
+  DCHECK(state->ShouldCodegen());
   DCHECK(state->codegen() != NULL);
   for (int i = 0; i < children_.size(); ++i) {
     children_[i]->Codegen(state);
@@ -429,7 +430,7 @@ Status ExecNode::ExecDebugAction(TExecNodePhase::type phase, RuntimeState* state
     return Status::OK();
   }
   if (debug_action_ == TDebugAction::MEM_LIMIT_EXCEEDED) {
-    mem_tracker()->MemLimitExceeded(state, "Debug Action: MEM_LIMIT_EXCEEDED");
+    return mem_tracker()->MemLimitExceeded(state, "Debug Action: MEM_LIMIT_EXCEEDED");
   }
   return Status::OK();
 }
@@ -455,6 +456,18 @@ void ExecNode::AddExprCtxsToFree(const SortExecExprs& sort_exec_exprs) {
   AddExprCtxsToFree(sort_exec_exprs.sort_tuple_slot_expr_ctxs());
   AddExprCtxsToFree(sort_exec_exprs.lhs_ordering_expr_ctxs());
   AddExprCtxsToFree(sort_exec_exprs.rhs_ordering_expr_ctxs());
+}
+
+void ExecNode::AddCodegenDisabledMessage(RuntimeState* state) {
+  if (state->CodegenDisabledByQueryOption()) {
+    runtime_profile()->AddCodegenMsg(false, "disabled by query option DISABLE_CODEGEN");
+  } else if (state->CodegenDisabledByHint()) {
+    runtime_profile()->AddCodegenMsg(false, "disabled due to optimization hints");
+  }
+}
+
+bool ExecNode::IsNodeCodegenDisabled() const {
+  return disable_codegen_;
 }
 
 // Codegen for EvalConjuncts.  The generated signature is
@@ -499,6 +512,10 @@ Status ExecNode::CodegenEvalConjuncts(LlvmCodeGen* codegen,
   for (int i = 0; i < conjunct_ctxs.size(); ++i) {
     RETURN_IF_ERROR(
         conjunct_ctxs[i]->root()->GetCodegendComputeFn(codegen, &conjunct_fns[i]));
+    if (i >= LlvmCodeGen::CODEGEN_INLINE_EXPRS_THRESHOLD) {
+      // Avoid bloating EvalConjuncts by inlining everything into it.
+      codegen->SetNoInline(conjunct_fns[i]);
+    }
   }
 
   // Construct function signature to match
@@ -519,7 +536,7 @@ Status ExecNode::CodegenEvalConjuncts(LlvmCodeGen* codegen,
       LlvmCodeGen::NamedVariable("num_ctxs", codegen->GetType(TYPE_INT)));
   prototype.AddArgument(LlvmCodeGen::NamedVariable("row", tuple_row_ptr_type));
 
-  LlvmCodeGen::LlvmBuilder builder(codegen->context());
+  LlvmBuilder builder(codegen->context());
   Value* args[3];
   *fn = prototype.GeneratePrototype(&builder, args);
   Value* ctxs_arg = args[0];
@@ -558,12 +575,16 @@ Status ExecNode::CodegenEvalConjuncts(LlvmCodeGen* codegen,
     builder.CreateRet(codegen->true_value());
   }
 
+  // Avoid inlining EvalConjuncts into caller if it is large.
+  if (conjunct_ctxs.size() > LlvmCodeGen::CODEGEN_INLINE_EXPR_BATCH_THRESHOLD) {
+    codegen->SetNoInline(*fn);
+  }
+
   *fn = codegen->FinalizeFunction(*fn);
   if (*fn == NULL) {
     return Status("ExecNode::CodegenEvalConjuncts(): codegen'd EvalConjuncts() function "
-        "failed verification, see log");
+                  "failed verification, see log");
   }
   return Status::OK();
 }
-
 }

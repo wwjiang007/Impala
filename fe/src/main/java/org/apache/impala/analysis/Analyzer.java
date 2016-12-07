@@ -51,13 +51,15 @@ import org.apache.impala.catalog.TableLoadingException;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.catalog.View;
 import org.apache.impala.common.AnalysisException;
-import org.apache.impala.common.Id;
 import org.apache.impala.common.IdGenerator;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.common.Pair;
 import org.apache.impala.common.PrintUtils;
 import org.apache.impala.planner.PlanNode;
+import org.apache.impala.rewrite.BetweenToCompoundRule;
+import org.apache.impala.rewrite.ExprRewriter;
+import org.apache.impala.rewrite.FoldConstantsRule;
 import org.apache.impala.service.FeSupport;
 import org.apache.impala.thrift.TAccessEvent;
 import org.apache.impala.thrift.TCatalogObjectType;
@@ -148,6 +150,7 @@ public class Analyzer {
   private String authErrorMsg_;
 
   // If false, privilege requests will not be registered in the analyzer.
+  // Note: it's not the purpose of this flag to control if security is enabled in general.
   private boolean enablePrivChecks_ = true;
 
   // By default, all registered semi-joined tuples are invisible, i.e., their slots
@@ -295,6 +298,10 @@ public class Analyzer {
     // same version of a table in a single query, we cache all referenced tables here.
     // TODO: Investigate what to do with other catalog objects.
     private final HashMap<TableName, Table> referencedTables_ = Maps.newHashMap();
+
+    // Expr rewriter for foldinc constants.
+    private final ExprRewriter constantFolder_ =
+        new ExprRewriter(FoldConstantsRule.INSTANCE);
 
     // Timeline of important events in the planning process, used for debugging /
     // profiling
@@ -551,11 +558,11 @@ public class Analyzer {
         if (rawPath.size() > 1) {
           registerPrivReq(new PrivilegeRequestBuilder()
               .onTable(rawPath.get(0), rawPath.get(1))
-              .allOf(Privilege.SELECT).toRequest());
+              .allOf(tableRef.getPrivilege()).toRequest());
         }
         registerPrivReq(new PrivilegeRequestBuilder()
             .onTable(getDefaultDb(), rawPath.get(0))
-            .allOf(Privilege.SELECT).toRequest());
+            .allOf(tableRef.getPrivilege()).toRequest());
       }
       throw e;
     } catch (TableLoadingException e) {
@@ -597,8 +604,10 @@ public class Analyzer {
       globalState_.fullOuterJoinedConjuncts.put(e.getId(), currentOuterJoin);
       break;
     }
-    LOG.trace("registerFullOuterJoinedConjunct: " +
-        globalState_.fullOuterJoinedConjuncts.toString());
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("registerFullOuterJoinedConjunct: " +
+          globalState_.fullOuterJoinedConjuncts.toString());
+    }
   }
 
   /**
@@ -609,8 +618,10 @@ public class Analyzer {
     for (TupleId tid: tids) {
       globalState_.fullOuterJoinedTupleIds.put(tid, rhsRef);
     }
-    LOG.trace("registerFullOuterJoinedTids: " +
-        globalState_.fullOuterJoinedTupleIds.toString());
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("registerFullOuterJoinedTids: " +
+          globalState_.fullOuterJoinedTupleIds.toString());
+    }
   }
 
   /**
@@ -620,7 +631,10 @@ public class Analyzer {
     for (TupleId tid: tids) {
       globalState_.outerJoinedTupleIds.put(tid, rhsRef);
     }
-    LOG.trace("registerOuterJoinedTids: " + globalState_.outerJoinedTupleIds.toString());
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("registerOuterJoinedTids: " +
+          globalState_.outerJoinedTupleIds.toString());
+    }
   }
 
   /**
@@ -653,6 +667,7 @@ public class Analyzer {
   }
 
   public TableRef getTableRef(TupleId tid) { return tableRefMap_.get(tid); }
+  public ExprRewriter getConstantFolder() { return globalState_.constantFolder_; }
 
   /**
    * Given a "table alias"."column alias", return the SlotDescriptor
@@ -1039,6 +1054,13 @@ public class Analyzer {
     if ((!fromHavingClause && !hasEmptySpjResultSet_)
         || (fromHavingClause && !hasEmptyResultSet_)) {
       try {
+        if (conjunct instanceof BetweenPredicate) {
+          // Rewrite the BetweenPredicate into a CompoundPredicate so we can evaluate it
+          // below (BetweenPredicates are not executable). We might be in the first
+          // analysis pass, so the conjunct may not have been rewritten yet.
+          ExprRewriter rewriter = new ExprRewriter(BetweenToCompoundRule.INSTANCE);
+          conjunct = rewriter.rewrite(conjunct, this);
+        }
         if (!FeSupport.EvalPredicate(conjunct, globalState_.queryCtx)) {
           if (fromHavingClause) {
             hasEmptyResultSet_ = true;
@@ -1068,10 +1090,14 @@ public class Analyzer {
     registerFullOuterJoinedConjunct(e);
 
     // register single tid conjuncts
-    if (tupleIds.size() == 1) globalState_.singleTidConjuncts.add(e.getId());
+    if (tupleIds.size() == 1 && !e.isAuxExpr()) {
+      globalState_.singleTidConjuncts.add(e.getId());
+    }
 
-    LOG.trace("register tuple/slotConjunct: " + Integer.toString(e.getId().asInt())
-        + " " + e.toSql() + " " + e.debugString());
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("register tuple/slotConjunct: " + Integer.toString(e.getId().asInt())
+      + " " + e.toSql() + " " + e.debugString());
+    }
 
     if (!(e instanceof BinaryPredicate)) return;
     BinaryPredicate binaryPred = (BinaryPredicate) e;
@@ -1122,7 +1148,9 @@ public class Analyzer {
     // create an eq predicate between lhs and rhs
     BinaryPredicate p = new BinaryPredicate(BinaryPredicate.Operator.EQ, lhs, rhs);
     p.setIsAuxExpr();
-    LOG.trace("register equiv predicate: " + p.toSql() + " " + p.debugString());
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("register equiv predicate: " + p.toSql() + " " + p.debugString());
+    }
     registerConjunct(p);
   }
 
@@ -1146,7 +1174,6 @@ public class Analyzer {
    */
   public List<Expr> getUnassignedConjuncts(
       List<TupleId> tupleIds, boolean inclOjConjuncts) {
-    LOG.trace("getUnassignedConjuncts for " + Id.printIds(tupleIds));
     List<Expr> result = Lists.newArrayList();
     for (Expr e: globalState_.conjuncts.values()) {
       if (e.isBoundByTupleIds(tupleIds)
@@ -1155,7 +1182,6 @@ public class Analyzer {
           && ((inclOjConjuncts && !e.isConstant())
               || !globalState_.ojClauseByConjunct.containsKey(e.getId()))) {
         result.add(e);
-        LOG.trace("getUnassignedConjunct: " + e.toSql());
       }
     }
     return result;
@@ -1191,22 +1217,19 @@ public class Analyzer {
    * Outer Join clause.
    */
   public List<Expr> getUnassignedConjuncts(List<TupleId> tupleIds) {
-    LOG.trace("getUnassignedConjuncts for node with " + Id.printIds(tupleIds));
     List<Expr> result = Lists.newArrayList();
     for (Expr e: getUnassignedConjuncts(tupleIds, true)) {
-      if (canEvalPredicate(tupleIds, e)) {
-        result.add(e);
-        LOG.trace("getUnassignedConjunct: " + e.toSql());
-      }
+      if (canEvalPredicate(tupleIds, e)) result.add(e);
     }
     return result;
   }
 
   /**
-   * Returns true if e must be evaluated by a join node. Note that it may still be
-   * safe to evaluate e elsewhere as well, but in any case the join must evaluate e.
+   * Returns true if 'e' must be evaluated after or by a join node. Note that it may
+   * still be safe to evaluate 'e' elsewhere as well, but in any case 'e' must be
+   * evaluated again by or after a join.
    */
-  public boolean evalByJoin(Expr e) {
+  public boolean evalAfterJoin(Expr e) {
     List<TupleId> tids = Lists.newArrayList();
     e.getIds(tids, null);
     if (tids.isEmpty()) return false;
@@ -1233,7 +1256,6 @@ public class Analyzer {
         Expr e = globalState_.conjuncts.get(conjunctId);
         Preconditions.checkNotNull(e);
         result.add(e);
-        LOG.trace("getUnassignedOjConjunct: " + e.toSql());
       }
     }
     return result;
@@ -1297,9 +1319,11 @@ public class Analyzer {
       Expr e = globalState_.conjuncts.get(conjunctId);
       Preconditions.checkState(e != null);
       if (!canEvalFullOuterJoinedConjunct(e, nodeTblRefIds) ||
-          !canEvalAntiJoinedConjunct(e, nodeTblRefIds)) {
+          !canEvalAntiJoinedConjunct(e, nodeTblRefIds) ||
+          !canEvalOuterJoinedConjunct(e, nodeTblRefIds)) {
         continue;
       }
+
       if (ojClauseConjuncts != null && !ojClauseConjuncts.contains(conjunctId)) continue;
       result.add(e);
     }
@@ -1307,13 +1331,23 @@ public class Analyzer {
   }
 
   /**
-   * Checks if a conjunct can be evaluated at a node materializing a list of tuple ids
-   * 'tids'.
+   * Returns false if 'e' references a full outer joined tuple and it is incorrect to
+   * evaluate 'e' at a node materializing 'tids'. Returns true otherwise.
    */
   public boolean canEvalFullOuterJoinedConjunct(Expr e, List<TupleId> tids) {
     TableRef fullOuterJoin = getFullOuterJoinRef(e);
     if (fullOuterJoin == null) return true;
     return tids.containsAll(fullOuterJoin.getAllTableRefIds());
+  }
+
+  /**
+   * Returns false if 'e' originates from an outer-join On-clause and it is incorrect to
+   * evaluate 'e' at a node materializing 'tids'. Returns true otherwise.
+   */
+  public boolean canEvalOuterJoinedConjunct(Expr e, List<TupleId> tids) {
+    TableRef outerJoin = globalState_.ojClauseByConjunct.get(e.getId());
+    if (outerJoin == null) return true;
+    return tids.containsAll(outerJoin.getAllTableRefIds());
   }
 
   /**
@@ -1327,8 +1361,6 @@ public class Analyzer {
    *   referenced tids the last join to outer-join this tid has been materialized
    */
   public boolean canEvalPredicate(List<TupleId> tupleIds, Expr e) {
-    LOG.trace("canEval: " + e.toSql() + " " + e.debugString() + " "
-        + Id.printIds(tupleIds));
     if (!e.isBoundByTupleIds(tupleIds)) return false;
     ArrayList<TupleId> tids = Lists.newArrayList();
     e.getIds(tids, null);
@@ -1383,14 +1415,10 @@ public class Analyzer {
     if (isAntiJoinedConjunct(e)) return canEvalAntiJoinedConjunct(e, tupleIds);
 
     for (TupleId tid: tids) {
-      LOG.trace("canEval: checking tid " + tid.toString());
       TableRef rhsRef = getLastOjClause(tid);
       // this is not outer-joined; ignore
       if (rhsRef == null) continue;
       // check whether the last join to outer-join 'tid' is materialized by tupleIds
-      boolean contains = tupleIds.containsAll(rhsRef.getAllTableRefIds());
-      LOG.trace("canEval: contains=" + (contains ? "true " : "false ")
-          + Id.printIds(tupleIds) + " " + Id.printIds(rhsRef.getAllTableRefIds()));
       if (!tupleIds.containsAll(rhsRef.getAllTableRefIds())) return false;
     }
     return true;
@@ -1509,7 +1537,9 @@ public class Analyzer {
           // to prevent callers from inadvertently marking the srcConjunct as assigned.
           p.setId(null);
           if (p instanceof BinaryPredicate) ((BinaryPredicate) p).setIsInferred();
-          LOG.trace("new pred: " + p.toSql() + " " + p.debugString());
+          if (LOG.isTraceEnabled()) {
+            LOG.trace("new pred: " + p.toSql() + " " + p.debugString());
+          }
         }
 
         if (markAssigned) {
@@ -1528,18 +1558,22 @@ public class Analyzer {
             }
           }
 
-          // Check if either srcConjunct or the generated predicate needs to be evaluated
-          // at a join node (IMPALA-2018).
-          boolean evalByJoin =
-              (evalByJoin(srcConjunct)
-               && (globalState_.ojClauseByConjunct.get(srcConjunct.getId())
-                != globalState_.outerJoinedTupleIds.get(srcTid)))
-              || (evalByJoin(p)
+          // IMPALA-2018/4379: Check if srcConjunct or the generated predicate need to
+          // be evaluated again at a later point in the plan, e.g., by a join that makes
+          // referenced tuples nullable. The first condition is conservative but takes
+          // into account that On-clause conjuncts can sometimes be legitimately assigned
+          // below their originating join.
+          boolean evalAfterJoin =
+              (hasOuterJoinedTuple && !srcConjunct.isOnClauseConjunct_)
+              || (evalAfterJoin(srcConjunct)
+                  && (globalState_.ojClauseByConjunct.get(srcConjunct.getId())
+                    != globalState_.outerJoinedTupleIds.get(srcTid)))
+              || (evalAfterJoin(p)
                   && (globalState_.ojClauseByConjunct.get(p.getId())
-                   != globalState_.outerJoinedTupleIds.get(destTid)));
+                    != globalState_.outerJoinedTupleIds.get(destTid)));
 
           // mark all bound predicates including duplicate ones
-          if (reverseValueTransfer && !evalByJoin) markConjunctAssigned(srcConjunct);
+          if (reverseValueTransfer && !evalAfterJoin) markConjunctAssigned(srcConjunct);
         }
 
         // check if we already created this predicate
@@ -2017,7 +2051,6 @@ public class Analyzer {
    */
   public List<SlotId> getEquivSlots(SlotId slotId, List<TupleId> tupleIds) {
     List<SlotId> result = Lists.newArrayList();
-    LOG.trace("getequivslots: slotid=" + Integer.toString(slotId.asInt()));
     EquivalenceClassId classId = globalState_.equivClassBySlotId.get(slotId);
     for (SlotId memberId: globalState_.equivClassMembers.get(classId)) {
       if (tupleIds.contains(
@@ -2106,7 +2139,6 @@ public class Analyzer {
     if (conjuncts == null) return;
     for (Expr p: conjuncts) {
       globalState_.assignedConjuncts.add(p.getId());
-      LOG.trace("markAssigned " + p.toSql() + " " + p.debugString());
     }
   }
 
@@ -2114,7 +2146,6 @@ public class Analyzer {
    * Mark predicate as assigned.
    */
   public void markConjunctAssigned(Expr conjunct) {
-    LOG.trace("markAssigned " + conjunct.toSql() + " " + conjunct.debugString());
     globalState_.assignedConjuncts.add(conjunct.getId());
   }
 
@@ -2138,7 +2169,6 @@ public class Analyzer {
       if (globalState_.assignedConjuncts.contains(id)) continue;
       Expr e = globalState_.conjuncts.get(id);
       if (e.isAuxExpr()) continue;
-      LOG.trace("unassigned: " + e.toSql() + " " + e.debugString());
       return true;
     }
     return false;
@@ -2335,7 +2365,7 @@ public class Analyzer {
    * If addAccessEvent is true, adds an access event if the catalog access succeeded.
    */
   public Table getTable(TableName tableName, Privilege privilege, boolean addAccessEvent)
-      throws AnalysisException {
+      throws AnalysisException, TableLoadingException {
     Preconditions.checkNotNull(tableName);
     Preconditions.checkNotNull(privilege);
     Table table = null;
@@ -2348,13 +2378,7 @@ public class Analyzer {
       registerPrivReq(new PrivilegeRequestBuilder()
           .allOf(privilege).onTable(tableName.getDb(), tableName.getTbl()).toRequest());
     }
-    // This may trigger a metadata load, in which case we want to return the errors as
-    // AnalysisExceptions.
-    try {
-      table = getTable(tableName.getDb(), tableName.getTbl());
-    } catch (TableLoadingException e) {
-      throw new AnalysisException(e.getMessage(), e);
-    }
+    table = getTable(tableName.getDb(), tableName.getTbl());
     Preconditions.checkNotNull(table);
     if (addAccessEvent) {
       // Add an audit event for this access
@@ -2376,7 +2400,13 @@ public class Analyzer {
    */
   public Table getTable(TableName tableName, Privilege privilege)
       throws AnalysisException {
-    return getTable(tableName, privilege, true);
+    // This may trigger a metadata load, in which case we want to return the errors as
+    // AnalysisExceptions.
+    try {
+      return getTable(tableName, privilege, true);
+    } catch (TableLoadingException e) {
+      throw new AnalysisException(e.getMessage(), e);
+    }
   }
 
   /**
@@ -2559,28 +2589,28 @@ public class Analyzer {
   }
 
   /**
-   * Registers a table-level SELECT privilege request and an access event for auditing
-   * for the given table. The given table must be a base table or a catalog view (not
-   * a local view).
+   * Registers a table-level privilege request and an access event for auditing
+   * for the given table and privilege. The table must be a base table or a
+   * catalog view (not a local view).
    */
-  public void registerAuthAndAuditEvent(Table table, Analyzer analyzer) {
+  public void registerAuthAndAuditEvent(Table table, Privilege priv) {
     // Add access event for auditing.
     if (table instanceof View) {
       View view = (View) table;
       Preconditions.checkState(!view.isLocalView());
-      analyzer.addAccessEvent(new TAccessEvent(
+      addAccessEvent(new TAccessEvent(
           table.getFullName(), TCatalogObjectType.VIEW,
-          Privilege.SELECT.toString()));
+          priv.toString()));
     } else {
-      analyzer.addAccessEvent(new TAccessEvent(
+      addAccessEvent(new TAccessEvent(
           table.getFullName(), TCatalogObjectType.TABLE,
-          Privilege.SELECT.toString()));
+          priv.toString()));
     }
     // Add privilege request.
     TableName tableName = table.getTableName();
-    analyzer.registerPrivReq(new PrivilegeRequestBuilder()
+    registerPrivReq(new PrivilegeRequestBuilder()
         .onTable(tableName.getDb(), tableName.getTbl())
-        .allOf(Privilege.SELECT).toRequest());
+        .allOf(priv).toRequest());
   }
 
   /**
@@ -2720,7 +2750,9 @@ public class Analyzer {
       }
 
       long end = System.currentTimeMillis();
-      LOG.trace("Time taken in computeValueTransfers(): " + (end - start) + "ms");
+      if (LOG.isDebugEnabled()) {
+        LOG.trace("Time taken in computeValueTransfers(): " + (end - start) + "ms");
+      }
     }
 
     /**
@@ -2825,7 +2857,9 @@ public class Analyzer {
           // scope of the source slot and the receiving slot's block has a limit
           Analyzer firstBlock = globalState_.blockBySlot.get(slotIds.first);
           Analyzer secondBlock = globalState_.blockBySlot.get(slotIds.second);
-          LOG.trace("value transfer: from " + slotIds.first.toString());
+          if (LOG.isTraceEnabled()) {
+            LOG.trace("value transfer: from " + slotIds.first.toString());
+          }
           Pair<SlotId, SlotId> firstToSecond = null;
           Pair<SlotId, SlotId> secondToFirst = null;
           if (!(secondBlock.hasLimitOffsetClause_ &&

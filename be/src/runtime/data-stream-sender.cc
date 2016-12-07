@@ -32,6 +32,7 @@
 #include "runtime/client-cache.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/backend-client.h"
+#include "util/aligned-new.h"
 #include "util/debug-util.h"
 #include "util/network-util.h"
 #include "util/thread-pool.h"
@@ -59,7 +60,7 @@ namespace impala {
 // at any one time (ie, sending will block if the most recent rpc hasn't finished,
 // which allows the receiver node to throttle the sender by withholding acks).
 // *Not* thread-safe.
-class DataStreamSender::Channel {
+class DataStreamSender::Channel : public CacheLineAligned {
  public:
   // Create channel to send data to particular ipaddress/port/query/node
   // combination. buffer_size is specified in bytes and a soft limit on
@@ -330,7 +331,6 @@ DataStreamSender::DataStreamSender(ObjectPool* pool, int sender_id,
     int per_channel_buffer_size)
   : DataSink(row_desc),
     sender_id_(sender_id),
-    pool_(pool),
     current_channel_idx_(0),
     flushed_(false),
     closed_(false),
@@ -381,25 +381,24 @@ DataStreamSender::~DataStreamSender() {
   }
 }
 
-Status DataStreamSender::Prepare(RuntimeState* state, MemTracker* mem_tracker) {
-  RETURN_IF_ERROR(DataSink::Prepare(state, mem_tracker));
+Status DataStreamSender::Prepare(RuntimeState* state, MemTracker* parent_mem_tracker) {
+  RETURN_IF_ERROR(DataSink::Prepare(state, parent_mem_tracker));
   state_ = state;
   SCOPED_TIMER(profile_->total_time_counter());
 
-  RETURN_IF_ERROR(Expr::Prepare(partition_expr_ctxs_, state, row_desc_, mem_tracker));
+  RETURN_IF_ERROR(
+      Expr::Prepare(partition_expr_ctxs_, state, row_desc_, mem_tracker_.get()));
 
-  bytes_sent_counter_ =
-      ADD_COUNTER(profile(), "BytesSent", TUnit::BYTES);
+  bytes_sent_counter_ = ADD_COUNTER(profile(), "BytesSent", TUnit::BYTES);
   uncompressed_bytes_counter_ =
       ADD_COUNTER(profile(), "UncompressedRowBatchSize", TUnit::BYTES);
-  serialize_batch_timer_ =
-      ADD_TIMER(profile(), "SerializeBatchTime");
-  thrift_transmit_timer_ = profile()->AddConcurrentTimerCounter("TransmitDataRPCTime",
-      TUnit::TIME_NS);
+  serialize_batch_timer_ = ADD_TIMER(profile(), "SerializeBatchTime");
+  thrift_transmit_timer_ =
+      profile()->AddConcurrentTimerCounter("TransmitDataRPCTime", TUnit::TIME_NS);
   network_throughput_ =
       profile()->AddDerivedCounter("NetworkThroughput(*)", TUnit::BYTES_PER_SECOND,
           bind<int64_t>(&RuntimeProfile::UnitsPerSecond, bytes_sent_counter_,
-                        thrift_transmit_timer_));
+                                       thrift_transmit_timer_));
   overall_throughput_ =
       profile()->AddDerivedCounter("OverallThroughput", TUnit::BYTES_PER_SECOND,
            bind<int64_t>(&RuntimeProfile::UnitsPerSecond, bytes_sent_counter_,

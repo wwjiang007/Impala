@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-
 #ifndef IMPALA_EXPRS_ANYVAL_UTIL_H
 #define IMPALA_EXPRS_ANYVAL_UTIL_H
 
@@ -134,12 +133,19 @@ class AnyValUtil {
     return HashUtil::MurmurHash2_64(&tv, 12, seed);
   }
 
-  static uint64_t Hash64(const DecimalVal& v, const FunctionContext::TypeDesc& t,
-      int64_t seed) {
-    switch (ColumnType::GetDecimalByteSize(t.precision)) {
-      case 4: return HashUtil::MurmurHash2_64(&v.val4, 4, seed);
-      case 8: return HashUtil::MurmurHash2_64(&v.val8, 8, seed);
-      case 16: return HashUtil::MurmurHash2_64(&v.val16, 16, seed);
+  static uint64_t Hash64(
+      const DecimalVal& v, const FunctionContext::TypeDesc& t, int64_t seed) {
+    return HashDecimal64(v, ColumnType::GetDecimalByteSize(t.precision), seed);
+  }
+
+  static uint64_t HashDecimal64(const DecimalVal& v, int byte_size, int64_t seed) {
+    switch (byte_size) {
+      case 4:
+        return HashUtil::MurmurHash2_64(&v.val4, 4, seed);
+      case 8:
+        return HashUtil::MurmurHash2_64(&v.val8, 8, seed);
+      case 16:
+        return HashUtil::MurmurHash2_64(&v.val16, 16, seed);
       default:
         DCHECK(false);
         return 0;
@@ -174,6 +180,28 @@ class AnyValUtil {
         return sizeof(StringVal);
       case TYPE_TIMESTAMP: return sizeof(TimestampVal);
       case TYPE_DECIMAL: return sizeof(DecimalVal);
+      default:
+        DCHECK(false) << t;
+        return 0;
+    }
+  }
+
+  /// Returns the byte alignment of *Val for type t.
+  static int AnyValAlignment(const ColumnType& t) {
+    switch (t.type) {
+      case TYPE_BOOLEAN: return alignof(BooleanVal);
+      case TYPE_TINYINT: return alignof(TinyIntVal);
+      case TYPE_SMALLINT: return alignof(SmallIntVal);
+      case TYPE_INT: return alignof(IntVal);
+      case TYPE_BIGINT: return alignof(BigIntVal);
+      case TYPE_FLOAT: return alignof(FloatVal);
+      case TYPE_DOUBLE: return alignof(DoubleVal);
+      case TYPE_STRING:
+      case TYPE_VARCHAR:
+      case TYPE_CHAR:
+        return alignof(StringVal);
+      case TYPE_TIMESTAMP: return alignof(TimestampVal);
+      case TYPE_DECIMAL: return alignof(DecimalVal);
       default:
         DCHECK(false) << t;
         return 0;
@@ -271,7 +299,7 @@ class AnyValUtil {
             return;
 #if __BYTE_ORDER == __LITTLE_ENDIAN
           case 16:
-            memcpy(&reinterpret_cast<DecimalVal*>(dst)->val4, slot, type.GetByteSize());
+            memcpy(&reinterpret_cast<DecimalVal*>(dst)->val16, slot, 16);
 #else
             DCHECK(false) << "Not implemented.";
 #endif
@@ -286,19 +314,20 @@ class AnyValUtil {
 
  private:
   /// Implementations of Equals().
-  template<typename T>
+  template <typename T>
   static inline bool EqualsInternal(const T& x, const T& y);
-  static inline bool DecimalEquals(int precision, const DecimalVal& x,
-      const DecimalVal& y);
+  static inline bool DecimalEquals(
+      int precision, const DecimalVal& x, const DecimalVal& y);
 };
 
-/// Creates the corresponding AnyVal subclass for type. The object is added to the pool.
-impala_udf::AnyVal* CreateAnyVal(ObjectPool* pool, const ColumnType& type);
+/// Allocates an AnyVal subclass of 'type' from 'pool'. The AnyVal's memory is
+/// initialized to all 0's. Returns a MemLimitExceeded() error with message
+/// 'mem_limit_exceeded_msg' if the allocation cannot be made because of a memory
+/// limit.
+Status AllocateAnyVal(RuntimeState* state, MemPool* pool, const ColumnType& type,
+    const std::string& mem_limit_exceeded_msg, AnyVal** result);
 
-/// Creates the corresponding AnyVal subclass for type. The object is owned by the caller.
-impala_udf::AnyVal* CreateAnyVal(const ColumnType& type);
-
-template<typename T>
+template <typename T>
 inline bool AnyValUtil::EqualsInternal(const T& x, const T& y) {
   DCHECK(!x.is_null);
   DCHECK(!y.is_null);

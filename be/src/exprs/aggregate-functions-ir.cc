@@ -92,7 +92,7 @@ int64_t HllEstimateBias(int64_t estimate) {
   // Precision index into data arrays
   // We don't have data for precisions less than 4
   DCHECK(impala::AggregateFunctions::HLL_PRECISION >= 4);
-  const size_t idx = impala::AggregateFunctions::HLL_PRECISION - 4;
+  static constexpr size_t idx = impala::AggregateFunctions::HLL_PRECISION - 4;
 
   // Calculate the square of the difference of this estimate to all
   // precalculated estimates for a particular precision
@@ -147,14 +147,18 @@ static void AllocBuffer(FunctionContext* ctx, StringVal* dst, size_t buf_len) {
 // 'buf_len' bytes and copies the content of StringVal 'src' into it.
 // If allocation fails, 'dst' will be set to a null string.
 static void CopyStringVal(FunctionContext* ctx, const StringVal& src, StringVal* dst) {
-  uint8_t* copy = ctx->Allocate(src.len);
-  if (UNLIKELY(copy == NULL && src.len != 0)) {
-    DCHECK(!ctx->impl()->state()->GetQueryStatus().ok());
+  if (src.is_null) {
     *dst = StringVal::null();
   } else {
-    *dst = StringVal(copy, src.len);
-    // Avoid memcpy() to NULL ptr as it's undefined.
-    if (LIKELY(dst->ptr != NULL)) memcpy(dst->ptr, src.ptr, src.len);
+    uint8_t* copy = ctx->Allocate(src.len);
+    if (UNLIKELY(copy == NULL)) {
+      // Zero-length allocation always returns a hard-coded pointer.
+      DCHECK(src.len != 0 && !ctx->impl()->state()->GetQueryStatus().ok());
+      *dst = StringVal::null();
+    } else {
+      *dst = StringVal(copy, src.len);
+      memcpy(dst->ptr, src.ptr, src.len);
+    }
   }
 }
 
@@ -164,16 +168,12 @@ StringVal ToStringVal(FunctionContext* context, T val) {
   stringstream ss;
   ss << val;
   const string &str = ss.str();
-  return StringVal::CopyFrom(context, reinterpret_cast<const uint8_t*>(str.c_str()), str.size());
+  return StringVal::CopyFrom(
+      context, reinterpret_cast<const uint8_t*>(str.c_str()), str.size());
 }
 
-// Delimiter to use if the separator is NULL.
-static const StringVal DEFAULT_STRING_CONCAT_DELIM((uint8_t*)", ", 2);
-
-// Hyperloglog precision. Default taken from paper. Doesn't seem to matter very
-// much when between [6,12]
-const int AggregateFunctions::HLL_PRECISION = 10;
-const int AggregateFunctions::HLL_LEN = 1024; // 2^HLL_PRECISION
+constexpr int AggregateFunctions::HLL_PRECISION;
+constexpr int AggregateFunctions::HLL_LEN;
 
 void AggregateFunctions::InitNull(FunctionContext*, AnyVal* dst) {
   dst->is_null = true;
@@ -188,7 +188,7 @@ void AggregateFunctions::InitZero(FunctionContext*, T* dst) {
 template<>
 void AggregateFunctions::InitZero(FunctionContext*, DecimalVal* dst) {
   dst->is_null = false;
-  dst->val16 = 0;
+  dst->val16 = 0; // Also initializes val4 and val8 to 0.
 }
 
 template <typename T>
@@ -629,15 +629,21 @@ void AggregateFunctions::Max(FunctionContext*,
 // StringConcatUpdate().
 typedef int StringConcatHeader;
 
-void AggregateFunctions::StringConcatUpdate(FunctionContext* ctx,
-    const StringVal& src, StringVal* result) {
-  StringConcatUpdate(ctx, src, DEFAULT_STRING_CONCAT_DELIM, result);
+// Delimiter to use if the separator is not provided.
+static inline StringVal ALWAYS_INLINE DefaultStringConcatDelim() {
+  return StringVal(reinterpret_cast<uint8_t*>(const_cast<char*>(", ")), 2);
 }
 
-void AggregateFunctions::StringConcatUpdate(FunctionContext* ctx,
-    const StringVal& src, const StringVal& separator, StringVal* result) {
+void AggregateFunctions::StringConcatUpdate(
+    FunctionContext* ctx, const StringVal& src, StringVal* result) {
+  StringConcatUpdate(ctx, src, DefaultStringConcatDelim(), result);
+}
+
+void AggregateFunctions::StringConcatUpdate(FunctionContext* ctx, const StringVal& src,
+    const StringVal& separator, StringVal* result) {
   if (src.is_null) return;
-  const StringVal* sep = separator.is_null ? &DEFAULT_STRING_CONCAT_DELIM : &separator;
+  const StringVal default_delim = DefaultStringConcatDelim();
+  const StringVal* sep = separator.is_null ? &default_delim : &separator;
   if (result->is_null) {
     // Header of the intermediate state holds the length of the first separator.
     const int header_len = sizeof(StringConcatHeader);
@@ -774,8 +780,7 @@ void AggregateFunctions::PcUpdate(FunctionContext* c, const T& input, StringVal*
   // different seed).
   for (int i = 0; i < NUM_PC_BITMAPS; ++i) {
     uint32_t hash_value = AnyValUtil::Hash(input, *c->GetArgType(0), i);
-    int bit_index = __builtin_ctz(hash_value);
-    if (UNLIKELY(hash_value == 0)) bit_index = PC_BITMAP_LENGTH - 1;
+    const int bit_index = BitUtil::CountTrailingZeros(hash_value, PC_BITMAP_LENGTH - 1);
     // Set bitmap[i, bit_index] to 1
     SetDistinctEstimateBit(dst->ptr, i, bit_index);
   }
@@ -792,10 +797,10 @@ void AggregateFunctions::PcsaUpdate(FunctionContext* c, const T& input, StringVa
   uint32_t row_index = hash_value % NUM_PC_BITMAPS;
 
   // We want the zero-based position of the least significant 1-bit in binary
-  // representation of hash_value. __builtin_ctz does exactly this because it returns
-  // the number of trailing 0-bits in x (or undefined if x is zero).
-  int bit_index = __builtin_ctz(hash_value / NUM_PC_BITMAPS);
-  if (UNLIKELY(hash_value == 0)) bit_index = PC_BITMAP_LENGTH - 1;
+  // representation of hash_value. BitUtil::CountTrailingZeros(x,y) does exactly this
+  // because it returns the number of trailing 0-bits in x (or y if x is zero).
+  const int bit_index =
+      BitUtil::CountTrailingZeros(hash_value / NUM_PC_BITMAPS, PC_BITMAP_LENGTH - 1);
 
   // Set bitmap[row_index, bit_index] to 1
   SetDistinctEstimateBit(dst->ptr, row_index, bit_index);
@@ -983,7 +988,7 @@ void AggregateFunctions::ReservoirSampleUpdate(FunctionContext* ctx, const T& sr
 }
 
 template <typename T>
-const StringVal AggregateFunctions::ReservoirSampleSerialize(FunctionContext* ctx,
+StringVal AggregateFunctions::ReservoirSampleSerialize(FunctionContext* ctx,
     const StringVal& src) {
   if (UNLIKELY(src.is_null)) return src;
   StringVal result = StringVal::CopyFrom(ctx, src.ptr, src.len);
@@ -1028,6 +1033,8 @@ bool SampleValLess(const ReservoirSample<StringVal>& i,
 template <>
 bool SampleValLess(const ReservoirSample<DecimalVal>& i,
     const ReservoirSample<DecimalVal>& j) {
+  // Also handles val4 and val8 - the DecimalVal memory layout ensures the least
+  // significant bits overlap in memory.
   return i.val.val16 < j.val.val16;
 }
 
@@ -1093,6 +1100,8 @@ void PrintSample(const ReservoirSample<StringVal>& v, ostream* os) {
 
 template <>
 void PrintSample(const ReservoirSample<DecimalVal>& v, ostream* os) {
+  // Also handles val4 and val8 - the DecimalVal memory layout ensures the least
+  // significant bits overlap in memory.
   *os << v.val.val16;
 }
 
@@ -1175,6 +1184,24 @@ void AggregateFunctions::HllUpdate(FunctionContext* ctx, const T& src, StringVal
   DCHECK_EQ(dst->len, HLL_LEN);
   uint64_t hash_value =
       AnyValUtil::Hash64(src, *ctx->GetArgType(0), HashUtil::FNV64_SEED);
+  // Use the lower bits to index into the number of streams and then find the first 1 bit
+  // after the index bits.
+  int idx = hash_value & (HLL_LEN - 1);
+  const uint8_t first_one_bit =
+      1 + BitUtil::CountTrailingZeros(
+              hash_value >> HLL_PRECISION, sizeof(hash_value) * CHAR_BIT - HLL_PRECISION);
+  dst->ptr[idx] = ::max(dst->ptr[idx], first_one_bit);
+}
+
+// Specialize for DecimalVal to allow substituting decimal size.
+template <>
+void AggregateFunctions::HllUpdate(
+    FunctionContext* ctx, const DecimalVal& src, StringVal* dst) {
+  if (src.is_null) return;
+  DCHECK(!dst->is_null);
+  DCHECK_EQ(dst->len, HLL_LEN);
+  uint64_t hash_value = AnyValUtil::HashDecimal64(
+      src, Expr::GetConstantInt(*ctx, Expr::ARG_TYPE_SIZE, 0), HashUtil::FNV64_SEED);
   if (hash_value != 0) {
     // Use the lower bits to index into the number of streams and then
     // find the first 1 bit after the index bits.
@@ -1184,8 +1211,8 @@ void AggregateFunctions::HllUpdate(FunctionContext* ctx, const T& src, StringVal
   }
 }
 
-void AggregateFunctions::HllMerge(FunctionContext* ctx, const StringVal& src,
-    StringVal* dst) {
+void AggregateFunctions::HllMerge(
+    FunctionContext* ctx, const StringVal& src, StringVal* dst) {
   DCHECK(!dst->is_null);
   DCHECK(!src.is_null);
   DCHECK_EQ(dst->len, HLL_LEN);
@@ -1779,25 +1806,25 @@ template void AggregateFunctions::ReservoirSampleUpdate(
 template void AggregateFunctions::ReservoirSampleUpdate(
     FunctionContext*, const DecimalVal&, StringVal*);
 
-template const StringVal AggregateFunctions::ReservoirSampleSerialize<BooleanVal>(
+template StringVal AggregateFunctions::ReservoirSampleSerialize<BooleanVal>(
     FunctionContext*, const StringVal&);
-template const StringVal AggregateFunctions::ReservoirSampleSerialize<TinyIntVal>(
+template StringVal AggregateFunctions::ReservoirSampleSerialize<TinyIntVal>(
     FunctionContext*, const StringVal&);
-template const StringVal AggregateFunctions::ReservoirSampleSerialize<SmallIntVal>(
+template StringVal AggregateFunctions::ReservoirSampleSerialize<SmallIntVal>(
     FunctionContext*, const StringVal&);
-template const StringVal AggregateFunctions::ReservoirSampleSerialize<IntVal>(
+template StringVal AggregateFunctions::ReservoirSampleSerialize<IntVal>(
     FunctionContext*, const StringVal&);
-template const StringVal AggregateFunctions::ReservoirSampleSerialize<BigIntVal>(
+template StringVal AggregateFunctions::ReservoirSampleSerialize<BigIntVal>(
     FunctionContext*, const StringVal&);
-template const StringVal AggregateFunctions::ReservoirSampleSerialize<FloatVal>(
+template StringVal AggregateFunctions::ReservoirSampleSerialize<FloatVal>(
     FunctionContext*, const StringVal&);
-template const StringVal AggregateFunctions::ReservoirSampleSerialize<DoubleVal>(
+template StringVal AggregateFunctions::ReservoirSampleSerialize<DoubleVal>(
     FunctionContext*, const StringVal&);
-template const StringVal AggregateFunctions::ReservoirSampleSerialize<StringVal>(
+template StringVal AggregateFunctions::ReservoirSampleSerialize<StringVal>(
     FunctionContext*, const StringVal&);
-template const StringVal AggregateFunctions::ReservoirSampleSerialize<TimestampVal>(
+template StringVal AggregateFunctions::ReservoirSampleSerialize<TimestampVal>(
     FunctionContext*, const StringVal&);
-template const StringVal AggregateFunctions::ReservoirSampleSerialize<DecimalVal>(
+template StringVal AggregateFunctions::ReservoirSampleSerialize<DecimalVal>(
     FunctionContext*, const StringVal&);
 
 template void AggregateFunctions::ReservoirSampleMerge<BooleanVal>(

@@ -286,19 +286,25 @@ def apply_error_match_filter(error_list, replace_filenames=True):
   return [replace_fn(row) for row in error_list]
 
 def verify_raw_results(test_section, exec_result, file_format, update_section=False,
-                       replace_filenames=True):
+                       replace_filenames=True, result_section='RESULTS'):
   """
-  Accepts a raw exec_result object and verifies it matches the expected results.
+  Accepts a raw exec_result object and verifies it matches the expected results,
+  including checking the ERRORS, TYPES, and LABELS test sections.
   If update_section is true, updates test_section with the actual results
   if they don't match the expected results. If update_section is false, failed
   verifications result in assertion failures, otherwise they are ignored.
 
   This process includes the parsing/transformation of the raw data results into the
   result format used in the tests.
+
+  The result_section parameter can be used to make this function check the results in
+  a DML_RESULTS section instead of the regular RESULTS section.
+  TODO: separate out the handling of sections like ERRORS from checking of query results
+  to allow regular RESULTS/ERRORS sections in tests with DML_RESULTS (IMPALA-4471).
   """
   expected_results = None
-  if 'RESULTS' in test_section:
-    expected_results = remove_comments(test_section['RESULTS'])
+  if result_section in test_section:
+    expected_results = remove_comments(test_section[result_section])
   else:
     assert 'ERRORS' not in test_section, "'ERRORS' section must have accompanying 'RESULTS' section"
     LOG.info("No results found. Skipping verification");
@@ -398,7 +404,7 @@ def verify_raw_results(test_section, exec_result, file_format, update_section=Fa
     VERIFIER_MAP[verifier](expected, actual)
   except AssertionError:
     if update_section:
-      test_section['RESULTS'] = join_section_lines(actual.result_list)
+      test_section[results_section] = join_section_lines(actual.result_list)
     else:
       raise
 
@@ -482,3 +488,25 @@ def verify_runtime_profile(expected, actual):
   assert len(unmatched_lines) == 0, ("Did not find matches for lines in runtime profile:"
       "\nEXPECTED LINES:\n%s\n\nACTUAL PROFILE:\n%s" % ('\n'.join(unmatched_lines),
         actual))
+
+def get_node_exec_options(profile_string, exec_node_id):
+  """ Return a list with all of the ExecOption strings for the given exec node id. """
+  results = []
+  matched_node = False
+  id_string = "(id={0})".format(exec_node_id)
+  for line in profile_string.splitlines():
+    if matched_node and line.strip().startswith("ExecOption:"):
+      results.append(line.strip())
+    matched_node = False
+    if id_string in line:
+      # Check for the ExecOption string on the next line.
+      matched_node = True
+  return results
+
+def assert_codegen_enabled(profile_string, exec_node_ids):
+  """ Check that codegen is enabled for the given exec node ids by parsing the text
+  runtime profile in 'profile_string'"""
+  for exec_node_id in exec_node_ids:
+    for exec_options in get_node_exec_options(profile_string, exec_node_id):
+      assert 'Codegen Enabled' in exec_options
+      assert not 'Codegen Disabled' in exec_options

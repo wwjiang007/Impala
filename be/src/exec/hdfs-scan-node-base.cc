@@ -129,7 +129,8 @@ Status HdfsScanNodeBase::Init(const TPlanNode& tnode, RuntimeState* state) {
     }
 
     FilterContext filter_ctx;
-    RETURN_IF_ERROR(Expr::CreateExprTree(pool_, target.target_expr, &filter_ctx.expr));
+    RETURN_IF_ERROR(
+        Expr::CreateExprTree(pool_, target.target_expr, &filter_ctx.expr_ctx));
     filter_ctx.filter = state->filter_bank()->RegisterFilter(filter, false);
 
     string filter_profile_title = Substitute("Filter $0 ($1)", filter.filter_id,
@@ -175,8 +176,8 @@ Status HdfsScanNodeBase::Prepare(RuntimeState* state) {
   scan_node_pool_.reset(new MemPool(mem_tracker()));
 
   for (FilterContext& filter: filter_ctxs_) {
-    RETURN_IF_ERROR(filter.expr->Prepare(state, row_desc(), expr_mem_tracker()));
-    AddExprCtxToFree(filter.expr);
+    RETURN_IF_ERROR(filter.expr_ctx->Prepare(state, row_desc(), expr_mem_tracker()));
+    AddExprCtxToFree(filter.expr_ctx);
   }
 
   // Parse Avro table schema if applicable
@@ -277,8 +278,8 @@ Status HdfsScanNodeBase::Prepare(RuntimeState* state) {
     }
     file_desc->splits.push_back(
         AllocateScanRange(file_desc->fs, file_desc->filename.c_str(), split.length,
-            split.offset, split.partition_id, params.volume_id,
-            try_cache, expected_local, file_desc->mtime));
+            split.offset, split.partition_id, params.volume_id, expected_local,
+            DiskIoMgr::BufferOpts(try_cache, file_desc->mtime)));
   }
 
   // Update server wide metrics for number of scan ranges and ranges that have
@@ -292,13 +293,15 @@ Status HdfsScanNodeBase::Prepare(RuntimeState* state) {
   UpdateHdfsSplitStats(*scan_range_params_, &per_volume_stats);
   PrintHdfsSplitStats(per_volume_stats, &str);
   runtime_profile()->AddInfoString(HDFS_SPLIT_STATS_DESC, str.str());
-  if (!state->codegen_enabled()) {
-    runtime_profile()->AddCodegenMsg(false, "disabled by query option DISABLE_CODEGEN");
-  }
+  AddCodegenDisabledMessage(state);
   return Status::OK();
 }
 
 void HdfsScanNodeBase::Codegen(RuntimeState* state) {
+  DCHECK(state->ShouldCodegen());
+  ExecNode::Codegen(state);
+  if (IsNodeCodegenDisabled()) return;
+
   // Create codegen'd functions
   for (int format = THdfsFileFormat::TEXT; format <= THdfsFileFormat::PARQUET; ++format) {
     vector<HdfsFileDesc*>& file_descs =
@@ -328,7 +331,7 @@ void HdfsScanNodeBase::Codegen(RuntimeState* state) {
         status = HdfsAvroScanner::Codegen(this, conjunct_ctxs_, &fn);
         break;
       case THdfsFileFormat::PARQUET:
-        status = HdfsParquetScanner::Codegen(this, conjunct_ctxs_, &fn);
+        status = HdfsParquetScanner::Codegen(this, conjunct_ctxs_, filter_ctxs_, &fn);
         break;
       default:
         // No codegen for this format
@@ -345,7 +348,6 @@ void HdfsScanNodeBase::Codegen(RuntimeState* state) {
     }
     runtime_profile()->AddCodegenMsg(status.ok(), status, format_name);
   }
-  ExecNode::Codegen(state);
 }
 
 Status HdfsScanNodeBase::Open(RuntimeState* state) {
@@ -358,7 +360,7 @@ Status HdfsScanNodeBase::Open(RuntimeState* state) {
     RETURN_IF_ERROR(Expr::Open(entry.second, state));
   }
 
-  for (FilterContext& filter: filter_ctxs_) RETURN_IF_ERROR(filter.expr->Open(state));
+  for (FilterContext& filter: filter_ctxs_) RETURN_IF_ERROR(filter.expr_ctx->Open(state));
 
   // Create template tuples for all partitions.
   for (int64_t partition_id: partition_ids_) {
@@ -465,7 +467,7 @@ void HdfsScanNodeBase::Close(RuntimeState* state) {
     Expr::Close(tid_conjunct.second, state);
   }
 
-  for (auto& filter_ctx: filter_ctxs_) filter_ctx.expr->Close(state);
+  for (auto& filter_ctx: filter_ctxs_) filter_ctx.expr_ctx->Close(state);
   ScanNode::Close(state);
 }
 
@@ -554,9 +556,9 @@ bool HdfsScanNodeBase::WaitForRuntimeFilters(int32_t time_ms) {
   return false;
 }
 
-DiskIoMgr::ScanRange* HdfsScanNodeBase::AllocateScanRange(
-    hdfsFS fs, const char* file, int64_t len, int64_t offset, int64_t partition_id,
-    int disk_id, bool try_cache, bool expected_local, int64_t mtime,
+DiskIoMgr::ScanRange* HdfsScanNodeBase::AllocateScanRange(hdfsFS fs, const char* file,
+    int64_t len, int64_t offset, int64_t partition_id, int disk_id, bool expected_local,
+    const DiskIoMgr::BufferOpts& buffer_opts,
     const DiskIoMgr::ScanRange* original_split) {
   DCHECK_GE(disk_id, -1);
   // Require that the scan range is within [0, file_length). While this cannot be used
@@ -573,15 +575,20 @@ DiskIoMgr::ScanRange* HdfsScanNodeBase::AllocateScanRange(
         new ScanRangeMetadata(partition_id, original_split));
   DiskIoMgr::ScanRange* range =
       runtime_state_->obj_pool()->Add(new DiskIoMgr::ScanRange());
-  range->Reset(fs, file, len, offset, disk_id, try_cache, expected_local,
-      mtime, metadata);
+  range->Reset(fs, file, len, offset, disk_id, expected_local, buffer_opts, metadata);
   return range;
+}
+
+DiskIoMgr::ScanRange* HdfsScanNodeBase::AllocateScanRange(hdfsFS fs, const char* file,
+    int64_t len, int64_t offset, int64_t partition_id, int disk_id, bool try_cache,
+    bool expected_local, int mtime, const DiskIoMgr::ScanRange* original_split) {
+  return AllocateScanRange(fs, file, len, offset, partition_id, disk_id, expected_local,
+      DiskIoMgr::BufferOpts(try_cache, mtime), original_split);
 }
 
 Status HdfsScanNodeBase::AddDiskIoRanges(const vector<DiskIoMgr::ScanRange*>& ranges,
     int num_files_queued) {
-  RETURN_IF_ERROR(
-      runtime_state_->io_mgr()->AddScanRanges(reader_context_, ranges));
+  RETURN_IF_ERROR(runtime_state_->io_mgr()->AddScanRanges(reader_context_, ranges));
   num_unqueued_files_.Add(-num_files_queued);
   DCHECK_GE(num_unqueued_files_.Load(), 0);
   return Status::OK();
@@ -704,13 +711,10 @@ bool HdfsScanNodeBase::PartitionPassesFilters(int32_t partition_id,
     if (!ctx.filter->filter_desc().targets[target_ndx].is_bound_by_partition_columns) {
       continue;
     }
-    void* e = ctx.expr->GetValue(tuple_row_mem);
 
-    // Not quite right because bitmap could arrive after Eval(), but we're ok with
-    // off-by-one errors.
-    bool processed = ctx.filter->HasBloomFilter();
-    bool passed_filter = ctx.filter->Eval<void>(e, ctx.expr->root()->type());
-    ctx.stats->IncrCounters(stats_name, 1, processed, !passed_filter);
+    bool has_filter = ctx.filter->HasBloomFilter();
+    bool passed_filter = !has_filter || ctx.Eval(tuple_row_mem);
+    ctx.stats->IncrCounters(stats_name, 1, has_filter, !passed_filter);
     if (!passed_filter) return false;
   }
 

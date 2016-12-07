@@ -23,9 +23,6 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Set;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.Expr;
 import org.apache.impala.analysis.ExprId;
@@ -41,6 +38,9 @@ import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.TPlan;
 import org.apache.impala.thrift.TPlanNode;
 import org.apache.impala.thrift.TQueryOptions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
@@ -120,6 +120,9 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
   // set in computeCosts(); invalid: -1
   protected long perHostMemCost_ = -1;
 
+  // If true, disable codegen for this plan node.
+  protected boolean disableCodegen_;
+
   // Runtime filters assigned to this node.
   protected List<RuntimeFilter> runtimeFilters_ = Lists.newArrayList();
 
@@ -144,6 +147,7 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     cardinality_ = -1;
     numNodes_ = -1;
     displayName_ = displayName;
+    disableCodegen_ = false;
   }
 
   /**
@@ -159,6 +163,7 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     cardinality_ = -1;
     numNodes_ = -1;
     displayName_ = displayName;
+    disableCodegen_ = node.disableCodegen_;
   }
 
   /**
@@ -393,9 +398,10 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
       msg.addToConjuncts(e.treeToThrift());
     }
     // Serialize any runtime filters
-    for (RuntimeFilter filter: runtimeFilters_) {
+    for (RuntimeFilter filter : runtimeFilters_) {
       msg.addToRuntime_filters(filter.toThrift());
     }
+    msg.setDisable_codegen(disableCodegen_);
     toThrift(msg);
     container.addToNodes(msg);
     // For the purpose of the BE consider ExchangeNodes to have no children.
@@ -669,7 +675,7 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     int numWithoutSel = 0;
     List<T> remaining = Lists.newArrayListWithCapacity(conjuncts.size());
     for (T e : conjuncts) {
-      Preconditions.checkState(e.hasCost());
+      Preconditions.checkState(e.hasCost(), e.toSql());
       totalCost += e.getCost();
       remaining.add(e);
       if (!e.hasSelectivity()) {
@@ -717,5 +723,9 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     }
 
     return sortedConjuncts;
+  }
+
+  public void setDisableCodegen(boolean disableCodegen) {
+    disableCodegen_ = disableCodegen;
   }
 }

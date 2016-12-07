@@ -1,3 +1,20 @@
+---- Licensed to the Apache Software Foundation (ASF) under one
+---- or more contributor license agreements.  See the NOTICE file
+---- distributed with this work for additional information
+---- regarding copyright ownership.  The ASF licenses this file
+---- to you under the Apache License, Version 2.0 (the
+---- "License"); you may not use this file except in compliance
+---- with the License.  You may obtain a copy of the License at
+----
+----   http://www.apache.org/licenses/LICENSE-2.0
+----
+---- Unless required by applicable law or agreed to in writing,
+---- software distributed under the License is distributed on an
+---- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+---- KIND, either express or implied.  See the License for the
+---- specific language governing permissions and limitations
+---- under the License.
+
 ---- Template SQL statements to create and load TPCH tables in KUDU.
 ---- TODO: Fix the primary key column order
 ---- TODO: Remove the 'kudu.master_addresses' from TBLPROPERTIES once CM properly sets
@@ -25,7 +42,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.lineitem (
   L_COMMENT STRING,
   PRIMARY KEY (L_ORDERKEY, L_LINENUMBER)
 )
-distribute by hash (l_orderkey) into {buckets} buckets
+partition by hash (l_orderkey) into {buckets} buckets
+STORED AS KUDU
 tblproperties ('kudu.master_addresses' = '{kudu_master}:7051');
 
 INSERT INTO TABLE {target_db_name}.lineitem
@@ -60,7 +78,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.part (
   P_RETAILPRICE DOUBLE,
   P_COMMENT STRING
 )
-distribute by hash (p_partkey) into {buckets} buckets
+partition by hash (p_partkey) into {buckets} buckets
+STORED AS KUDU
 tblproperties ('kudu.master_addresses' = '{kudu_master}:7051');
 
 INSERT INTO TABLE {target_db_name}.part SELECT * FROM {source_db_name}.part;
@@ -74,7 +93,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.partsupp (
   PS_COMMENT STRING,
   PRIMARY KEY (PS_PARTKEY, PS_SUPPKEY)
 )
-distribute by hash (ps_partkey, ps_suppkey) into {buckets} buckets
+partition by hash (ps_partkey, ps_suppkey) into {buckets} buckets
+STORED AS KUDU
 tblproperties ('kudu.master_addresses' = '{kudu_master}:7051');
 
 INSERT INTO TABLE {target_db_name}.partsupp SELECT * FROM {source_db_name}.partsupp;
@@ -89,7 +109,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.supplier (
   S_ACCTBAL DOUBLE,
   S_COMMENT STRING
 )
-distribute by hash (s_suppkey) into {buckets} buckets
+partition by hash (s_suppkey) into {buckets} buckets
+STORED AS KUDU
 tblproperties ('kudu.master_addresses' = '{kudu_master}:7051');
 
 INSERT INTO TABLE {target_db_name}.supplier SELECT * FROM {source_db_name}.supplier;
@@ -101,7 +122,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.nation (
   N_REGIONKEY BIGINT,
   N_COMMENT STRING
 )
-distribute by hash (n_nationkey) into {buckets} buckets
+partition by hash (n_nationkey) into {buckets} buckets
+STORED AS KUDU
 tblproperties ('kudu.master_addresses' = '{kudu_master}:7051');
 
 INSERT INTO TABLE {target_db_name}.nation SELECT * FROM {source_db_name}.nation;
@@ -112,7 +134,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.region (
   R_NAME STRING,
   R_COMMENT STRING
 )
-distribute by hash (r_regionkey) into {buckets} buckets
+partition by hash (r_regionkey) into {buckets} buckets
+STORED AS KUDU
 tblproperties ('kudu.master_addresses' = '{kudu_master}:7051');
 
 INSERT INTO TABLE {target_db_name}.region SELECT * FROM {source_db_name}.region;
@@ -129,7 +152,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.orders (
   O_SHIPPRIORITY BIGINT,
   O_COMMENT STRING
 )
-distribute by hash (o_orderkey) into {buckets} buckets
+partition by hash (o_orderkey) into {buckets} buckets
+STORED AS KUDU
 tblproperties ('kudu.master_addresses' = '{kudu_master}:7051');
 
 INSERT INTO TABLE {target_db_name}.orders SELECT * FROM {source_db_name}.orders;
@@ -145,7 +169,8 @@ CREATE TABLE IF NOT EXISTS {target_db_name}.customer (
   C_MKTSEGMENT STRING,
   C_COMMENT STRING
 )
-distribute by hash (c_custkey) into {buckets} buckets
+partition by hash (c_custkey) into {buckets} buckets
+STORED AS KUDU
 tblproperties ('kudu.master_addresses' = '{kudu_master}:7051');
 
 INSERT INTO TABLE {target_db_name}.customer SELECT * FROM {source_db_name}.customer;

@@ -304,20 +304,20 @@ public class AnalyzerTest extends FrontendTestBase {
     // Unsupported type binary.
     AnalysisError("select bin_col from functional.unsupported_types",
         "Unsupported type 'BINARY' in 'bin_col'.");
-    // Unsupported type binary in a star expansion.
+    // Unsupported type date in a star expansion.
     AnalysisError("select * from functional.unsupported_types",
-        "Unsupported type 'BINARY' in 'functional.unsupported_types.bin_col'.");
+        "Unsupported type 'DATE' in 'functional.unsupported_types.date_col'.");
     // Mixed supported/unsupported types.
     AnalysisError("select int_col, str_col, bin_col " +
         "from functional.unsupported_types",
         "Unsupported type 'BINARY' in 'bin_col'.");
     AnalysisError("create table tmp as select * from functional.unsupported_types",
-        "Unsupported type 'BINARY' in 'functional.unsupported_types.bin_col'.");
+        "Unsupported type 'DATE' in 'functional.unsupported_types.date_col'.");
     // Unsupported type in the target insert table.
     AnalysisError("insert into functional.unsupported_types " +
-        "values(null, null, null, null, null)",
+        "values(null, null, null, null, null, null)",
         "Unable to INSERT into target table (functional.unsupported_types) because " +
-        "the column 'bin_col' has an unsupported type 'BINARY'");
+        "the column 'date_col' has an unsupported type 'DATE'");
     // Unsupported partition-column type.
     AnalysisError("select * from functional.unsupported_partition_types",
         "Failed to load metadata for table: 'functional.unsupported_partition_types'");
@@ -428,6 +428,10 @@ public class AnalyzerTest extends FrontendTestBase {
         "select id from (select id+2 from functional_hbase.alltypessmall) a",
         "Could not resolve column/field reference: 'id'");
 
+    // Analysis error from explain upsert
+    AnalysisError("explain upsert into table functional.alltypes select * from " +
+        "functional.alltypes", "UPSERT is only supported for Kudu tables");
+
     // Positive test for explain query
     AnalyzesOk("explain select * from functional.AllTypes");
 
@@ -437,6 +441,10 @@ public class AnalyzerTest extends FrontendTestBase {
         "select id, bool_col, tinyint_col, smallint_col, int_col, int_col, " +
         "float_col, float_col, date_string_col, string_col, timestamp_col " +
         "from functional.alltypes");
+
+    // Positive test for explain upsert
+    AnalyzesOk("explain upsert into table functional_kudu.testtbl select * from " +
+        "functional_kudu.testtbl");
   }
 
   @Test

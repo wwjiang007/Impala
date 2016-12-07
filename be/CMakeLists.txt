@@ -87,6 +87,21 @@ SET(CXX_FLAGS_RELEASE "${CXX_GCC_FLAGS} -O3 -DNDEBUG -gdwarf-2")
 SET(CXX_FLAGS_ADDRESS_SANITIZER
   "${CXX_CLANG_FLAGS} -O1 -g -fsanitize=address -fno-omit-frame-pointer -DADDRESS_SANITIZER")
 
+SET(CXX_FLAGS_TIDY "${CXX_CLANG_FLAGS}")
+# Catching unused variables requires an optimization level greater than 0
+SET(CXX_FLAGS_TIDY "${CXX_FLAGS_TIDY} -O1")
+# Ignore assert() and DCHECK() to avoid dead code errors on "DCHECK(false); return
+# nullptr" in impossible default switch/case statements.
+SET(CXX_FLAGS_TIDY "${CXX_FLAGS_TIDY} -DNDEBUG")
+# Turn all warnings back on. Some will be ignored via .clang-tidy's "Checks" value, but
+# this allows different "Checks" settings to be used in different clang-tidy runs without
+# recompiling.
+SET(CXX_FLAGS_TIDY "${CXX_FLAGS_TIDY} -Wall -W -Weverything")
+# The Tidy build is so verbose (becasue of -Weverything) that it is unlikely to be viewed
+# in a terminal and most likely will be redirecto to less, a log file, or /dev/null. In
+# those places color codes just make the output harder to read.
+SET(CXX_FLAGS_TIDY "${CXX_FLAGS_TIDY} -fno-color-diagnostics")
+
 # Set compile flags based on the build type.
 if ("${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG")
   SET(CMAKE_CXX_FLAGS ${CXX_FLAGS_DEBUG})
@@ -94,6 +109,8 @@ elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "RELEASE")
   SET(CMAKE_CXX_FLAGS ${CXX_FLAGS_RELEASE})
 elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "ADDRESS_SANITIZER")
   SET(CMAKE_CXX_FLAGS "${CXX_FLAGS_ADDRESS_SANITIZER}")
+elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "TIDY")
+  SET(CMAKE_CXX_FLAGS "${CXX_FLAGS_TIDY}")
 else()
   message(FATAL_ERROR "Unknown build type: ${CMAKE_BUILD_TYPE}")
 endif()
@@ -115,7 +132,8 @@ find_program(CCACHE ccache)
 if (CCACHE AND NOT DEFINED ENV{DISABLE_CCACHE})
   set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE ccache)
   set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ccache)
-  if ("${CMAKE_BUILD_TYPE}" STREQUAL "ADDRESS_SANITIZER")
+  if ("${CMAKE_BUILD_TYPE}" STREQUAL "ADDRESS_SANITIZER"
+      OR "${CMAKE_BUILD_TYPE}" STREQUAL "TIDY")
     # Need to set CCACHE_CPP so that ccache calls clang with the original source file for
     # both preprocessing and compilation. Otherwise, ccache will use clang to preprocess
     # the file and then call clang with the preprocessed output if not cached. However,
@@ -163,7 +181,6 @@ if (DOXYGEN_FOUND)
   # Possible to not input the subdirs one by one?
   set(CMAKE_DOXYGEN_INPUT
     ${CMAKE_SOURCE_DIR}/be/src
-    ${CMAKE_SOURCE_DIR}/be/src/bufferpool/
     ${CMAKE_SOURCE_DIR}/be/src/catalog/
     ${CMAKE_SOURCE_DIR}/be/src/common/
     ${CMAKE_SOURCE_DIR}/be/src/exec/
@@ -372,7 +389,7 @@ add_custom_target(be-test)
 # Utility CMake function to make specifying tests and benchmarks less verbose
 FUNCTION(ADD_BE_TEST TEST_NAME)
   # This gets the directory where the test is from (e.g. 'exprs' or 'runtime')
-  get_filename_component(DIR_NAME ${CMAKE_CURRENT_SOURCE_DIR} NAME)
+  file(RELATIVE_PATH DIR_NAME "${CMAKE_SOURCE_DIR}/be/src/" ${CMAKE_CURRENT_SOURCE_DIR})
   ADD_EXECUTABLE(${TEST_NAME} ${TEST_NAME}.cc)
   TARGET_LINK_LIBRARIES(${TEST_NAME} ${IMPALA_TEST_LINK_LIBS})
   set(CMAKE_EXE_LINKER_FLAGS "--start-group")
@@ -416,7 +433,6 @@ endfunction(COMPILE_TO_IR)
 add_subdirectory(src/gutil)
 
 # compile these subdirs using their own CMakeLists.txt
-add_subdirectory(src/bufferpool)
 add_subdirectory(src/catalog)
 add_subdirectory(src/codegen)
 add_subdirectory(src/common)

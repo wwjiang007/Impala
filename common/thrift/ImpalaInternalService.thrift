@@ -191,7 +191,8 @@ struct TQueryOptions {
   // query per backend.
   // > 0: multi-threaded execution mode, with given dop
   // 0: single-threaded execution mode
-  44: optional i32 mt_dop = 0
+  // unset: may be set automatically to > 0 in createExecRequest(), otherwise same as 0
+  44: optional i32 mt_dop
 
   // If true, INSERT writes to S3 go directly to their final location rather than being
   // copied there by the coordinator. We cannot do this for INSERT OVERWRITES because for
@@ -213,6 +214,10 @@ struct TQueryOptions {
 
   // A limit on the amount of scratch directory space that can be used;
   50: optional i64 scratch_limit = -1
+
+  // Indicates whether the FE should rewrite Exprs for optimization purposes.
+  // It's sometimes useful to disable rewrites for testing, e.g., expr-test.cc.
+  51: optional bool enable_expr_rewrites = true
 }
 
 // Impala currently has two types of sessions: Beeswax and HiveServer2
@@ -307,6 +312,14 @@ struct TQueryCtx {
   // Contains only the union of those descriptors referenced by list of fragments destined
   // for a single host. Optional for frontend tests.
   12: optional Descriptors.TDescriptorTable desc_tbl
+
+  // Milliseconds since UNIX epoch at the start of query execution.
+  13: required i64 start_unix_millis
+
+  // Hint to disable codegen. Set by planner for single-node optimization or by the
+  // backend in NativeEvalConstExprs() in FESupport. This flag is only advisory to
+  // avoid the overhead of codegen and can be ignored if codegen is needed functionally.
+  14: optional bool disable_codegen_hint = false;
 }
 
 // Context to collect information, which is shared among all instances of that plan
@@ -410,16 +423,28 @@ struct TParquetInsertStats {
   1: required map<string, i64> per_column_size
 }
 
-// Per partition insert stats
+struct TKuduDmlStats {
+  // The number of reported per-row errors, i.e. this many rows were not modified.
+  // Note that this aggregate is less useful than a breakdown of the number of errors by
+  // error type, e.g. number of rows with duplicate key conflicts, number of rows
+  // violating nullability constraints, etc., but it isn't possible yet to differentiate
+  // all error types in the KuduTableSink yet.
+  1: optional i64 num_row_errors
+}
+
+// Per partition DML stats
 // TODO: this should include the table stats that we update the metastore with.
+// TODO: Refactor to reflect usage by other DML statements.
 struct TInsertStats {
   1: required i64 bytes_written
   2: optional TParquetInsertStats parquet_stats
+  3: optional TKuduDmlStats kudu_stats
 }
 
 const string ROOT_PARTITION_KEY = ''
 
-// Per-partition statistics and metadata resulting from INSERT queries.
+// Per-partition statistics and metadata resulting from DML statements.
+// TODO: Refactor to reflect usage by other DML statements.
 struct TInsertPartitionStatus {
   // The id of the partition written to (may be -1 if the partition is created by this
   // query). See THdfsTable.partitions.
@@ -434,13 +459,14 @@ struct TInsertPartitionStatus {
   // Fully qualified URI to the base directory for this partition.
   4: required string partition_base_dir
 
-  // The latest observed Kudu timestamp reported by the KuduSession at this partition.
+  // The latest observed Kudu timestamp reported by the local KuduSession.
   // This value is an unsigned int64.
   5: optional i64 kudu_latest_observed_ts
 }
 
-// The results of an INSERT query, sent to the coordinator as part of
+// The results of a DML statement, sent to the coordinator as part of
 // TReportExecStatusParams
+// TODO: Refactor to reflect usage by other DML statements.
 struct TInsertExecStatus {
   // A map from temporary absolute file path to final absolute destination. The
   // coordinator performs these updates after the query completes.

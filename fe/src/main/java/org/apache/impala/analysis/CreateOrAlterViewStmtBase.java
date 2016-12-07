@@ -21,12 +21,12 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TCreateOrAlterViewParams;
 import org.apache.impala.thrift.TTableName;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
@@ -114,7 +114,7 @@ public abstract class CreateOrAlterViewStmtBase extends StatementBase {
       List<String> labels = viewDefStmt_.getColLabels();
       Preconditions.checkState(exprs.size() == labels.size());
       for (int i = 0; i < viewDefStmt_.getColLabels().size(); ++i) {
-        ColumnDef colDef = new ColumnDef(labels.get(i), null, null);
+        ColumnDef colDef = new ColumnDef(labels.get(i), null);
         colDef.setType(exprs.get(i).getType());
         finalColDefs_.add(colDef);
       }
@@ -124,7 +124,7 @@ public abstract class CreateOrAlterViewStmtBase extends StatementBase {
     // duplicate column names.
     Set<String> distinctColNames = Sets.newHashSet();
     for (ColumnDef colDesc: finalColDefs_) {
-      colDesc.analyze();
+      colDesc.analyze(null);
       if (!distinctColNames.add(colDesc.getColName().toLowerCase())) {
         throw new AnalysisException("Duplicate column name: " + colDesc.getColName());
       }
@@ -156,7 +156,7 @@ public abstract class CreateOrAlterViewStmtBase extends StatementBase {
   }
 
   /**
-   * Computes the column lineage graph for a create/alter view statetement.
+   * Computes the column lineage graph for a create/alter view statement.
    */
   protected void computeLineageGraph(Analyzer analyzer) {
     ColumnLineageGraph graph = analyzer.getColumnLineageGraph();
@@ -166,7 +166,7 @@ public abstract class CreateOrAlterViewStmtBase extends StatementBase {
     }
     graph.addTargetColumnLabels(colDefs);
     graph.computeLineageGraph(viewDefStmt_.getResultExprs(), analyzer);
-    LOG.trace("lineage: " + graph.debugString());
+    if (LOG.isTraceEnabled()) LOG.trace("lineage: " + graph.debugString());
   }
 
   public TCreateOrAlterViewParams toThrift() {

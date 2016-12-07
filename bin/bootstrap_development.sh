@@ -70,11 +70,11 @@ popd
 
 # HDFS bug workaround
 echo "127.0.0.1 $(hostname -s) $(hostname)" | sudo tee -a /etc/hosts
-echo "NoHostAuthenticationForLocalhost yes" > ~/.ssh/config
+echo "NoHostAuthenticationForLocalhost yes" >> ~/.ssh/config
 
 pushd "$(dirname $0)/.."
 export IMPALA_HOME="$(pwd)"
 export MAX_PYTEST_FAILURES=0
 source bin/impala-config.sh
-./buildall.sh -noclean -format -testdata
+./buildall.sh -noclean -format -testdata -build_shared_libs
 popd

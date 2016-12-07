@@ -18,7 +18,6 @@
 package org.apache.impala.analysis;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -28,37 +27,20 @@ import java.util.ArrayList;
 import java.util.List;
 
 import org.apache.hadoop.hive.metastore.MetaStoreUtils;
-import org.junit.Test;
-
 import org.apache.impala.analysis.TimestampArithmeticExpr.TimeUnit;
 import org.apache.impala.common.AnalysisException;
+import org.apache.impala.common.FrontendTestBase;
 import org.apache.impala.testutil.TestUtils;
+import org.junit.Test;
+
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
-public class ParserTest {
+public class ParserTest extends FrontendTestBase {
 
   // Representative operands for testing.
   private final static String[] operands_ =
       new String[] {"i", "5", "true", "NULL", "'a'", "(1.5 * 8)" };
-
-  /**
-   * Asserts in case of parser error.
-   */
-  public Object ParsesOk(String stmt) {
-    SqlScanner input = new SqlScanner(new StringReader(stmt));
-    SqlParser parser = new SqlParser(input);
-    Object result = null;
-    try {
-      result = parser.parse().value;
-    } catch (Exception e) {
-      System.err.println(parser.getErrorMsg(stmt));
-      e.printStackTrace();
-      fail("\n" + parser.getErrorMsg(stmt));
-    }
-    assertNotNull(result);
-    return result;
-  }
 
   /**
    * Attempts to parse the given select statement, and asserts in case of parser error.
@@ -392,6 +374,12 @@ public class ParserTest {
       TestInsertHints(String.format(
           "insert overwrite t(a, b) partition(x, y) %sfoo,bar,baz%s select * from t",
           prefix, suffix), "foo", "bar", "baz");
+
+      // Test upsert hints.
+      ParsesOk(String.format("upsert into t %sshuffle%s select * from t", prefix,
+          suffix));
+      ParsesOk(String.format("upsert into t (x, y) %sshuffle%s select * from t", prefix,
+          suffix));
 
       // Test TableRef hints.
       TestTableHints(String.format(
@@ -761,6 +749,11 @@ public class ParserTest {
     ParsesOk("insert overwrite table t select a from test union select a from test " +
         "union select a from test union select a from test");
 
+    // Union in upsert query.
+    ParsesOk("upsert into table t select a from test union select a from test");
+    ParsesOk("upsert into table t select a from test union select a from test " +
+        "union select a from test union select a from test");
+
     // No complete select statement on lhs.
     ParserError("a from test union select a from test");
     // No complete select statement on rhs.
@@ -777,12 +770,14 @@ public class ParserTest {
     ParsesOk("select * from (values(1, 'a', abc, 1.0, *)) as t");
     ParsesOk("values(1, 'a', abc, 1.0, *) union all values(1, 'a', abc, 1.0, *)");
     ParsesOk("insert into t values(1, 'a', abc, 1.0, *)");
+    ParsesOk("upsert into t values(1, 'a', abc, 1.0, *)");
     // Values stmt with multiple rows.
     ParsesOk("values(1, abc), ('x', cde), (2), (efg, fgh, ghi)");
     ParsesOk("select * from (values(1, abc), ('x', cde), (2), (efg, fgh, ghi)) as t");
     ParsesOk("values(1, abc), ('x', cde), (2), (efg, fgh, ghi) " +
         "union all values(1, abc), ('x', cde), (2), (efg, fgh, ghi)");
     ParsesOk("insert into t values(1, abc), ('x', cde), (2), (efg, fgh, ghi)");
+    ParsesOk("upsert into t values(1, abc), ('x', cde), (2), (efg, fgh, ghi)");
     // Test additional parenthesis.
     ParsesOk("(values(1, abc), ('x', cde), (2), (efg, fgh, ghi))");
     ParsesOk("values((1, abc), ('x', cde), (2), (efg, fgh, ghi))");
@@ -838,6 +833,14 @@ public class ParserTest {
     // With clause before insert statement.
     ParsesOk("with t as (select 1) insert into x select * from t");
     ParsesOk("with t(x) as (select 1) insert into x select * from t");
+    // With clause in query statement of upsert statement.
+    ParsesOk("upsert into x with t as (select * from tab) select * from t");
+    ParsesOk("upsert into x with t(x, y) as (select * from tab) select * from t");
+    ParsesOk("upsert into x with t as (values(1, 2, 3)) select * from t");
+    ParsesOk("upsert into x with t(x, y) as (values(1, 2, 3)) select * from t");
+    // With clause before upsert statement.
+    ParsesOk("with t as (select 1) upsert into x select * from t");
+    ParsesOk("with t(x) as (select 1) upsert into x select * from t");
 
     // Test quoted identifier or string literal as table alias.
     ParsesOk("with `t1` as (select 1 a), 't2' as (select 2 a), \"t3\" as (select 3 a)" +
@@ -854,6 +857,10 @@ public class ParserTest {
     ParsesOk("with t as (select 1) insert into x with t as (select 2) select * from t");
     ParsesOk("with t(c1) as (select 1) " +
         "insert into x with t(c2) as (select 2) select * from t");
+    // Multiple with clauses. One before the upsert and one inside the query statement.
+    ParsesOk("with t as (select 1) upsert into x with t as (select 2) select * from t");
+    ParsesOk("with t(c1) as (select 1) " +
+        "upsert into x with t(c2) as (select 2) select * from t");
 
     // Empty with clause.
     ParserError("with t as () select 1");
@@ -873,6 +880,9 @@ public class ParserTest {
     // Insert in with clause is not valid.
     ParserError("with t as (insert into x select * from tab) select * from t");
     ParserError("with t(c1) as (insert into x select * from tab) select * from t");
+    // Upsert in with clause is not valid.
+    ParserError("with t as (upsert into x select * from tab) select * from t");
+    ParserError("with t(c1) as (upsert into x select * from tab) select * from t");
     // Union operands need to be parenthesized to have their own with clause.
     ParserError("select * from t union all with t as (select 2) select * from t");
   }
@@ -919,8 +929,8 @@ public class ParserTest {
   @Test
   public void TestIdentQuoting() {
     ParsesOk("select a from `t`");
-    ParsesOk("select a from `default`.`t`");
-    ParsesOk("select a from `default`.t");
+    ParsesOk("select a from default.`t`");
+    ParsesOk("select a from default.t");
     ParsesOk("select a from default.`t`");
     ParsesOk("select 01a from default.`01_t`");
 
@@ -952,7 +962,7 @@ public class ParserTest {
 
     // Quoted identifiers can contain any characters except "`".
     ParsesOk("select a from `all types`");
-    ParsesOk("select a from `default`.`all types`");
+    ParsesOk("select a from default.`all types`");
     ParsesOk("select a from `~!@#$%^&*()-_=+|;:'\",<.>/?`");
     // Quoted identifiers do not unescape escape sequences.
     ParsesOk("select a from `ab\rabc`");
@@ -966,7 +976,7 @@ public class ParserTest {
     ParsesOk("select a from `abc\u007fabc`");
 
     // Quoted identifiers can contain keywords.
-    ParsesOk("select `select`, `insert` from `table` where `where` = 10");
+    ParsesOk("select `select`, `insert`, `upsert` from `table` where `where` = 10");
 
     // Quoted identifiers cannot contain "`"
     ParserError("select a from `abcde`abcde`");
@@ -1605,8 +1615,47 @@ public class ParserTest {
         "select a from src where b > 5");
     ParserError("insert into table t partition [shuffle] (pk1=10 pk2=20) " +
         "select a from src where b > 5");
+  }
 
-    ParsesOk("insert ignore into table t values (1,2,3)");
+  @Test
+  public void TestUpsert() {
+    for (String optTbl: new String[] {"", "table"}) {
+      // SELECT clause
+      ParsesOk(String.format("upsert into %s t select a from src", optTbl));
+      // VALUES clause
+      ParsesOk(String.format("upsert into %s t values (1, 2, 3)", optTbl));
+      // Permutation
+      ParsesOk(String.format("upsert into %s t (a,b,c) values(1,2,3)", optTbl));
+      // Permutation with mismatched select list (should parse fine)
+      ParsesOk(String.format("upsert into %s t (a,b,c) values(1,2,3,4,5,6)", optTbl));
+      // Empty permutation list
+      ParsesOk(String.format("upsert into %s t () select 1 from a", optTbl));
+      // Permutation with optional query statement
+      ParsesOk(String.format("upsert into %s t () ", optTbl));
+      // WITH clause
+      ParsesOk(String.format("with x as (select a from src where b > 5) upsert into %s " +
+          "t select * from x", optTbl));
+
+      // Missing query statement
+      ParserError(String.format("upsert into %s t", optTbl));
+      // Missing 'into'.
+      ParserError(String.format("upsert %s t select a from src where b > 5", optTbl));
+      // Missing target table identifier.
+      ParserError(String.format("upsert into %s select a from src where b > 5", optTbl));
+      // No comma in permutation list
+      ParserError(String.format("upsert %s t(a b c) select 1 from a", optTbl));
+      // Can't use strings as identifiers in permutation list
+      ParserError(String.format("upsert %s t('a') select 1 from a", optTbl));
+      // Expressions not allowed in permutation list
+      ParserError(String.format("upsert %s t(a=1, b) select 1 from a", optTbl));
+      // Upsert doesn't support ignore.
+      ParserError(String.format("upsert ignore into %s t select a from src", optTbl));
+      // Upsert doesn't support partition clauses.
+      ParserError(String.format(
+          "upsert into %s t partition (pk1=10) select a from src", optTbl));
+      // Upsert doesn't support overwrite.
+      ParserError(String.format("upsert overwrite %s t select 1 from src", optTbl));
+    }
   }
 
   @Test
@@ -1615,8 +1664,6 @@ public class ParserTest {
     ParsesOk("update t set x = (3 + length(\"hallo\")) where a < 'adasas'");
     ParsesOk("update t set x = 3");
     ParsesOk("update t set x=3, x=4 from a.b t where b = 10");
-    ParsesOk("update ignore t set x = 3");
-    ParsesOk("update ignore t set x=3, x=4 from a.b t where b = 10");
     ParserError("update t");
     ParserError("update t set x < 3");
     ParserError("update t set x");
@@ -1629,18 +1676,16 @@ public class ParserTest {
 
   @Test
   public void TestKuduUpdate() {
-    TestUtils.assumeKuduIsSupported();
+    //TestUtils.assumeKuduIsSupported();
     ParserError("update (select * from functional_kudu.testtbl) a set name = '10'");
   }
 
   @Test
   public void TestDelete() {
     ParsesOk("delete from t");
-    ParsesOk("delete ignore from t");
     ParsesOk("delete a from t a");
     ParsesOk("delete a from t a join b on a.id = b.id where true");
     ParsesOk("delete a from t a join b where true");
-    ParsesOk("delete ignore a from t a join b where true");
     ParsesOk("delete t from t");
     ParsesOk("delete t from t where a < b");
     ParsesOk("delete a from t a where a < b");
@@ -1723,8 +1768,8 @@ public class ParserTest {
     ParserError("SHOW TABLE STATS 'strlit'");
     // Missing table.
     ParserError("SHOW FILES IN");
-    // Invalid partition.
-    ParserError("SHOW FILES IN db.tbl PARTITION(p)");
+
+    ParsesOk("SHOW FILES IN db.tbl PARTITION(p)");
   }
 
   @Test
@@ -1930,6 +1975,11 @@ public class ParserTest {
           "ALTER TABLE TestDb.Foo %s COLUMNS (i int)", addReplace));
       ParsesOk(String.format(
           "ALTER TABLE TestDb.Foo %s COLUMNS (i int comment 'hi')", addReplace));
+      // Kudu column options
+      ParsesOk(String.format("ALTER TABLE Foo %s COLUMNS (i int PRIMARY KEY NOT NULL " +
+          "ENCODING RLE COMPRESSION SNAPPY BLOCK_SIZE 1024 DEFAULT 10, " +
+          "j string NULL ENCODING PLAIN_ENCODING COMPRESSION LZ4 BLOCK_SIZE 10 " +
+          "DEFAULT 'test')", addReplace));
 
       // Negative syntax tests
       ParserError(String.format("ALTER TABLE TestDb.Foo %s COLUMNS i int", addReplace));
@@ -1957,9 +2007,6 @@ public class ParserTest {
     ParsesOk("ALTER TABLE Foo ADD PARTITION (i=NULL, j=2, k=NULL)");
     ParsesOk("ALTER TABLE Foo ADD PARTITION (i=abc, j=(5*8+10), k=!true and false)");
 
-    // Cannot use dynamic partition syntax
-    ParserError("ALTER TABLE TestDb.Foo ADD PARTITION (partcol)");
-    ParserError("ALTER TABLE TestDb.Foo ADD PARTITION (i=1, partcol)");
     // Location needs to be a string literal
     ParserError("ALTER TABLE TestDb.Foo ADD PARTITION (i=1, s='Hello') LOCATION a/b");
 
@@ -1991,6 +2038,19 @@ public class ParserTest {
     ParserError("ALTER TABLE ADD PARTITION (i=1)");
     ParserError("ALTER TABLE ADD");
     ParserError("ALTER TABLE DROP");
+
+    // Kudu range partitions
+    String[] ifNotExistsOption = {"IF NOT EXISTS", ""};
+    for (String option: ifNotExistsOption) {
+      ParsesOk(String.format("ALTER TABLE Foo ADD %s RANGE PARTITION 10 < VALUES < 20",
+          option));
+      ParsesOk(String.format("ALTER TABLE Foo ADD %s RANGE PARTITION VALUE = 100",
+          option));
+      ParserError(String.format("ALTER TABLE Foo ADD %s RANGE PARTITION 10 < VALUES " +
+          "<= 20, PARTITION 20 < VALUES <= 30", option));
+      ParserError(String.format("ALTER TABLE Foo ADD %s (RANGE PARTITION 10 < VALUES " +
+          "<= 20)", option));
+    }
   }
 
   @Test
@@ -2025,10 +2085,6 @@ public class ParserTest {
       ParsesOk(String.format("ALTER TABLE Foo DROP PARTITION (i=abc, "
         + "j=(5*8+10), k=!true and false) %s", kw));
 
-      // Cannot use dynamic partition syntax
-      ParserError(String.format("ALTER TABLE Foo DROP PARTITION (partcol) %s", kw));
-      ParserError(String.format("ALTER TABLE Foo DROP PARTITION (i=1, j) %s", kw));
-
       ParserError(String.format("ALTER TABLE Foo DROP IF NOT EXISTS "
         + "PARTITION (i=1, s='Hello') %s", kw));
       ParserError(String.format("ALTER TABLE TestDb.Foo DROP (i=1, s='Hello') %s", kw));
@@ -2040,6 +2096,21 @@ public class ParserTest {
       ParserError(String.format("ALTER Foo DROP PARTITION (i=1) %s", kw));
       ParserError(String.format("ALTER TABLE DROP PARTITION (i=1) %s", kw));
     }
+
+    // Kudu range partitions
+    String[] ifExistsOption = {"IF EXISTS", ""};
+    for (String option: ifExistsOption) {
+      ParsesOk(String.format("ALTER TABLE Foo DROP %s RANGE PARTITION 10 < VALUES < 20",
+          option));
+      ParsesOk(String.format("ALTER TABLE Foo DROP %s RANGE PARTITION VALUE = 100",
+          option));
+      ParserError(String.format("ALTER TABLE Foo DROP %s RANGE PARTITION 10 < VALUES " +
+          "<= 20, PARTITION 20 < VALUES <= 30", option));
+      ParserError(String.format("ALTER TABLE Foo DROP %s (RANGE PARTITION 10 < VALUES " +
+          "<= 20)", option));
+      ParserError(String.format("ALTER TABLE Foo DROP %s RANGE PARTITION VALUE = 100 " +
+          "PURGE", option));
+    }
   }
 
   @Test
@@ -2049,6 +2120,9 @@ public class ParserTest {
     for (String kw: columnKw) {
       ParsesOk(String.format("ALTER TABLE Foo.Bar CHANGE %s c1 c2 int", kw));
       ParsesOk(String.format("ALTER TABLE Foo CHANGE %s c1 c2 int comment 'hi'", kw));
+      // Kudu column options
+      ParsesOk(String.format("ALTER TABLE Foo CHANGE %s c1 c2 int comment 'hi' " +
+          "NULL ENCODING PLAIN_ENCODING COMPRESSION LZ4 DEFAULT 10 BLOCK_SIZE 1024", kw));
 
       // Negative syntax tests
       ParserError(String.format("ALTER TABLE Foo CHANGE %s c1 int c2", kw));
@@ -2081,10 +2155,7 @@ public class ParserTest {
     ParsesOk("ALTER TABLE Foo PARTITION (i=1,s='str') SET LOCATION '/a/i=1/s=str'");
     ParsesOk("ALTER TABLE Foo PARTITION (s='str') SET LOCATION '/a/i=1/s=str'");
 
-    ParserError("ALTER TABLE Foo PARTITION (s) SET LOCATION '/a'");
     ParserError("ALTER TABLE Foo PARTITION () SET LOCATION '/a'");
-    ParserError("ALTER TABLE Foo PARTITION ('str') SET FILEFORMAT TEXTFILE");
-    ParserError("ALTER TABLE Foo PARTITION (a=1, 5) SET FILEFORMAT TEXTFILE");
     ParserError("ALTER TABLE Foo PARTITION () SET FILEFORMAT PARQUETFILE");
     ParserError("ALTER TABLE Foo PARTITION (,) SET FILEFORMAT PARQUET");
     ParserError("ALTER TABLE Foo PARTITION (a=1) SET FILEFORMAT");
@@ -2346,6 +2417,7 @@ public class ParserTest {
     ParserError("CREATE TABLE Foo i int");
     ParserError("CREATE TABLE Foo (i intt)");
     ParserError("CREATE TABLE Foo (int i)");
+    ParserError("CREATE TABLE Foo (i int,)");
     ParserError("CREATE TABLE Foo ()");
     ParserError("CREATE TABLE");
     ParserError("CREATE EXTERNAL");
@@ -2373,41 +2445,98 @@ public class ParserTest {
 
 
     // Flexible partitioning
-    ParsesOk("CREATE TABLE Foo (i int) DISTRIBUTE BY HASH(i) INTO 4 BUCKETS");
-    ParsesOk("CREATE TABLE Foo (i int) DISTRIBUTE BY HASH(i) INTO 4 BUCKETS, " +
+    ParsesOk("CREATE TABLE Foo (i int) PARTITION BY HASH(i) INTO 4 BUCKETS");
+    ParsesOk("CREATE TABLE Foo (i int) PARTITION BY HASH(i) INTO 4 BUCKETS, " +
         "HASH(a) INTO 2 BUCKETS");
-    ParsesOk("CREATE TABLE Foo (i int) DISTRIBUTE BY HASH INTO 4 BUCKETS");
-    ParsesOk("CREATE TABLE Foo (i int, k int) DISTRIBUTE BY HASH INTO 4 BUCKETS," +
+    ParsesOk("CREATE TABLE Foo (i int) PARTITION BY HASH INTO 4 BUCKETS");
+    ParsesOk("CREATE TABLE Foo (i int, k int) PARTITION BY HASH INTO 4 BUCKETS," +
         " HASH(k) INTO 4 BUCKETS");
-    ParserError("CREATE TABLE Foo (i int) DISTRIBUTE BY HASH(i)");
+    ParserError("CREATE TABLE Foo (i int) PARTITION BY HASH(i)");
+    ParserError("CREATE EXTERNAL TABLE Foo PARTITION BY HASH INTO 4 BUCKETS");
 
-    // Range partitioning, the split rows are not validated in the parser
-    ParsesOk("CREATE TABLE Foo (i int) DISTRIBUTE BY RANGE(i) " +
-        "SPLIT ROWS ((1, 2.0, 'asdas'))");
-    ParsesOk("CREATE TABLE Foo (i int) DISTRIBUTE BY RANGE " +
-        "SPLIT ROWS ((1, 2.0, 'asdas'))");
+    // Range partitioning
+    ParsesOk("CREATE TABLE Foo (i int) PARTITION BY RANGE (PARTITION VALUE = 10)");
+    ParsesOk("CREATE TABLE Foo (i int) PARTITION BY RANGE(i) " +
+        "(PARTITION 1 <= VALUES < 10, PARTITION 10 <= VALUES < 20, " +
+        "PARTITION 21 < VALUES <= 30, PARTITION VALUE = 50)");
+    ParsesOk("CREATE TABLE Foo (a int) PARTITION BY RANGE(a) " +
+        "(PARTITION 10 <= VALUES)");
+    ParsesOk("CREATE TABLE Foo (a int) PARTITION BY RANGE(a) " +
+        "(PARTITION VALUES < 10)");
+    ParsesOk("CREATE TABLE Foo (a int) PARTITION BY RANGE (a) " +
+        "(PARTITION VALUE = 10, PARTITION VALUE = 20)");
+    ParsesOk("CREATE TABLE Foo (a int) PARTITION BY RANGE(a) " +
+        "(PARTITION VALUES <= 10, PARTITION VALUE = 20)");
+    ParsesOk("CREATE TABLE Foo (a int, b int) PARTITION BY RANGE(a, b) " +
+        "(PARTITION VALUE = (2001, 1), PARTITION VALUE = (2001, 2), " +
+        "PARTITION VALUE = (2002, 1))");
+    ParsesOk("CREATE TABLE Foo (a int, b string) PARTITION BY " +
+        "HASH (a) INTO 3 BUCKETS, RANGE (a, b) (PARTITION VALUE = (1, 'abc'), " +
+        "PARTITION VALUE = (2, 'def'))");
+    ParsesOk("CREATE TABLE Foo (a int) PARTITION BY RANGE (a) " +
+        "(PARTITION VALUE = 1 + 1) STORED AS KUDU");
+    ParsesOk("CREATE TABLE Foo (a int) PARTITION BY RANGE (a) " +
+        "(PARTITION 1 + 1 < VALUES) STORED AS KUDU");
+    ParsesOk("CREATE TABLE Foo (a int, b int) PARTITION BY RANGE (a) " +
+        "(PARTITION b < VALUES <= a) STORED AS KUDU");
+    ParsesOk("CREATE TABLE Foo (a int) PARTITION BY RANGE (a) " +
+        "(PARTITION now() <= VALUES, PARTITION VALUE = add_months(now(), 2)) " +
+        "STORED AS KUDU");
 
-    ParsesOk("CREATE TABLE Foo (i int) DISTRIBUTE BY RANGE(i) " +
-            "SPLIT ROWS (('asdas'))");
+    ParserError("CREATE TABLE Foo (a int) PARTITION BY RANGE (a) ()");
+    ParserError("CREATE TABLE Foo (a int) PARTITION BY HASH (a) INTO 4 BUCKETS, " +
+        "RANGE (a) (PARTITION VALUE = 10), RANGE (a) (PARTITION VALUES < 10)");
+    ParserError("CREATE TABLE Foo (a int) PARTITION BY RANGE (a) " +
+        "(PARTITION VALUE = 10), HASH (a) INTO 3 BUCKETS");
+    ParserError("CREATE TABLE Foo (a int) PARTITION BY RANGE (a) " +
+        "(PARTITION VALUES = 10) STORED AS KUDU");
+    ParserError("CREATE TABLE Foo (a int) PARTITION BY RANGE (a) " +
+        "(PARTITION 10 < VALUE < 20) STORED AS KUDU");
 
-    ParsesOk("CREATE TABLE Foo (i int) DISTRIBUTE BY RANGE(i) " +
-        "SPLIT ROWS ((1, 2.0, 'asdas'), (2,3.0, 'adas'))");
+    // Column options for Kudu tables
+    String[] encodings = {"encoding auto_encoding", "encoding plain_encoding",
+        "encoding prefix_encoding", "encoding group_varint", "encoding rle",
+        "encoding dict_encoding", "encoding bit_shuffle", "encoding unknown", ""};
+    String[] compression = {"compression default_compression",
+        "compression no_compression", "compression snappy", "compression lz4",
+        "compression zlib", "compression unknown", ""};
 
-    ParserError("CREATE TABLE Foo (i int) DISTRIBUTE BY RANGE(i) " +
-        "SPLIT ROWS ()");
-    ParserError("CREATE TABLE Foo (i int) DISTRIBUTE BY RANGE(i)");
-    ParserError("CREATE EXTERNAL TABLE Foo DISTRIBUTE BY HASH INTO 4 BUCKETS");
-
-    // Combine both
-    ParsesOk("CREATE TABLE Foo (i int) DISTRIBUTE BY HASH(i) INTO 4 BUCKETS, RANGE(i) " +
-        "SPLIT ROWS ((1, 2.0, 'asdas'))");
-
-    // Can only have one range clause
-    ParserError("CREATE TABLE Foo (i int) DISTRIBUTE BY HASH(i) INTO 4 BUCKETS, RANGE(i) " +
-        "SPLIT ROWS ((1, 2.0, 'asdas')), RANGE(i) SPLIT ROWS ((1, 2.0, 'asdas'))");
-    // Range needs to be the last DISTRIBUTE BY clause
-    ParserError("CREATE TABLE Foo (i int) DISTRIBUTE BY RANGE(i) SPLIT ROWS ((1),(2)), " +
-        "HASH (i) INTO 3 BUCKETS");
+    String[] nullability = {"not null", "null", ""};
+    String[] defaultVal = {"default 10", ""};
+    String[] blockSize = {"block_size 4096", ""};
+    for (String enc: encodings) {
+      for (String comp: compression) {
+        for (String nul: nullability) {
+          for (String def: defaultVal) {
+            for (String block: blockSize) {
+              ParsesOk(String.format("CREATE TABLE Foo (i int PRIMARY KEY " +
+                  "%s %s %s %s %s) STORED AS KUDU", nul, enc, comp, def, block));
+              ParsesOk(String.format("CREATE TABLE Foo (i int PRIMARY KEY " +
+                  "%s %s %s %s %s) STORED AS KUDU", block, nul, enc, comp, def));
+              ParsesOk(String.format("CREATE TABLE Foo (i int PRIMARY KEY " +
+                  "%s %s %s %s %s) STORED AS KUDU", def, block, nul, enc, comp));
+              ParsesOk(String.format("CREATE TABLE Foo (i int PRIMARY KEY " +
+                  "%s %s %s %s %s) STORED AS KUDU", comp, def, block, nul, enc));
+              ParsesOk(String.format("CREATE TABLE Foo (i int PRIMARY KEY " +
+                  "%s %s %s %s %s) STORED AS KUDU", enc, comp, def, block, nul));
+              ParsesOk(String.format("CREATE TABLE Foo (i int PRIMARY KEY " +
+                  "%s %s %s %s %s) STORED AS KUDU", enc, comp, block, def, nul));
+            }
+          }
+        }
+      }
+    }
+    // Column option is specified multiple times for the same column
+    ParserError("CREATE TABLE Foo(a int PRIMARY KEY ENCODING RLE ENCODING PLAIN) " +
+        "STORED AS KUDU");
+    // Constant expr used in DEFAULT
+    ParsesOk("CREATE TABLE Foo(a int PRIMARY KEY, b int DEFAULT 1+1) STORED AS KUDU");
+    ParsesOk("CREATE TABLE Foo(a int PRIMARY KEY, b float DEFAULT cast(1.1 as float)) " +
+        "STORED AS KUDU");
+    // Non-literal value used in BLOCK_SIZE
+    ParserError("CREATE TABLE Foo(a int PRIMARY KEY, b int BLOCK_SIZE 1+1) " +
+        "STORED AS KUDU");
+    ParserError("CREATE TABLE Foo(a int PRIMARY KEY BLOCK_SIZE -1) STORED AS KUDU");
   }
 
   @Test
@@ -2499,6 +2628,7 @@ public class ParserTest {
     ParserError("CREATE VIEW Foo.Bar (x) AS");
     // Invalid view definitions. A view definition must be a query statement.
     ParserError("CREATE VIEW Foo.Bar (x) AS INSERT INTO t select * from t");
+    ParserError("CREATE VIEW Foo.Bar (x) AS UPSERT INTO t select * from t");
     ParserError("CREATE VIEW Foo.Bar (x) AS CREATE TABLE Wrong (i int)");
     ParserError("CREATE VIEW Foo.Bar (x) AS ALTER TABLE Foo COLUMNS (i int, s string)");
     ParserError("CREATE VIEW Foo.Bar (x) AS CREATE VIEW Foo.Bar AS SELECT 1");
@@ -2528,6 +2658,7 @@ public class ParserTest {
     ParserError("ALTER VIEW Foo.Bar AS");
     // Invalid view definitions. A view definition must be a query statement.
     ParserError("ALTER VIEW Foo.Bar AS INSERT INTO t select * from t");
+    ParserError("ALTER VIEW Foo.Bar AS UPSERT INTO t select * from t");
     ParserError("ALTER VIEW Foo.Bar AS CREATE TABLE Wrong (i int)");
     ParserError("ALTER VIEW Foo.Bar AS ALTER TABLE Foo COLUMNS (i int, s string)");
     ParserError("ALTER VIEW Foo.Bar AS CREATE VIEW Foo.Bar AS SELECT 1, 2, 3");
@@ -2545,14 +2676,10 @@ public class ParserTest {
     ParsesOk("CREATE TABLE Foo ROW FORMAT DELIMITED STORED AS PARQUETFILE AS SELECT 1");
     ParsesOk("CREATE TABLE Foo TBLPROPERTIES ('a'='b', 'c'='d') AS SELECT * from bar");
     ParsesOk("CREATE TABLE Foo PRIMARY KEY (a, b) AS SELECT * from bar");
-    ParsesOk("CREATE TABLE Foo PRIMARY KEY (a, b) DISTRIBUTE BY HASH INTO 2 BUCKETS " +
+    ParsesOk("CREATE TABLE Foo PRIMARY KEY (a, b) PARTITION BY HASH INTO 2 BUCKETS " +
         "AS SELECT * from bar");
-    ParsesOk("CREATE TABLE Foo PRIMARY KEY (a, b) DISTRIBUTE BY HASH (b) INTO 2 " +
+    ParsesOk("CREATE TABLE Foo PRIMARY KEY (a, b) PARTITION BY HASH (b) INTO 2 " +
         "BUCKETS AS SELECT * from bar");
-    ParsesOk("CREATE TABLE Foo PRIMARY KEY (a, b) DISTRIBUTE BY RANGE (b) SPLIT ROWS " +
-        "(('foo'), ('bar')) STORED AS KUDU AS SELECT * from bar");
-    ParsesOk("CREATE TABLE Foo PRIMARY KEY (a, b) DISTRIBUTE BY RANGE SPLIT ROWS " +
-        "(('foo'), ('bar')) STORED AS KUDU AS SELECT * from bar");
 
     // With clause works
     ParsesOk("CREATE TABLE Foo AS with t1 as (select 1) select * from t1");
@@ -2562,8 +2689,9 @@ public class ParserTest {
     ParserError("CREATE TABLE Foo ROW FORMAT DELIMITED STORED AS PARQUET AS WITH");
     ParserError("CREATE TABLE Foo ROW FORMAT DELIMITED STORED AS PARQUET AS");
 
-    // INSERT statements are not allowed
+    // INSERT/UPSERT statements are not allowed
     ParserError("CREATE TABLE Foo AS INSERT INTO Foo SELECT 1");
+    ParserError("CREATE TABLE Foo AS UPSERT INTO Foo SELECT 1");
 
     // Column and partition definitions not allowed
     ParserError("CREATE TABLE Foo(i int) AS SELECT 1");
@@ -2580,11 +2708,14 @@ public class ParserTest {
     ParserError("CREATE TABLE Foo PARTITIONED BY (a, b=2) AS SELECT * from Bar");
 
     // Flexible partitioning
-    ParsesOk("CREATE TABLE Foo PRIMARY KEY (i) DISTRIBUTE BY HASH(i) INTO 4 BUCKETS AS " +
+    ParsesOk("CREATE TABLE Foo PRIMARY KEY (i) PARTITION BY HASH(i) INTO 4 BUCKETS AS " +
         "SELECT 1");
-    ParserError("CREATE TABLE Foo DISTRIBUTE BY HASH(i) INTO 4 BUCKETS AS SELECT 1");
-    ParsesOk("CREATE TABLE Foo PRIMARY KEY (a) DISTRIBUTE BY HASH(a) INTO 4 BUCKETS " +
+    ParserError("CREATE TABLE Foo PARTITION BY HASH(i) INTO 4 BUCKETS AS SELECT 1");
+    ParsesOk("CREATE TABLE Foo PRIMARY KEY (a) PARTITION BY HASH(a) INTO 4 BUCKETS " +
         "TBLPROPERTIES ('a'='b', 'c'='d') AS SELECT * from bar");
+    ParsesOk("CREATE TABLE Foo PRIMARY KEY (a) PARTITION BY RANGE(a) " +
+        "(PARTITION 1 < VALUES < 10, PARTITION 10 <= VALUES < 20, PARTITION VALUE = 30) " +
+        "STORED AS KUDU AS SELECT * FROM Bar");
   }
 
   @Test
@@ -2828,7 +2959,7 @@ public class ParserTest {
         "Encountered: IDENTIFIER\n" +
         "Expected: ALTER, COMPUTE, CREATE, DELETE, DESCRIBE, DROP, EXPLAIN, GRANT, " +
         "INSERT, INVALIDATE, LOAD, REFRESH, REVOKE, SELECT, SET, SHOW, TRUNCATE, " +
-        "UPDATE, USE, VALUES, WITH\n");
+        "UPDATE, UPSERT, USE, VALUES, WITH\n");
 
     // missing select list
     ParserError("select from t",
@@ -2836,7 +2967,7 @@ public class ParserTest {
         "select from t\n" +
         "       ^\n" +
         "Encountered: FROM\n" +
-        "Expected: ALL, CASE, CAST, DISTINCT, EXISTS, " +
+        "Expected: ALL, CASE, CAST, DEFAULT, DISTINCT, EXISTS, " +
         "FALSE, IF, INTERVAL, NOT, NULL, " +
         "STRAIGHT_JOIN, TRUNCATE, TRUE, IDENTIFIER\n");
 
@@ -2846,8 +2977,8 @@ public class ParserTest {
         "select c, b, c where a = 5\n" +
         "               ^\n" +
         "Encountered: WHERE\n" +
-        "Expected: AND, AS, BETWEEN, DIV, FROM, ILIKE, IN, IREGEXP, IS, LIKE, LIMIT, NOT, OR, " +
-        "ORDER, REGEXP, RLIKE, UNION, COMMA, IDENTIFIER\n");
+        "Expected: AND, AS, BETWEEN, DEFAULT, DIV, FROM, ILIKE, IN, IREGEXP, IS, LIKE, " +
+        "LIMIT, NOT, OR, ORDER, REGEXP, RLIKE, UNION, COMMA, IDENTIFIER\n");
 
     // missing table list
     ParserError("select c, b, c from where a = 5",
@@ -2855,7 +2986,7 @@ public class ParserTest {
         "select c, b, c from where a = 5\n" +
         "                    ^\n" +
         "Encountered: WHERE\n" +
-        "Expected: IDENTIFIER\n");
+        "Expected: DEFAULT, IDENTIFIER\n");
 
     // missing predicate in where clause (no group by)
     ParserError("select c, b, c from t where",
@@ -2863,7 +2994,7 @@ public class ParserTest {
         "select c, b, c from t where\n" +
         "                           ^\n" +
         "Encountered: EOF\n" +
-        "Expected: CASE, CAST, EXISTS, FALSE, " +
+        "Expected: CASE, CAST, DEFAULT, EXISTS, FALSE, " +
         "IF, INTERVAL, NOT, NULL, TRUNCATE, TRUE, IDENTIFIER\n");
 
     // missing predicate in where clause (group by)
@@ -2872,7 +3003,7 @@ public class ParserTest {
         "select c, b, c from t where group by a, b\n" +
         "                            ^\n" +
         "Encountered: GROUP\n" +
-        "Expected: CASE, CAST, EXISTS, FALSE, " +
+        "Expected: CASE, CAST, DEFAULT, EXISTS, FALSE, " +
         "IF, INTERVAL, NOT, NULL, TRUNCATE, TRUE, IDENTIFIER\n");
 
     // unmatched string literal starting with "
@@ -2933,7 +3064,7 @@ public class ParserTest {
         "...c,c,c,c,c,c,c,c,cd,c,d,d, ,c, from t\n" +
         "                             ^\n" +
         "Encountered: COMMA\n" +
-        "Expected: CASE, CAST, EXISTS, FALSE, " +
+        "Expected: CASE, CAST, DEFAULT, EXISTS, FALSE, " +
         "IF, INTERVAL, NOT, NULL, TRUNCATE, TRUE, IDENTIFIER\n");
 
     // Parsing identifiers that have different names printed as EXPECTED
@@ -2954,7 +3085,7 @@ public class ParserTest {
         "USE ` `\n" +
         "    ^\n" +
         "Encountered: EMPTY IDENTIFIER\n" +
-        "Expected: IDENTIFIER\n");
+        "Expected: DEFAULT, IDENTIFIER\n");
 
     // Expecting = token
     ParserError("SET foo",
@@ -2969,6 +3100,7 @@ public class ParserTest {
   public void TestExplain() {
     ParsesOk("explain select a from tbl");
     ParsesOk("explain insert into tbl select a, b, c, d from tbl");
+    ParsesOk("explain upsert into tbl select a, b, c, d from tbl");
     ParserError("explain");
     // cannot EXPLAIN an explain stmt
     ParserError("explain explain select a from tbl");
@@ -3270,13 +3402,10 @@ public class ParserTest {
 
     ParsesOk(
         "COMPUTE INCREMENTAL STATS functional.alltypes PARTITION(month=10, year=2010)");
-    // No dynamic partition specs
-    ParserError("COMPUTE INCREMENTAL STATS functional.alltypes PARTITION(month, year)");
 
     ParserError("COMPUTE INCREMENTAL STATS");
 
     ParsesOk("DROP INCREMENTAL STATS functional.alltypes PARTITION(month=10, year=2010)");
-    ParserError("DROP INCREMENTAL STATS functional.alltypes PARTITION(month, year)");
     ParserError("DROP INCREMENTAL STATS functional.alltypes");
   }
 

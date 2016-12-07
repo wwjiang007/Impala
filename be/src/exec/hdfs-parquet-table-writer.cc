@@ -509,10 +509,8 @@ Status HdfsParquetTableWriter::BaseColumnWriter::Flush(int64_t* file_pos,
   for (int i = 0; i < num_data_pages_; ++i) {
     DataPage& page = pages_[i];
 
-    // Last page might be empty
     if (page.header.data_page_header.num_values == 0) {
-      DCHECK_EQ(page.header.compressed_page_size, 0);
-      DCHECK_EQ(i, num_data_pages_ - 1);
+      // Skip empty pages
       continue;
     }
 
@@ -874,8 +872,8 @@ Status HdfsParquetTableWriter::InitNewFile() {
   return Status::OK();
 }
 
-Status HdfsParquetTableWriter::AppendRowBatch(RowBatch* batch,
-    const vector<int32_t>& row_group_indices, bool* new_file) {
+Status HdfsParquetTableWriter::AppendRows(
+    RowBatch* batch, const vector<int32_t>& row_group_indices, bool* new_file) {
   SCOPED_TIMER(parent_->encode_timer());
   *new_file = false;
   int limit;

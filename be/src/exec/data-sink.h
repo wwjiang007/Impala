@@ -58,9 +58,9 @@ class DataSink {
   virtual std::string GetName() = 0;
 
   /// Setup. Call before Send(), Open(), or Close() during the prepare phase of the query
-  /// fragment. Any memory allocated will be tracked against the caller-provided
-  /// 'mem_tracker'. Subclasses must call DataSink::Prepare().
-  virtual Status Prepare(RuntimeState* state, MemTracker* mem_tracker);
+  /// fragment. Creates a MemTracker for the sink that is a child of 'parent_mem_tracker'.
+  /// Subclasses must call DataSink::Prepare().
+  virtual Status Prepare(RuntimeState* state, MemTracker* parent_mem_tracker);
 
   /// Call before Send() to open the sink.
   virtual Status Open(RuntimeState* state) = 0;
@@ -85,17 +85,16 @@ class DataSink {
     const TPlanFragmentInstanceCtx& fragment_instance_ctx,
     const RowDescriptor& row_desc, boost::scoped_ptr<DataSink>* sink);
 
-  /// Merges one update to the insert stats for a partition. dst_stats will have the
+  /// Merges one update to the DML stats for a partition. dst_stats will have the
   /// combined stats of src_stats and dst_stats after this method returns.
-  static void MergeInsertStats(const TInsertStats& src_stats,
+  static void MergeDmlStats(const TInsertStats& src_stats,
       TInsertStats* dst_stats);
 
-  /// Outputs the insert stats contained in the map of insert partition updates to a
-  /// string
-  static std::string OutputInsertStats(const PartitionStatusMap& stats,
+  /// Outputs the DML stats contained in the map of partition updates to a string
+  static std::string OutputDmlStats(const PartitionStatusMap& stats,
       const std::string& prefix = "");
 
-  MemTracker* mem_tracker() const { return mem_tracker_; }
+  MemTracker* mem_tracker() const { return mem_tracker_.get(); }
   RuntimeProfile* profile() const { return profile_; }
 
  protected:
@@ -110,13 +109,11 @@ class DataSink {
   RuntimeProfile* profile_;
 
   /// The MemTracker for all allocations made by the DataSink. Initialized in Prepare().
-  /// Not owned.
-  MemTracker* mem_tracker_;
+  boost::scoped_ptr<MemTracker> mem_tracker_;
 
   /// A child of 'mem_tracker_' that tracks expr allocations. Initialized in Prepare().
   boost::scoped_ptr<MemTracker> expr_mem_tracker_;
-
 };
 
-}  // namespace impala
+} // namespace impala
 #endif

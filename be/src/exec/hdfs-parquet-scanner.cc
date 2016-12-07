@@ -23,6 +23,7 @@
 #include <gflags/gflags.h>
 #include <gutil/strings/substitute.h>
 
+#include "codegen/codegen-anyval.h"
 #include "codegen/llvm-codegen.h"
 #include "common/logging.h"
 #include "exec/hdfs-scanner.h"
@@ -48,18 +49,18 @@
 
 using llvm::Function;
 using namespace impala;
+using namespace llvm;
 
 DEFINE_double(parquet_min_filter_reject_ratio, 0.1, "(Advanced) If the percentage of "
     "rows rejected by a runtime filter drops below this value, the filter is disabled.");
 DECLARE_bool(enable_partitioned_aggregation);
 DECLARE_bool(enable_partitioned_hash_join);
 
-// The number of rows between checks to see if a filter is not effective, and should be
-// disabled. Must be a power of two.
-const int ROWS_PER_FILTER_SELECTIVITY_CHECK = 16 * 1024;
-static_assert(
-    !(ROWS_PER_FILTER_SELECTIVITY_CHECK & (ROWS_PER_FILTER_SELECTIVITY_CHECK - 1)),
-    "ROWS_PER_FILTER_SELECTIVITY_CHECK must be a power of two");
+// The number of row batches between checks to see if a filter is effective, and
+// should be disabled. Must be a power of two.
+constexpr int BATCHES_PER_FILTER_SELECTIVITY_CHECK = 16;
+static_assert(BitUtil::IsPowerOf2(BATCHES_PER_FILTER_SELECTIVITY_CHECK),
+    "BATCHES_PER_FILTER_SELECTIVITY_CHECK must be a power of two");
 
 // Max dictionary page header size in bytes. This is an estimate and only needs to be an
 // upper bound.
@@ -69,6 +70,8 @@ const int64_t HdfsParquetScanner::FOOTER_SIZE;
 const int16_t HdfsParquetScanner::ROW_GROUP_END;
 const int16_t HdfsParquetScanner::INVALID_LEVEL;
 const int16_t HdfsParquetScanner::INVALID_POS;
+
+const char* HdfsParquetScanner::LLVM_CLASS_NAME = "class.impala::HdfsParquetScanner";
 
 Status HdfsParquetScanner::IssueInitialRanges(HdfsScanNodeBase* scan_node,
     const std::vector<HdfsFileDesc*>& files) {
@@ -108,13 +111,14 @@ Status HdfsParquetScanner::IssueInitialRanges(HdfsScanNodeBase* scan_node,
           footer_range = scan_node->AllocateScanRange(files[i]->fs,
               files[i]->filename.c_str(), footer_size, footer_start,
               split_metadata->partition_id, footer_split->disk_id(),
-              footer_split->try_cache(), footer_split->expected_local(), files[i]->mtime,
-              split);
+              footer_split->expected_local(),
+              DiskIoMgr::BufferOpts(footer_split->try_cache(), files[i]->mtime), split);
         } else {
           // If we did not find the last split, we know it is going to be a remote read.
-          footer_range = scan_node->AllocateScanRange(files[i]->fs,
-              files[i]->filename.c_str(), footer_size, footer_start,
-              split_metadata->partition_id, -1, false, false, files[i]->mtime, split);
+          footer_range =
+              scan_node->AllocateScanRange(files[i]->fs, files[i]->filename.c_str(),
+                  footer_size, footer_start, split_metadata->partition_id, -1, false,
+                  DiskIoMgr::BufferOpts::Uncached(), split);
         }
 
         footer_ranges.push_back(footer_range);
@@ -145,6 +149,7 @@ HdfsParquetScanner::HdfsParquetScanner(HdfsScanNodeBase* scan_node, RuntimeState
       row_group_idx_(-1),
       row_group_rows_read_(0),
       advance_row_group_(true),
+      row_batches_produced_(0),
       scratch_batch_(new ScratchTupleBatch(
           scan_node->row_desc(), state_->batch_size(), scan_node->mem_tracker())),
       metadata_range_(NULL),
@@ -182,7 +187,7 @@ Status HdfsParquetScanner::Open(ScannerContext* context) {
   for (int i = 0; i < context->filter_ctxs().size(); ++i) {
     const FilterContext* ctx = &context->filter_ctxs()[i];
     DCHECK(ctx->filter != NULL);
-    if (!ctx->filter->AlwaysTrue()) filter_ctxs_.push_back(ctx);
+    filter_ctxs_.push_back(ctx);
   }
   filter_stats_.resize(filter_ctxs_.size());
 
@@ -224,25 +229,31 @@ Status HdfsParquetScanner::Open(ScannerContext* context) {
 }
 
 void HdfsParquetScanner::Close(RowBatch* row_batch) {
-  if (row_batch != NULL) {
+  if (row_batch != nullptr) {
     FlushRowGroupResources(row_batch);
     row_batch->tuple_data_pool()->AcquireData(template_tuple_pool_.get(), false);
     if (scan_node_->HasRowBatchQueue()) {
       static_cast<HdfsScanNode*>(scan_node_)->AddMaterializedRowBatch(row_batch);
     }
   } else {
-    if (template_tuple_pool_.get() != NULL) template_tuple_pool_->FreeAll();
-    if (!FLAGS_enable_partitioned_hash_join ||
-        !FLAGS_enable_partitioned_aggregation) {
+    if (template_tuple_pool_ != nullptr) template_tuple_pool_->FreeAll();
+    dictionary_pool_.get()->FreeAll();
+    context_->ReleaseCompletedResources(nullptr, true);
+    for (ParquetColumnReader* col_reader: column_readers_) col_reader->Close(nullptr);
+    if (!FLAGS_enable_partitioned_hash_join || !FLAGS_enable_partitioned_aggregation) {
       // With the legacy aggs/joins the tuple ptrs of the scratch batch are allocated
       // from the scratch batch's mem pool. We can get into this case if Open() fails.
       scratch_batch_->mem_pool()->FreeAll();
     }
   }
+  if (level_cache_pool_ != nullptr) {
+    level_cache_pool_->FreeAll();
+    level_cache_pool_.reset();
+  }
 
   // Verify all resources (if any) have been transferred.
-  DCHECK_EQ(template_tuple_pool_.get()->total_allocated_bytes(), 0);
-  DCHECK_EQ(dictionary_pool_.get()->total_allocated_bytes(), 0);
+  DCHECK_EQ(template_tuple_pool_->total_allocated_bytes(), 0);
+  DCHECK_EQ(dictionary_pool_->total_allocated_bytes(), 0);
   DCHECK_EQ(scratch_batch_->mem_pool()->total_allocated_bytes(), 0);
   DCHECK_EQ(context_->num_completed_io_buffers(), 0);
 
@@ -268,12 +279,7 @@ void HdfsParquetScanner::Close(RowBatch* row_batch) {
   if (compression_types.empty()) compression_types.push_back(THdfsCompression::NONE);
   scan_node_->RangeComplete(THdfsFileFormat::PARQUET, compression_types);
 
-  if (level_cache_pool_.get() != NULL) {
-    level_cache_pool_->FreeAll();
-    level_cache_pool_.reset();
-  }
-
-  if (schema_resolver_.get() != NULL) schema_resolver_.reset();
+  if (schema_resolver_.get() != nullptr) schema_resolver_.reset();
 
   for (int i = 0; i < filter_ctxs_.size(); ++i) {
     const FilterStats* stats = filter_ctxs_[i]->stats;
@@ -325,6 +331,18 @@ int HdfsParquetScanner::CountScalarColumns(const vector<ParquetColumnReader*>& c
   return num_columns;
 }
 
+void HdfsParquetScanner::CheckFiltersEffectiveness() {
+  for (int i = 0; i < filter_stats_.size(); ++i) {
+    LocalFilterStats* stats = &filter_stats_[i];
+    const RuntimeFilter* filter = filter_ctxs_[i]->filter;
+    double reject_ratio = stats->rejected / static_cast<double>(stats->considered);
+    if (filter->AlwaysTrue() ||
+        reject_ratio < FLAGS_parquet_min_filter_reject_ratio) {
+      stats->enabled = 0;
+    }
+  }
+}
+
 Status HdfsParquetScanner::ProcessSplit() {
   DCHECK(scan_node_->HasRowBatchQueue());
   HdfsScanNode* scan_node = static_cast<HdfsScanNode*>(scan_node_);
@@ -332,6 +350,10 @@ Status HdfsParquetScanner::ProcessSplit() {
     StartNewParquetRowBatch();
     RETURN_IF_ERROR(GetNextInternal(batch_));
     scan_node->AddMaterializedRowBatch(batch_);
+    ++row_batches_produced_;
+    if ((row_batches_produced_ & (BATCHES_PER_FILTER_SELECTIVITY_CHECK - 1)) == 0) {
+      CheckFiltersEffectiveness();
+    }
   } while (!eos_ && !scan_node_->ReachedLimit());
 
   // Transfer the remaining resources to this new batch in Close().
@@ -536,8 +558,9 @@ Status HdfsParquetScanner::AssembleRows(
       bool num_tuples_mismatch = c != 0 && last_num_tuples != scratch_batch_->num_tuples;
       if (UNLIKELY(!continue_execution || num_tuples_mismatch)) {
         // Skipping this row group. Free up all the resources with this row group.
-        scratch_batch_->mem_pool()->FreeAll();
+        FlushRowGroupResources(row_batch);
         scratch_batch_->num_tuples = 0;
+        DCHECK(scratch_batch_->AtEnd());
         *skip_row_group = true;
         if (num_tuples_mismatch) {
           parse_status_.MergeStatus(Substitute("Corrupt Parquet file '$0': column '$1' "
@@ -632,8 +655,9 @@ int HdfsParquetScanner::TransferScratchTuples(RowBatch* dst_batch) {
 }
 
 Status HdfsParquetScanner::Codegen(HdfsScanNodeBase* node,
-    const vector<ExprContext*>& conjunct_ctxs, Function** process_scratch_batch_fn) {
-  DCHECK(node->runtime_state()->codegen_enabled());
+    const vector<ExprContext*>& conjunct_ctxs, const vector<FilterContext>& filter_ctxs,
+    Function** process_scratch_batch_fn) {
+  DCHECK(node->runtime_state()->ShouldCodegen());
   *process_scratch_batch_fn = NULL;
   LlvmCodeGen* codegen = node->runtime_state()->codegen();
   DCHECK(codegen != NULL);
@@ -650,6 +674,14 @@ Status HdfsParquetScanner::Codegen(HdfsScanNodeBase* node,
   int replaced = codegen->ReplaceCallSites(fn, eval_conjuncts_fn, "EvalConjuncts");
   DCHECK_EQ(replaced, 1);
 
+  Function* eval_runtime_filters_fn;
+  RETURN_IF_ERROR(CodegenEvalRuntimeFilters(
+      codegen, filter_ctxs, &eval_runtime_filters_fn));
+  DCHECK(eval_runtime_filters_fn != NULL);
+
+  replaced = codegen->ReplaceCallSites(fn, eval_runtime_filters_fn, "EvalRuntimeFilters");
+  DCHECK_EQ(replaced, 1);
+
   fn->setName("ProcessScratchBatch");
   *process_scratch_batch_fn = codegen->FinalizeFunction(fn);
   if (*process_scratch_batch_fn == NULL) {
@@ -661,31 +693,96 @@ Status HdfsParquetScanner::Codegen(HdfsScanNodeBase* node,
 bool HdfsParquetScanner::EvalRuntimeFilters(TupleRow* row) {
   int num_filters = filter_ctxs_.size();
   for (int i = 0; i < num_filters; ++i) {
-    LocalFilterStats* stats = &filter_stats_[i];
-    if (!stats->enabled) continue;
-    const RuntimeFilter* filter = filter_ctxs_[i]->filter;
-    // Check filter effectiveness every ROWS_PER_FILTER_SELECTIVITY_CHECK rows.
-    // TODO: The stats updates and the filter effectiveness check are executed very
-    // frequently. Consider hoisting it out of of this loop, and doing an equivalent
-    // check less frequently, e.g., after producing an output batch.
-    ++stats->total_possible;
-    if (UNLIKELY(
-        !(stats->total_possible & (ROWS_PER_FILTER_SELECTIVITY_CHECK - 1)))) {
-      double reject_ratio = stats->rejected / static_cast<double>(stats->considered);
-      if (filter->AlwaysTrue() ||
-          reject_ratio < FLAGS_parquet_min_filter_reject_ratio) {
-        stats->enabled = 0;
-        continue;
-      }
-    }
-    ++stats->considered;
-    void* e = filter_ctxs_[i]->expr->GetValue(row);
-    if (!filter->Eval<void>(e, filter_ctxs_[i]->expr->root()->type())) {
-      ++stats->rejected;
-      return false;
-    }
+    if (!EvalRuntimeFilter(i, row)) return false;
   }
   return true;
+}
+
+// ; Function Attrs: noinline
+// define i1 @EvalRuntimeFilters(%"class.impala::HdfsParquetScanner"* %this,
+//                               %"class.impala::TupleRow"* %row) #34 {
+// entry:
+//   %0 = call i1 @_ZN6impala18HdfsParquetScanner17EvalRuntimeFilterEiPNS_8TupleRowE.2(
+//       %"class.impala::HdfsParquetScanner"* %this, i32 0, %"class.impala::TupleRow"* %row)
+//   br i1 %0, label %continue, label %bail_out
+//
+// bail_out:                                         ; preds = %entry
+//   ret i1 false
+//
+// continue:                                         ; preds = %entry
+//   ret i1 true
+// }
+//
+// EvalRuntimeFilter() is the same as the cross-compiled version except EvalOneFilter()
+// is replaced with the one generated by CodegenEvalOneFilter().
+Status HdfsParquetScanner::CodegenEvalRuntimeFilters(LlvmCodeGen* codegen,
+    const vector<FilterContext>& filter_ctxs, Function** fn) {
+  LLVMContext& context = codegen->context();
+  LlvmBuilder builder(context);
+
+  *fn = NULL;
+  Type* this_type = codegen->GetPtrType(HdfsParquetScanner::LLVM_CLASS_NAME);
+  PointerType* tuple_row_ptr_type = codegen->GetPtrType(TupleRow::LLVM_CLASS_NAME);
+  LlvmCodeGen::FnPrototype prototype(codegen, "EvalRuntimeFilters",
+      codegen->GetType(TYPE_BOOLEAN));
+  prototype.AddArgument(LlvmCodeGen::NamedVariable("this", this_type));
+  prototype.AddArgument(LlvmCodeGen::NamedVariable("row", tuple_row_ptr_type));
+
+  Value* args[2];
+  Function* eval_runtime_filters_fn = prototype.GeneratePrototype(&builder, args);
+  Value* this_arg = args[0];
+  Value* row_arg = args[1];
+
+  int num_filters = filter_ctxs.size();
+  if (num_filters == 0) {
+    builder.CreateRet(codegen->true_value());
+  } else {
+    // row_rejected_block: jump target for when a filter is evaluated to false.
+    BasicBlock* row_rejected_block =
+        BasicBlock::Create(context, "row_rejected", eval_runtime_filters_fn);
+
+    DCHECK_GT(num_filters, 0);
+    for (int i = 0; i < num_filters; ++i) {
+      Function* eval_runtime_filter_fn =
+          codegen->GetFunction(IRFunction::PARQUET_SCANNER_EVAL_RUNTIME_FILTER, true);
+      DCHECK(eval_runtime_filter_fn != NULL);
+
+      // Codegen function for inlining filter's expression evaluation and constant fold
+      // the type of the expression into the hashing function to avoid branches.
+      Function* eval_one_filter_fn;
+      RETURN_IF_ERROR(filter_ctxs[i].CodegenEval(codegen, &eval_one_filter_fn));
+      DCHECK(eval_one_filter_fn != NULL);
+
+      int replaced = codegen->ReplaceCallSites(eval_runtime_filter_fn, eval_one_filter_fn,
+          "FilterContext4Eval");
+      DCHECK_EQ(replaced, 1);
+
+      Value* idx = codegen->GetIntConstant(TYPE_INT, i);
+      Value* passed_filter = builder.CreateCall(
+          eval_runtime_filter_fn, ArrayRef<Value*>({this_arg, idx, row_arg}));
+
+      BasicBlock* continue_block =
+          BasicBlock::Create(context, "continue", eval_runtime_filters_fn);
+      builder.CreateCondBr(passed_filter, continue_block, row_rejected_block);
+      builder.SetInsertPoint(continue_block);
+    }
+    builder.CreateRet(codegen->true_value());
+
+    builder.SetInsertPoint(row_rejected_block);
+    builder.CreateRet(codegen->false_value());
+
+    // Don't inline this function to avoid code bloat in ProcessScratchBatch().
+    // If there is any filter, EvalRuntimeFilters() is large enough to not benefit
+    // much from inlining.
+    eval_runtime_filters_fn->addFnAttr(llvm::Attribute::NoInline);
+  }
+
+  *fn = codegen->FinalizeFunction(eval_runtime_filters_fn);
+  if (*fn == NULL) {
+    return Status("Codegen'd HdfsParquetScanner::EvalRuntimeFilters() failed "
+        "verification, see log");
+  }
+  return Status::OK();
 }
 
 bool HdfsParquetScanner::AssembleCollection(
@@ -841,8 +938,8 @@ Status HdfsParquetScanner::ProcessFooter() {
   uint8_t* metadata_size_ptr = magic_number_ptr - sizeof(int32_t);
   uint32_t metadata_size = *reinterpret_cast<uint32_t*>(metadata_size_ptr);
   uint8_t* metadata_ptr = metadata_size_ptr - metadata_size;
-  // If the metadata was too big, we need to stitch it before deserializing it.
-  // In that case, we stitch the data in this buffer.
+  // If the metadata was too big, we need to read it into a contiguous buffer before
+  // deserializing it.
   ScopedBuffer metadata_buffer(scan_node_->mem_tracker());
 
   DCHECK(metadata_range_ != NULL);
@@ -854,45 +951,34 @@ Status HdfsParquetScanner::ProcessFooter() {
     DCHECK(file_desc != NULL);
     // The start of the metadata is:
     // file_length - 4-byte metadata size - footer-size - metadata size
-    int64_t metadata_start = file_desc->file_length -
-      sizeof(int32_t) - sizeof(PARQUET_VERSION_NUMBER) - metadata_size;
-    int64_t metadata_bytes_to_read = metadata_size;
+    int64_t metadata_start = file_desc->file_length - sizeof(int32_t)
+        - sizeof(PARQUET_VERSION_NUMBER) - metadata_size;
     if (metadata_start < 0) {
       return Status(Substitute("File '$0' is invalid. Invalid metadata size in file "
           "footer: $1 bytes. File size: $2 bytes.", filename(), metadata_size,
           file_desc->file_length));
     }
-    // IoMgr can only do a fixed size Read(). The metadata could be larger
-    // so we stitch it here.
-    // TODO: consider moving this stitching into the scanner context. The scanner
-    // context usually handles the stitching but no other scanner need this logic
-    // now.
 
     if (!metadata_buffer.TryAllocate(metadata_size)) {
       return Status(Substitute("Could not allocate buffer of $0 bytes for Parquet "
           "metadata for file '$1'.", metadata_size, filename()));
     }
     metadata_ptr = metadata_buffer.buffer();
-    int64_t copy_offset = 0;
     DiskIoMgr* io_mgr = scan_node_->runtime_state()->io_mgr();
 
-    while (metadata_bytes_to_read > 0) {
-      int64_t to_read = ::min<int64_t>(io_mgr->max_read_buffer_size(),
-          metadata_bytes_to_read);
-      DiskIoMgr::ScanRange* range = scan_node_->AllocateScanRange(
-          metadata_range_->fs(), filename(), to_read, metadata_start + copy_offset, -1,
-          metadata_range_->disk_id(), metadata_range_->try_cache(),
-          metadata_range_->expected_local(), file_desc->mtime);
+    // Read the header into the metadata buffer.
+    DiskIoMgr::ScanRange* metadata_range = scan_node_->AllocateScanRange(
+        metadata_range_->fs(), filename(), metadata_size, metadata_start, -1,
+        metadata_range_->disk_id(), metadata_range_->expected_local(),
+        DiskIoMgr::BufferOpts::ReadInto(metadata_buffer.buffer(), metadata_size));
 
-      DiskIoMgr::BufferDescriptor* io_buffer = NULL;
-      RETURN_IF_ERROR(io_mgr->Read(scan_node_->reader_context(), range, &io_buffer));
-      memcpy(metadata_ptr + copy_offset, io_buffer->buffer(), io_buffer->len());
-      io_buffer->Return();
-
-      metadata_bytes_to_read -= to_read;
-      copy_offset += to_read;
-    }
-    DCHECK_EQ(metadata_bytes_to_read, 0);
+    DiskIoMgr::BufferDescriptor* io_buffer;
+    RETURN_IF_ERROR(
+        io_mgr->Read(scan_node_->reader_context(), metadata_range, &io_buffer));
+    DCHECK_EQ(io_buffer->buffer(), metadata_buffer.buffer());
+    DCHECK_EQ(io_buffer->len(), metadata_size);
+    DCHECK(io_buffer->eosr());
+    io_buffer->Return();
   }
 
   // Deserialize file header
@@ -1153,14 +1239,13 @@ Status HdfsParquetScanner::InitColumns(
         static_cast<ScanRangeMetadata*>(metadata_range_->meta_data())->original_split;
 
     // Determine if the column is completely contained within a local split.
-    bool column_range_local = split_range->expected_local() &&
-                              col_start >= split_range->offset() &&
-                              col_end <= split_range->offset() + split_range->len();
-
-    DiskIoMgr::ScanRange* col_range = scan_node_->AllocateScanRange(
-        metadata_range_->fs(), filename(), col_len, col_start, scalar_reader->col_idx(),
-        split_range->disk_id(), split_range->try_cache(), column_range_local,
-        file_desc->mtime);
+    bool col_range_local = split_range->expected_local()
+        && col_start >= split_range->offset()
+        && col_end <= split_range->offset() + split_range->len();
+    DiskIoMgr::ScanRange* col_range = scan_node_->AllocateScanRange(metadata_range_->fs(),
+        filename(), col_len, col_start, scalar_reader->col_idx(), split_range->disk_id(),
+        col_range_local,
+        DiskIoMgr::BufferOpts(split_range->try_cache(), file_desc->mtime));
     col_ranges.push_back(col_range);
 
     // Get the stream that will be used for this column

@@ -31,4 +31,9 @@ Impala only supports Linux at the moment.
 
 ## Build Instructions
 
-./buildall.sh -notests
+See bin/bootstrap_build.sh.
+
+## Export Control Notice
+
+This distribution uses cryptographic software and may be subject to export controls.
+Please refer to EXPORT\_CONTROL.md for more information.

@@ -58,6 +58,7 @@ enum TDdlType {
 enum TAlterTableType {
   ADD_REPLACE_COLUMNS,
   ADD_PARTITION,
+  ADD_DROP_RANGE_PARTITION,
   CHANGE_COLUMN,
   DROP_COLUMN,
   DROP_PARTITION,
@@ -111,10 +112,10 @@ struct TDropStatsParams {
   // Fully qualified name of the target table
   1: required CatalogObjects.TTableName table_name
 
-  // If set, delete the stats only for a particular partition, but do not recompute the
+  // If set, delete the stats only for specified partitions, but do not recompute the
   // stats for the whole table. This is set only for
   // DROP INCREMENTAL STATS <table> PARTITION(...)
-  2: optional list<CatalogObjects.TPartitionKeyValue> partition_spec
+  2: optional list<list<CatalogObjects.TPartitionKeyValue>> partition_set
 }
 
 // Parameters of CREATE FUNCTION commands
@@ -176,14 +177,32 @@ struct TAlterTableAddPartitionParams {
   1: required list<CatalogObjects.TPartitionKeyValue> partition_spec
 
   // If true, no error is raised if a partition with the same spec already exists.
-  3: required bool if_not_exists
+  2: required bool if_not_exists
 
   // Optional HDFS storage location for the Partition. If not specified the
   // default storage location is used.
-  2: optional string location
+  3: optional string location
 
   // Optional caching operation to perform on the newly added partition.
   4: optional THdfsCachingOp cache_op
+}
+
+enum TRangePartitionOperationType {
+  ADD,
+  DROP
+}
+
+// Parameters for ALTER TABLE ADD/DROP RANGE PARTITION command
+struct TAlterTableAddDropRangePartitionParams {
+  // Range partition to add/drop
+  1: required CatalogObjects.TRangePartition range_partition_spec
+
+  // If true, ignore errors raised while adding/dropping a range
+  // partition
+  2: required bool ignore_errors
+
+  // Operation
+  3: required TRangePartitionOperationType type
 }
 
 // Parameters for ALTER TABLE DROP COLUMN commands.
@@ -194,8 +213,8 @@ struct TAlterTableDropColParams {
 
 // Parameters for ALTER TABLE DROP PARTITION commands
 struct TAlterTableDropPartitionParams {
-  // The partition spec (list of keys and values) to add.
-  1: required list<CatalogObjects.TPartitionKeyValue> partition_spec
+  // The partition set used to drop partitions.
+  1: required list<list<CatalogObjects.TPartitionKeyValue>> partition_set
 
   // If true, no error is raised if no partition with the specified spec exists.
   2: required bool if_exists
@@ -222,18 +241,18 @@ struct TAlterTableSetTblPropertiesParams {
   // Map of property names to property values.
   2: required map<string, string> properties
 
-  // If set, alters the properties of the given partition, otherwise
+  // If set, alters the properties of the given partitions, otherwise
   // those of the table.
-  3: optional list<CatalogObjects.TPartitionKeyValue> partition_spec
+  3: optional list<list<CatalogObjects.TPartitionKeyValue>> partition_set
 }
 
-// Parameters for ALTER TABLE SET [PARTITION partitionSpec] FILEFORMAT commands.
+// Parameters for ALTER TABLE SET [PARTITION partitionSet] FILEFORMAT commands.
 struct TAlterTableSetFileFormatParams {
   // New file format.
   1: required CatalogObjects.THdfsFileFormat file_format
 
-  // An optional partition spec, set if modifying the fileformat of a partition.
-  2: optional list<CatalogObjects.TPartitionKeyValue> partition_spec
+  // An optional partition set, set if modifying the fileformat of the partitions.
+  2: optional list<list<CatalogObjects.TPartitionKeyValue>> partition_set
 }
 
 // Parameters for ALTER TABLE SET [PARTITION partitionSpec] location commands.
@@ -270,14 +289,14 @@ struct TAlterTableUpdateStatsParams {
   6: optional bool is_incremental
 }
 
-// Parameters for ALTER TABLE SET [PARTITION partitionSpec] CACHED|UNCACHED
+// Parameters for ALTER TABLE SET [PARTITION partitionSet] CACHED|UNCACHED
 struct TAlterTableSetCachedParams {
   // Details on what operation to perform (cache or uncache)
   1: required THdfsCachingOp cache_op
 
-  // An optional partition spec, set if marking a partition as cached/uncached
+  // An optional partition set, set if marking the partitions as cached/uncached
   // rather than a table.
-  2: optional list<CatalogObjects.TPartitionKeyValue> partition_spec
+  2: optional list<list<CatalogObjects.TPartitionKeyValue>> partition_set
 }
 
 // Parameters for all ALTER TABLE commands.
@@ -319,6 +338,9 @@ struct TAlterTableParams {
 
   // Parameters for ALTER TABLE SET CACHED|UNCACHED
   13: optional TAlterTableSetCachedParams set_cached_params
+
+  // Parameters for ALTER TABLE ADD/ADD RANGE PARTITION
+  14: optional TAlterTableAddDropRangePartitionParams add_drop_range_partition_params
 }
 
 // Parameters of CREATE TABLE LIKE commands
@@ -393,9 +415,9 @@ struct TCreateTableParams {
   // If set, the table will be cached after creation with details specified in cache_op.
   13: optional THdfsCachingOp cache_op
 
-  // If set, the table is automatically distributed according to this parameter.
+  // If set, the table is automatically partitioned according to this parameter.
   // Kudu-only.
-  14: optional list<CatalogObjects.TDistributeParam> distribute_by
+  14: optional list<CatalogObjects.TKuduPartitionParam> partition_by
 
   // Primary key column names (Kudu-only)
   15: optional list<string> primary_key_column_names;

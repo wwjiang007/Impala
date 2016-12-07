@@ -66,6 +66,7 @@ class HdfsScanNode : public HdfsScanNodeBase {
   HdfsScanNode(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs);
   ~HdfsScanNode();
 
+  virtual Status Init(const TPlanNode& tnode, RuntimeState* state);
   virtual Status Prepare(RuntimeState* state);
   virtual Status Open(RuntimeState* state);
   virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos);
@@ -152,11 +153,6 @@ class HdfsScanNode : public HdfsScanNodeBase {
   /// is available. Used to remove the callback before this scan node is destroyed.
   /// -1 if no callback is registered.
   int thread_avail_cb_id_;
-
-  /// The id of the callback added to the query resource manager when RM is enabled.
-  /// Used to remove the callback before this scan node is destroyed.
-  /// -1 if no callback is registered.
-  int32_t rm_callback_id_;
 
   /// Maximum number of scanner threads. Set to 'NUM_SCANNER_THREADS' if that query
   /// option is set. Otherwise, it's set to the number of cpu cores. Scanner threads

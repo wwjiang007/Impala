@@ -147,14 +147,14 @@ struct TDescribeDbParams {
 // given TDescribeOutputStyle.
 // NOTE: This struct should only be used for intra-process communication.
 struct TDescribeTableParams {
-  1: required string db
-  2: required string table_name
-
   // Controls the output style for this describe command.
-  3: required TDescribeOutputStyle output_style
+  1: required TDescribeOutputStyle output_style
 
-  // Struct type with fields to display for the MINIMAL output style.
-  4: optional Types.TColumnType result_struct
+  // Set when describing a table.
+  2: optional CatalogObjects.TTableName table_name
+
+  // Set when describing a path to a nested collection.
+  3: optional Types.TColumnType result_struct
 }
 
 // Results of a call to describeDb() and describeTable()
@@ -209,9 +209,9 @@ struct TShowTablesParams {
 struct TShowFilesParams {
   1: required CatalogObjects.TTableName table_name
 
-  // An optional partition spec. Set if this operation should apply to a specific
-  // partition rather than the base table.
-  2: optional list<CatalogObjects.TPartitionKeyValue> partition_spec
+  // An optional partition set. Set if this operation should apply to a list of
+  // partitions rather than the base table.
+  2: optional list<list<CatalogObjects.TPartitionKeyValue>> partition_set
 }
 
 // Parameters for SHOW [CURRENT] ROLES and SHOW ROLE GRANT GROUP <groupName> commands
@@ -719,11 +719,6 @@ struct TGetHadoopConfigResponse {
 
 struct TGetAllHadoopConfigsResponse {
   1: optional map<string, string> configs;
-}
-
-// BE startup options
-struct TStartupOptions {
-  1: optional bool compute_lineage
 }
 
 // For creating a test descriptor table. The tuples and their memory layout are computed

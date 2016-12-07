@@ -67,7 +67,7 @@ class DataStreamSender : public DataSink {
 
   /// Must be called before other API calls, and before the codegen'd IR module is
   /// compiled (i.e. in an ExecNode's Prepare() function).
-  virtual Status Prepare(RuntimeState* state, MemTracker* mem_tracker);
+  virtual Status Prepare(RuntimeState* state, MemTracker* parent_mem_tracker);
 
   /// Must be called before Send() or Close(), and after the codegen'd IR module is
   /// compiled (i.e. in an ExecNode's Open() function).
@@ -104,7 +104,6 @@ class DataStreamSender : public DataSink {
   /// Sender instance id, unique within a fragment.
   int sender_id_;
   RuntimeState* state_;
-  ObjectPool* pool_;
   bool broadcast_;  // if true, send all rows on all channels
   bool random_; // if true, round-robins row batches among channels
   int current_channel_idx_; // index of current channel to send to if random_ == true

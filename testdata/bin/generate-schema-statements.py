@@ -223,7 +223,7 @@ def build_table_template(file_format, columns, partition_columns, row_format,
   elif file_format == 'kudu':
     # Use partitioned_by to set a trivial hash distribution
     assert not partitioned_by, "Kudu table shouldn't have partition cols defined"
-    partitioned_by = "distribute by hash into 3 buckets"
+    partitioned_by = "partition by hash into 3 buckets"
 
     # Fetch KUDU host and port from environment
     kudu_master = os.getenv("KUDU_MASTER_ADDRESS", "127.0.0.1")
@@ -408,10 +408,11 @@ def build_load_statement(load_template, db_name, db_suffix, table_name):
                                          db_name=db_name,
                                          db_suffix=db_suffix)
   else:
+    base_load_dir = os.getenv("REMOTE_LOAD", os.getenv("IMPALA_HOME"))
     load_template = load_template.format(table_name=table_name,
                                          db_name=db_name,
                                          db_suffix=db_suffix,
-                                         impala_home = os.environ['IMPALA_HOME'])
+                                         impala_home = base_load_dir)
   return load_template
 
 def build_hbase_create_stmt(db_name, table_name, column_families):

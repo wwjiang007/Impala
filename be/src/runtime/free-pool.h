@@ -23,6 +23,7 @@
 #include <string.h>
 #include <string>
 #include <sstream>
+#include "common/atomic.h"
 #include "common/logging.h"
 #include "gutil/bits.h"
 #include "runtime/mem-pool.h"
@@ -35,8 +36,8 @@ namespace impala {
 
 /// Implementation of a free pool to recycle allocations. The pool is broken
 /// up into 64 lists, one for each power of 2. Each allocation is rounded up
-/// to the next power of 2. When the allocation is freed, it is added to the
-/// corresponding free list.
+/// to the next power of 2 (or 8 bytes, whichever is larger). When the
+/// allocation is freed, it is added to the corresponding free list.
 /// Each allocation has an 8 byte header that immediately precedes the actual
 /// allocation. If the allocation is owned by the user, the header contains
 /// the ptr to the list that it should be added to on Free().
@@ -60,9 +61,8 @@ class FreePool {
   uint8_t* Allocate(int64_t size) {
     DCHECK_GE(size, 0);
 #ifndef NDEBUG
-    static int32_t alloc_counts = 0;
     if (FLAGS_stress_free_pool_alloc > 0 &&
-        (++alloc_counts % FLAGS_stress_free_pool_alloc) == 0) {
+        (alloc_counts_.Add(1) % FLAGS_stress_free_pool_alloc) == 0) {
       return NULL;
     }
 #endif
@@ -70,6 +70,9 @@ class FreePool {
     if (UNLIKELY(size == 0)) return mem_pool_->EmptyAllocPtr();
     ++net_allocations_;
     if (FLAGS_disable_mem_pools) return reinterpret_cast<uint8_t*>(malloc(size));
+    /// MemPool allocations are 8-byte aligned, so making allocations < 8 bytes
+    /// doesn't save memory and eliminates opportunities to recycle allocations.
+    size = std::max<int64_t>(8, size);
     int free_list_idx = Bits::Log2Ceiling64(size);
     DCHECK_LT(free_list_idx, NUM_LISTS);
     FreeListNode* allocation = lists_[free_list_idx].next;
@@ -118,9 +121,8 @@ class FreePool {
   /// free the memory buffer pointed to by "ptr" in this case.
   uint8_t* Reallocate(uint8_t* ptr, int64_t size) {
 #ifndef NDEBUG
-    static int32_t alloc_counts = 0;
     if (FLAGS_stress_free_pool_alloc > 0 &&
-        (++alloc_counts % FLAGS_stress_free_pool_alloc) == 0) {
+        (alloc_counts_.Add(1) % FLAGS_stress_free_pool_alloc) == 0) {
       return NULL;
     }
 #endif
@@ -206,6 +208,12 @@ class FreePool {
 
   /// Diagnostic counter that tracks (# Allocates - # Frees)
   int64_t net_allocations_;
+
+#ifndef NDEBUG
+  /// Counter for tracking the number of allocations. Used only if the
+  /// the stress flag FLAGS_stress_free_pool_alloc is set.
+  static AtomicInt32 alloc_counts_;
+#endif
 };
 
 }

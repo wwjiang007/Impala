@@ -21,6 +21,10 @@
 // All files here must be added explicitly to the codegen/CMakeLists.txt dependency list
 
 #ifdef IR_COMPILE
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wheader-hygiene"
+
 #include "codegen/codegen-anyval-ir.cc"
 #include "exec/aggregation-node-ir.cc"
 #include "exec/hash-join-node-ir.cc"
@@ -51,8 +55,11 @@
 #include "exprs/utility-functions-ir.cc"
 #include "runtime/mem-pool.h"
 #include "runtime/raw-value-ir.cc"
+#include "runtime/runtime-filter-ir.cc"
 #include "udf/udf-ir.cc"
 #include "util/hash-util-ir.cc"
+
+#pragma clang diagnostic pop
 
 // Unused function to make sure printf declaration is included in IR module. Used by
 // LlvmCodegen::CodegenDebugTrace().
