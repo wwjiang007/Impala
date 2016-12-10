@@ -23,9 +23,11 @@ from kudu.schema import (
     INT32,
     INT64,
     INT8,
+    SchemaBuilder,
     STRING,
     BINARY,
     UNIXTIME_MICROS)
+from kudu.client import Partitioning
 import logging
 import pytest
 import textwrap
@@ -83,8 +85,8 @@ class TestKuduOperations(KuduTestSuite):
             for nullable in nullability:
               impala_tbl_name = "test_column_options_%s" % str(indx)
               cursor.execute("""CREATE TABLE %s.%s (a INT PRIMARY KEY
-                  %s %s %s %s, b INT %s %s %s %s %s) PARTITION BY HASH (a) INTO 3
-                  BUCKETS STORED AS KUDU""" % (unique_database, impala_tbl_name,
+                  %s %s %s %s, b INT %s %s %s %s %s) PARTITION BY HASH (a)
+                  PARTITIONS 3 STORED AS KUDU""" % (unique_database, impala_tbl_name,
                   encoding, compression, default, blocksize, nullable, encoding,
                   compression, default, blocksize))
               indx = indx + 1
@@ -94,7 +96,7 @@ class TestKuduOperations(KuduTestSuite):
   def test_kudu_rename_table(self, cursor, kudu_client, unique_database):
     """Test Kudu table rename"""
     cursor.execute("""CREATE TABLE %s.foo (a INT PRIMARY KEY) PARTITION BY HASH(a)
-        INTO 3 BUCKETS STORED AS KUDU""" % unique_database)
+        PARTITIONS 3 STORED AS KUDU""" % unique_database)
     kudu_tbl_name = "impala::%s.foo" % unique_database
     assert kudu_client.table_exists(kudu_tbl_name)
     new_kudu_tbl_name = "blah"
@@ -102,6 +104,37 @@ class TestKuduOperations(KuduTestSuite):
         unique_database, new_kudu_tbl_name))
     assert kudu_client.table_exists(new_kudu_tbl_name)
     assert not kudu_client.table_exists(kudu_tbl_name)
+
+  def test_kudu_show_unbounded_range_partition(self, cursor, kudu_client,
+                                               unique_database):
+    """Check that a single unbounded range partition gets printed correctly."""
+    schema_builder = SchemaBuilder()
+    column_spec = schema_builder.add_column("id", INT64)
+    column_spec.nullable(False)
+    schema_builder.set_primary_keys(["id"])
+    schema = schema_builder.build()
+
+    name = unique_database + ".unbounded_range_table"
+
+    try:
+      kudu_client.create_table(name, schema,
+                        partitioning=Partitioning().set_range_partition_columns(["id"]))
+      kudu_table = kudu_client.table(name)
+
+      impala_table_name = self.get_kudu_table_base_name(kudu_table.name)
+      props = "TBLPROPERTIES('kudu.table_name'='%s')" % kudu_table.name
+      cursor.execute("CREATE EXTERNAL TABLE %s STORED AS KUDU %s" % (impala_table_name,
+          props))
+      with self.drop_impala_table_after_context(cursor, impala_table_name):
+        cursor.execute("SHOW RANGE PARTITIONS %s" % impala_table_name)
+        assert cursor.description == [
+          ('RANGE (id)', 'STRING', None, None, None, None, None)]
+        assert cursor.fetchall() == [('UNBOUNDED',)]
+
+    finally:
+      if kudu_client.table_exists(name):
+        kudu_client.delete_table(name)
+
 
 class TestCreateExternalTable(KuduTestSuite):
 
@@ -272,20 +305,20 @@ class TestShowCreateTable(KuduTestSuite):
     self.assert_show_create_equals(cursor,
         """
         CREATE TABLE {table} (c INT PRIMARY KEY)
-        PARTITION BY HASH (c) INTO 3 BUCKETS STORED AS KUDU""",
+        PARTITION BY HASH (c) PARTITIONS 3 STORED AS KUDU""",
         """
         CREATE TABLE {db}.{{table}} (
           c INT NOT NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION,
           PRIMARY KEY (c)
         )
-        PARTITION BY HASH (c) INTO 3 BUCKETS
+        PARTITION BY HASH (c) PARTITIONS 3
         STORED AS KUDU
         TBLPROPERTIES ('kudu.master_addresses'='{kudu_addr}')""".format(
             db=cursor.conn.db_name, kudu_addr=KUDU_MASTER_HOSTS))
     self.assert_show_create_equals(cursor,
         """
         CREATE TABLE {table} (c INT PRIMARY KEY, d STRING NULL)
-        PARTITION BY HASH (c) INTO 3 BUCKETS, RANGE (c)
+        PARTITION BY HASH (c) PARTITIONS 3, RANGE (c)
         (PARTITION VALUES <= 1, PARTITION 1 < VALUES <= 2,
          PARTITION 2 < VALUES) STORED AS KUDU""",
         """
@@ -294,27 +327,27 @@ class TestShowCreateTable(KuduTestSuite):
           d STRING NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION,
           PRIMARY KEY (c)
         )
-        PARTITION BY HASH (c) INTO 3 BUCKETS, RANGE (c) (...)
+        PARTITION BY HASH (c) PARTITIONS 3, RANGE (c) (...)
         STORED AS KUDU
         TBLPROPERTIES ('kudu.master_addresses'='{kudu_addr}')""".format(
             db=cursor.conn.db_name, kudu_addr=KUDU_MASTER_HOSTS))
     self.assert_show_create_equals(cursor,
         """
         CREATE TABLE {table} (c INT ENCODING PLAIN_ENCODING, PRIMARY KEY (c))
-        PARTITION BY HASH (c) INTO 3 BUCKETS STORED AS KUDU""",
+        PARTITION BY HASH (c) PARTITIONS 3 STORED AS KUDU""",
         """
         CREATE TABLE {db}.{{table}} (
           c INT NOT NULL ENCODING PLAIN_ENCODING COMPRESSION DEFAULT_COMPRESSION,
           PRIMARY KEY (c)
         )
-        PARTITION BY HASH (c) INTO 3 BUCKETS
+        PARTITION BY HASH (c) PARTITIONS 3
         STORED AS KUDU
         TBLPROPERTIES ('kudu.master_addresses'='{kudu_addr}')""".format(
             db=cursor.conn.db_name, kudu_addr=KUDU_MASTER_HOSTS))
     self.assert_show_create_equals(cursor,
         """
         CREATE TABLE {table} (c INT COMPRESSION LZ4, d STRING, PRIMARY KEY(c, d))
-        PARTITION BY HASH (c) INTO 3 BUCKETS, HASH (d) INTO 3 BUCKETS,
+        PARTITION BY HASH (c) PARTITIONS 3, HASH (d) PARTITIONS 3,
         RANGE (c, d) (PARTITION VALUE = (1, 'aaa'), PARTITION VALUE = (2, 'bbb'))
         STORED AS KUDU""",
         """
@@ -323,7 +356,7 @@ class TestShowCreateTable(KuduTestSuite):
           d STRING NOT NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION,
           PRIMARY KEY (c, d)
         )
-        PARTITION BY HASH (c) INTO 3 BUCKETS, HASH (d) INTO 3 BUCKETS, RANGE (c, d) (...)
+        PARTITION BY HASH (c) PARTITIONS 3, HASH (d) PARTITIONS 3, RANGE (c, d) (...)
         STORED AS KUDU
         TBLPROPERTIES ('kudu.master_addresses'='{kudu_addr}')""".format(
             db=cursor.conn.db_name, kudu_addr=KUDU_MASTER_HOSTS))
@@ -352,7 +385,7 @@ class TestShowCreateTable(KuduTestSuite):
     self.assert_show_create_equals(cursor,
         """
         CREATE TABLE {{table}} (c INT PRIMARY KEY)
-        PARTITION BY HASH (c) INTO 3 BUCKETS
+        PARTITION BY HASH (c) PARTITIONS 3
         STORED AS KUDU
         TBLPROPERTIES ({props})""".format(props=props),
         """
@@ -360,7 +393,7 @@ class TestShowCreateTable(KuduTestSuite):
           c INT NOT NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION,
           PRIMARY KEY (c)
         )
-        PARTITION BY HASH (c) INTO 3 BUCKETS
+        PARTITION BY HASH (c) PARTITIONS 3
         STORED AS KUDU
         TBLPROPERTIES ('kudu.master_addresses'='{kudu_addr}', {props})""".format(
             db=cursor.conn.db_name, kudu_addr=KUDU_MASTER_HOSTS, props=props))
@@ -371,7 +404,7 @@ class TestShowCreateTable(KuduTestSuite):
     self.assert_show_create_equals(cursor,
         """
         CREATE TABLE {{table}} (c INT PRIMARY KEY)
-        PARTITION BY HASH (c) INTO 3 BUCKETS
+        PARTITION BY HASH (c) PARTITIONS 3
         STORED AS KUDU
         TBLPROPERTIES ({props})""".format(props=props),
         """
@@ -379,7 +412,7 @@ class TestShowCreateTable(KuduTestSuite):
           c INT NOT NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION,
           PRIMARY KEY (c)
         )
-        PARTITION BY HASH (c) INTO 3 BUCKETS
+        PARTITION BY HASH (c) PARTITIONS 3
         STORED AS KUDU
         TBLPROPERTIES ('kudu.master_addresses'='{kudu_addr}')""".format(
             db=cursor.conn.db_name, kudu_addr=KUDU_MASTER_HOSTS))
@@ -421,7 +454,7 @@ class TestDropDb(KuduTestSuite):
       # Create a managed Kudu table
       managed_table_name = self.random_table_name()
       unique_cursor.execute("""
-          CREATE TABLE %s (a INT PRIMARY KEY) PARTITION BY HASH (a) INTO 3 BUCKETS
+          CREATE TABLE %s (a INT PRIMARY KEY) PARTITION BY HASH (a) PARTITIONS 3
           STORED AS KUDU TBLPROPERTIES ('kudu.table_name' = '%s')"""
           % (managed_table_name, managed_table_name))
       assert kudu_client.table_exists(managed_table_name)
@@ -507,7 +540,7 @@ class TestImpalaKuduIntegration(KuduTestSuite):
         has been dropped externally."""
     impala_tbl_name = "foo"
     cursor.execute("""CREATE TABLE %s.%s (a INT PRIMARY KEY) PARTITION BY HASH (a)
-        INTO 3 BUCKETS STORED AS KUDU""" % (unique_database, impala_tbl_name))
+        PARTITIONS 3 STORED AS KUDU""" % (unique_database, impala_tbl_name))
     kudu_tbl_name = "impala::%s.%s" % (unique_database, impala_tbl_name)
     assert kudu_client.table_exists(kudu_tbl_name)
     kudu_client.delete_table(kudu_tbl_name)
@@ -545,7 +578,7 @@ class TestKuduMemLimits(KuduTestSuite):
     l_shipmode STRING,
     l_comment STRING,
     PRIMARY KEY (l_orderkey, l_linenumber))
-  PARTITION BY HASH (l_orderkey, l_linenumber) INTO 3 BUCKETS
+  PARTITION BY HASH (l_orderkey, l_linenumber) PARTITIONS 3
   STORED AS KUDU"""
 
   LOAD = """

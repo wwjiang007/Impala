@@ -333,7 +333,7 @@ public class KuduTable extends Table {
       if (param.isSetBy_hash_param()) {
         TKuduPartitionByHashParam hashParam = param.getBy_hash_param();
         partitionBy_.add(KuduPartitionParam.createHashParam(
-            hashParam.getColumns(), hashParam.getNum_buckets()));
+            hashParam.getColumns(), hashParam.getNum_partitions()));
       } else {
         Preconditions.checkState(param.isSetBy_range_param());
         TKuduPartitionByRangeParam rangeParam = param.getBy_range_param();
@@ -410,6 +410,35 @@ public class KuduTable extends Table {
 
     } catch (Exception e) {
       throw new ImpalaRuntimeException("Error accessing Kudu for table stats.", e);
+    }
+    return result;
+  }
+
+  public TResultSet getRangePartitions() throws ImpalaRuntimeException {
+    TResultSet result = new TResultSet();
+    TResultSetMetadata resultSchema = new TResultSetMetadata();
+    result.setSchema(resultSchema);
+
+    // Build column header
+    String header = "RANGE (" + Joiner.on(',').join(getRangePartitioningColNames()) + ")";
+    resultSchema.addToColumns(new TColumn(header, Type.STRING.toThrift()));
+    try (KuduClient client = KuduUtil.createKuduClient(getKuduMasterHosts())) {
+      org.apache.kudu.client.KuduTable kuduTable = client.openTable(kuduTableName_);
+      // The Kudu table API will return the partitions in sorted order by value.
+      List<String> partitions = kuduTable.getFormattedRangePartitions(
+          BackendConfig.INSTANCE.getKuduClientTimeoutMs());
+      if (partitions.isEmpty()) {
+        TResultRowBuilder builder = new TResultRowBuilder();
+        result.addToRows(builder.add("").get());
+        return result;
+      }
+      for (String partition: partitions) {
+        TResultRowBuilder builder = new TResultRowBuilder();
+        builder.add(partition);
+        result.addToRows(builder.get());
+      }
+    } catch (Exception e) {
+      throw new ImpalaRuntimeException("Error accessing Kudu for table partitions.", e);
     }
     return result;
   }
