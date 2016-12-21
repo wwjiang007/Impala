@@ -57,7 +57,7 @@ fi
 # moving to a different build of the toolchain, e.g. when a version is bumped or a
 # compile option is changed. The build id can be found in the output of the toolchain
 # build jobs, it is constructed from the build number and toolchain git hash prefix.
-: ${IMPALA_TOOLCHAIN_BUILD_ID=304-a5cb8de41a}
+: ${IMPALA_TOOLCHAIN_BUILD_ID=308-96a4cc516e}
 
 # This flag is used in $IMPALA_HOME/cmake_modules/toolchain.cmake.
 # If it's 0, Impala will be built with the compiler in the toolchain directory.
@@ -141,7 +141,7 @@ if [[ -z "${KUDU_IS_SUPPORTED-}" ]]; then
       # Remove spaces, trim minor versions, and convert to lowercase.
       DISTRO_VERSION="$(tr -d ' \n' <<< "$DISTRO_VERSION" | cut -d. -f1 | tr "A-Z" "a-z")"
       case "$DISTRO_VERSION" in
-        centos6 | centos7 | debian7 | debian8 | ubuntu* )
+        centos6 | centos7 | debian7 | debian8 | suselinux12 | ubuntu* )
             KUDU_IS_SUPPORTED=true;;
       esac
     fi
@@ -228,25 +228,12 @@ export IMPALA_FE_TEST_COVERAGE_DIR="${IMPALA_FE_TEST_LOGS_DIR}/coverage"
 export IMPALA_BE_TEST_LOGS_DIR="${IMPALA_LOGS_DIR}/be_tests"
 export IMPALA_EE_TEST_LOGS_DIR="${IMPALA_LOGS_DIR}/ee_tests"
 export IMPALA_CUSTOM_CLUSTER_TEST_LOGS_DIR="${IMPALA_LOGS_DIR}/custom_cluster_tests"
-# List of all Impala log dirs and create them.
+# List of all Impala log dirs so they can be created by buildall.sh
 export IMPALA_ALL_LOGS_DIRS="${IMPALA_CLUSTER_LOGS_DIR}
   ${IMPALA_DATA_LOADING_LOGS_DIR} ${IMPALA_DATA_LOADING_SQL_DIR}
   ${IMPALA_EE_TEST_LOGS_DIR} ${IMPALA_FE_TEST_COVERAGE_DIR}
   ${IMPALA_BE_TEST_LOGS_DIR} ${IMPALA_EE_TEST_LOGS_DIR}
   ${IMPALA_CUSTOM_CLUSTER_TEST_LOGS_DIR}"
-mkdir -p $IMPALA_ALL_LOGS_DIRS
-
-# Create symlinks Testing/Temporary and be/Testing/Temporary that point to the BE test
-# log dir to capture the all logs of BE unit tests. Gtest has Testing/Temporary
-# hardwired in its code, so we cannot change the output dir by configuration.
-# We create two symlinks to capture the logs when running ctest either from
-# ${IMPALA_HOME} or ${IMPALA_HOME}/be.
-rm -rf "${IMPALA_HOME}/Testing"
-mkdir -p "${IMPALA_HOME}/Testing"
-ln -fs "${IMPALA_BE_TEST_LOGS_DIR}" "${IMPALA_HOME}/Testing/Temporary"
-rm -rf "${IMPALA_HOME}/be/Testing"
-mkdir -p "${IMPALA_HOME}/be/Testing"
-ln -fs "${IMPALA_BE_TEST_LOGS_DIR}" "${IMPALA_HOME}/be/Testing/Temporary"
 
 # Reduce the concurrency for local tests to half the number of cores in the system.
 # Note than nproc may not be available on older distributions (centos5.5)
@@ -270,7 +257,6 @@ export IMPALA_GFLAGS_VERSION=2.0
 export IMPALA_GLOG_VERSION=0.3.2-p2
 export IMPALA_GPERFTOOLS_VERSION=2.5
 export IMPALA_GTEST_VERSION=1.6.0
-export IMPALA_KUDU_VERSION=a70c905006
 export IMPALA_LLVM_VERSION=3.8.0-p1
 export IMPALA_LLVM_ASAN_VERSION=3.8.0-p1
 # Debug builds should use the release+asserts build to get additional coverage.
@@ -291,12 +277,14 @@ export IMPALA_THRIFT_VERSION=0.9.0-p8
 export IMPALA_THRIFT_JAVA_VERSION=0.9.0
 export IMPALA_ZLIB_VERSION=1.2.8
 
+# Kudu version in the toolchain; provides libkudu_client.so and minicluster binaries.
+export IMPALA_KUDU_VERSION=e018a83
+
+# Kudu version used to identify Java client jar from maven
+export KUDU_JAVA_VERSION=1.2.0-SNAPSHOT
+
 export KUDU_MASTER="${KUDU_MASTER:-127.0.0.1}"
 export KUDU_MASTER_PORT="${KUDU_MASTER_PORT:-7051}"
-# TODO: Figure out a way to use a snapshot version without causing a lot of breakage due
-#       to nightly changes from Kudu. The version below is the last released version but
-#       before release this needs to be updated to the version about to be released.
-export KUDU_JAVA_VERSION=1.2.0-SNAPSHOT
 
 if [[ $OSTYPE == "darwin"* ]]; then
   IMPALA_CYRUS_SASL_VERSION=2.1.26
@@ -306,11 +294,11 @@ if [[ $OSTYPE == "darwin"* ]]; then
   IMPALA_THRIFT_JAVA_VERSION=0.9.2
 fi
 
-export IMPALA_HADOOP_VERSION=${IMPALA_HADOOP_VERSION:-2.6.0-cdh5.10.0-SNAPSHOT}
-export IMPALA_HBASE_VERSION=${IMPALA_HBASE_VERSION:-1.2.0-cdh5.10.0-SNAPSHOT}
-export IMPALA_HIVE_VERSION=${IMPALA_HIVE_VERSION:-1.1.0-cdh5.10.0-SNAPSHOT}
-export IMPALA_SENTRY_VERSION=${IMPALA_SENTRY_VERSION:-1.5.1-cdh5.10.0-SNAPSHOT}
-export IMPALA_PARQUET_VERSION=${IMPALA_PARQUET_VERSION:-1.5.0-cdh5.10.0-SNAPSHOT}
+export IMPALA_HADOOP_VERSION=${IMPALA_HADOOP_VERSION:-2.6.0-cdh5.11.0-SNAPSHOT}
+export IMPALA_HBASE_VERSION=${IMPALA_HBASE_VERSION:-1.2.0-cdh5.11.0-SNAPSHOT}
+export IMPALA_HIVE_VERSION=${IMPALA_HIVE_VERSION:-1.1.0-cdh5.11.0-SNAPSHOT}
+export IMPALA_SENTRY_VERSION=${IMPALA_SENTRY_VERSION:-1.5.1-cdh5.11.0-SNAPSHOT}
+export IMPALA_PARQUET_VERSION=${IMPALA_PARQUET_VERSION:-1.5.0-cdh5.11.0-SNAPSHOT}
 export IMPALA_LLAMA_MINIKDC_VERSION=${IMPALA_LLAMA_MINIKDC_VERSION:-1.0.0}
 
 export IMPALA_FE_DIR="$IMPALA_HOME/fe"
@@ -391,8 +379,13 @@ export ASAN_SYMBOLIZER_PATH="${IMPALA_TOOLCHAIN}/llvm-${IMPALA_LLVM_ASAN_VERSION
 
 export CLUSTER_DIR="${IMPALA_HOME}/testdata/cluster"
 
+# The number of parallel build processes we should run at a time.
 : ${IMPALA_BUILD_THREADS:="$(nproc)"}
 export IMPALA_BUILD_THREADS
+
+# Additional flags to pass to make or ninja.
+: ${IMPALA_MAKE_FLAGS:=""}
+export IMPALA_MAKE_FLAGS
 
 # Some environments (like the packaging build) might not have $USER set.  Fix that here.
 export USER="${USER-`id -un`}"
