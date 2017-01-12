@@ -52,7 +52,10 @@ under the License.
       <note>
         Impala was accepted into the Apache incubator on December 2, 2015.
         In places where the documentation formerly referred to <q>Cloudera Impala</q>,
-        now the official name is <q>Apache Impala (incubating)</q>.
+        now the official name is <q>Apache Impala (incubating)</q>. As of January 2016,
+        the Impala community is working on excising the Cloudera-specific documentation
+        from this manual. While that is ongoing, there are still some outdated or
+        off-topic parts of this manual.
       </note>
 
   </conbody>
@@ -70,7 +73,7 @@ under the License.
 
   <concept id="impala_cdh">
 
-    <title>How Impala Works with CDH</title>
+    <title>How Impala Works with <keyword keyref="hadoop_distro"/></title>
   <prolog>
     <metadata>
       <data name="Category" value="Concepts"/>
@@ -79,7 +82,7 @@ under the License.
 
     <conbody>
 
-      <p conref="../shared/impala_common.xml#common/impala_overview_diagram"/>
+      <p audience="Cloudera" conref="../shared/impala_common.xml#common/impala_overview_diagram"/>
 
       <p conref="../shared/impala_common.xml#common/component_list"/>
 
