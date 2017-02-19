@@ -1055,7 +1055,7 @@ def load_random_queries_and_populate_runtime_info(
 
   def generate_candidates():
     while True:
-      query_model = query_generator.create_query(tables)
+      query_model = query_generator.generate_statement(tables)
       sql = model_translator.write_query(query_model)
       query = Query()
       query.sql = sql
@@ -1777,7 +1777,7 @@ def main():
   args = parser.parse_args()
 
   cli_options.configure_logging(
-      args.log_level, debug_log_file=args.debug_log_file, log_thread_id=True,
+      args.log_level, debug_log_file=args.debug_log_file, log_thread_name=True,
       log_process_id=True)
   LOG.debug("CLI args: %s" % (args, ))
 

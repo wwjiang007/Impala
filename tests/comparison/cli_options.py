@@ -23,8 +23,8 @@ import sys
 from getpass import getuser
 from tempfile import gettempdir
 
-import db_connection
-from cluster import (
+from tests.comparison import db_connection
+from tests.comparison.cluster import (
     CmCluster,
     DEFAULT_HIVE_HOST,
     DEFAULT_HIVE_PASSWORD,
@@ -33,7 +33,7 @@ from cluster import (
     MiniCluster,
     MiniHiveCluster,
 )
-from db_types import TYPES
+from tests.comparison.db_types import TYPES
 
 
 def add_logging_options(parser, default_debug_log_file=None):
@@ -48,7 +48,7 @@ def add_logging_options(parser, default_debug_log_file=None):
       help='Path to debug log file.')
 
 
-def configure_logging(log_level, debug_log_file=None, log_thread_id=False,
+def configure_logging(log_level, debug_log_file=None, log_thread_name=False,
                       log_process_id=False):
   root_logger = logging.getLogger()
   root_logger.setLevel(logging.DEBUG)
@@ -59,16 +59,16 @@ def configure_logging(log_level, debug_log_file=None, log_thread_id=False,
   format = "%(asctime)s"
   if log_process_id:
     format += " %(process)d"
-  if log_thread_id:
-    format += " %(thread)d"
+  if log_thread_name:
+    format += " %(threadName)s"
   format += " %(levelname)s:%(module)s[%(lineno)s]:%(message)s"
-  console_logger.setFormatter(logging.Formatter(format, "%H:%M:%S"))
+  console_logger.setFormatter(logging.Formatter(format))
   root_logger.addHandler(console_logger)
 
   if debug_log_file:
-    file_logger = logging.FileHandler(debug_log_file, mode="w")
+    file_logger = logging.FileHandler(debug_log_file)
     file_logger.name = "file"
-    file_logger.setFormatter(logging.Formatter(format, "%H:%M:%S"))
+    file_logger.setFormatter(logging.Formatter(format))
     file_logger.setLevel(logging.DEBUG)
     root_logger.addHandler(file_logger)
 

@@ -158,19 +158,13 @@ class Expr {
 
   const ColumnType& type() const { return type_; }
   bool is_slotref() const { return is_slotref_; }
+  bool is_constant() const { return is_constant_; }
 
   const std::vector<Expr*>& children() const { return children_; }
 
   /// Returns an error status if the function context associated with the
   /// expr has an error set.
   Status GetFnContextError(ExprContext* ctx);
-
-  /// Returns true if the expression is considered constant. This must match the
-  /// definition of Expr.isConstant() in the frontend. The default implementation returns
-  /// true if all children are constant.
-  /// TODO: IMPALA-4617 - plumb through the value from the frontend and remove duplicate
-  /// logic.
-  virtual bool IsConstant() const;
 
   /// Returns true if this is a literal expression.
   virtual bool IsLiteral() const;
@@ -247,12 +241,12 @@ class Expr {
   /// appropriate type of AnyVal.
   virtual Status GetCodegendComputeFn(LlvmCodeGen* codegen, llvm::Function** fn) = 0;
 
-  /// If this expr is constant, evaluates the expr with no input row argument and returns
-  /// the result in 'const_val'. Sets 'const_val' to NULL if the argument is not constant.
-  /// The returned AnyVal and associated varlen data is owned by 'context'. This should
-  /// only be called after Open() has been called on this expr. Returns an error if there
-  /// was an error evaluating the expression or if memory could not be allocated for the
-  /// expression result.
+  /// If this expr is constant according to is_constant(), evaluates the expr with no
+  /// input row argument and returns the result in 'const_val'. Otherwise sets
+  /// 'const_val' to nullptr. The returned AnyVal and associated varlen data is owned by
+  /// 'context'. This should only be called after Open() has been called on this expr.
+  /// Returns an error if there was an error evaluating the expression or if memory could
+  /// not be allocated for the expression result.
   virtual Status GetConstVal(
       RuntimeState* state, ExprContext* context, AnyVal** const_val);
 
@@ -266,51 +260,7 @@ class Expr {
   /// not strip these symbols.
   static void InitBuiltinsDummy();
 
-  // Any additions to this enum must be reflected in both GetConstant*() and
-  // GetIrConstant().
-  enum ExprConstant {
-    RETURN_TYPE_SIZE, // int
-    RETURN_TYPE_PRECISION, // int
-    RETURN_TYPE_SCALE, // int
-    ARG_TYPE_SIZE, // int[]
-    ARG_TYPE_PRECISION, // int[]
-    ARG_TYPE_SCALE, // int[]
-  };
-
-  // Static function for obtaining a runtime constant.  Expr compute functions and
-  // builtins implementing the UDF interface should use this function, rather than
-  // accessing runtime constants directly, so any recognized constants can be inlined via
-  // InlineConstants() in the codegen path. In the interpreted path, this function will
-  // work as-is.
-  //
-  // 'c' determines which constant is returned. The type of the constant is annotated in
-  // the ExprConstant enum above. If the constant is an array, 'i' must be specified and
-  // indicates which element to return. 'i' must always be an immediate integer value so
-  // InlineConstants() can resolve the index, e.g., it cannot be a variable or an
-  // expression like "1 + 1".  For example, if 'c' = ARG_TYPE_SIZE, then 'T' = int and
-  // 0 <= i < children_.size().
-  //
-  // InlineConstants() can be run on the function to replace recognized constants. The
-  // constants are only replaced in the function itself, so any callee functions with
-  // constants to be replaced must be inlined into the function that InlineConstants()
-  // is run on (e.g. by annotating them with IR_ALWAYS_INLINE).
-  //
-  // TODO: implement a loop unroller (or use LLVM's) so we can use GetConstantInt() in loops
-  static int GetConstantInt(const FunctionContext& ctx, ExprConstant c, int i = -1);
-
-  /// Finds all calls to Expr::GetConstantInt() in 'fn' and replaces them with the
-  /// appropriate runtime constants based on the arguments. 'return_type' is the
-  /// return type of the UDF or UDAF, i.e. the value of FunctionContext::GetReturnType().
-  /// 'arg_types' are the argument types of the UDF or UDAF, i.e. the values of
-  /// FunctionContext::GetArgType().
-  static int InlineConstants(const FunctionContext::TypeDesc& return_type,
-      const std::vector<FunctionContext::TypeDesc>& arg_types,
-      LlvmCodeGen* codegen, llvm::Function* fn);
-
   static const char* LLVM_CLASS_NAME;
-
-  // Expr::GetConstantInt() symbol prefix.
-  static const char* GET_CONSTANT_INT_SYMBOL_PREFIX;
 
  protected:
   friend class AggFnEvaluator;
@@ -329,7 +279,7 @@ class Expr {
   friend class FunctionCall;
   friend class ScalarFnCall;
 
-  Expr(const ColumnType& type, bool is_slotref = false);
+  Expr(const ColumnType& type, bool is_constant, bool is_slotref);
   Expr(const TExprNode& node, bool is_slotref = false);
 
   /// Initializes this expr instance for execution. This does not include initializing
@@ -364,6 +314,11 @@ class Expr {
 
   /// Function description.
   TFunction fn_;
+
+  /// True if this expr should be treated as a constant expression. True if either:
+  /// * This expr was sent from the frontend and Expr.isConstant() was true.
+  /// * This expr is a constant literal created in the backend.
+  const bool is_constant_;
 
   /// recognize if this node is a slotref in order to speed up GetValue()
   const bool is_slotref_;
@@ -406,11 +361,6 @@ class Expr {
   /// 'type'. This is used for calling interpreted Get*Val() functions from codegen'd
   /// functions (e.g. in ScalarFnCall() when codegen is disabled).
   llvm::Function* GetStaticGetValWrapper(ColumnType type, LlvmCodeGen* codegen);
-
-  /// Replace all calls to Expr::GetConstant() in 'fn' based on the types of the
-  /// expr and its children. This is a convenience method that invokes the static
-  /// InlineConstants() function with the correct arguments for the expr.
-  int InlineConstants(LlvmCodeGen* codegen, llvm::Function* fn);
 
   /// Simple debug string that provides no expr subclass-specific information
   std::string DebugString(const std::string& expr_name) const;
@@ -455,13 +405,6 @@ class Expr {
   static StringVal GetStringVal(Expr* expr, ExprContext* context, const TupleRow* row);
   static TimestampVal GetTimestampVal(Expr* expr, ExprContext* context, const TupleRow* row);
   static DecimalVal GetDecimalVal(Expr* expr, ExprContext* context, const TupleRow* row);
-
-
-  // Helper function for GetConstantInt() and InlineConstants(): return the constant value
-  // given the specific argument and return types.
-  static int GetConstantInt(const FunctionContext::TypeDesc& return_type,
-      const std::vector<FunctionContext::TypeDesc>& arg_types, ExprConstant c,
-      int i = -1);
 };
 
 }

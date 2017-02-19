@@ -45,8 +45,7 @@ using kudu::client::KuduSchema;
 using kudu::client::KuduTable;
 
 DEFINE_string(kudu_read_mode, "READ_LATEST", "(Advanced) Sets the Kudu scan ReadMode. "
-    "Supported Kudu read modes are READ_LATEST and READ_AT_SNAPSHOT. Invalid values "
-    "result in using READ_LATEST.");
+    "Supported Kudu read modes are READ_LATEST and READ_AT_SNAPSHOT.");
 DEFINE_bool(pick_only_leaders_for_tests, false,
             "Whether to pick only leader replicas, for tests purposes only.");
 DEFINE_int32(kudu_scanner_keep_alive_period_sec, 15,

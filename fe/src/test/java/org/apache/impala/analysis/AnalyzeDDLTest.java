@@ -44,6 +44,7 @@ import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.FrontendTestBase;
 import org.apache.impala.common.RuntimeEnv;
+import org.apache.impala.service.CatalogOpExecutor;
 import org.apache.impala.testutil.TestUtils;
 import org.apache.impala.thrift.TDescribeTableParams;
 import org.apache.impala.util.MetaStoreUtil;
@@ -257,6 +258,77 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalysisError("alter table functional.alltypes add " +
         "partition(year=2050, month=10) location '  '",
         "URI path cannot be empty.");
+  }
+
+  @Test
+  public void TestAlterTableAddMultiplePartitions() {
+    for (String cl: new String[]{"if not exists", ""}) {
+      // Add multiple partitions.
+      AnalyzesOk("alter table functional.alltypes add " + cl +
+          " partition(year=2050, month=10)" +
+          " partition(year=2050, month=11)" +
+          " partition(year=2050, month=12)");
+      // Duplicate partition specifications.
+      AnalysisError("alter table functional.alltypes add " + cl +
+          " partition(year=2050, month=10)" +
+          " partition(year=2050, month=11)" +
+          " partition(Month=10, YEAR=2050)",
+          "Duplicate partition spec: (month=10, year=2050)");
+
+      // Multiple partitions with locations and caching.
+      AnalyzesOk("alter table functional.alltypes add " + cl +
+          " partition(year=2050, month=10) location" +
+          " '/test-warehouse/alltypes/y2050m10' cached in 'testPool'" +
+          " partition(year=2050, month=11) location" +
+          " 'hdfs://localhost:20500/test-warehouse/alltypes/y2050m11'" +
+          " cached in 'testPool' with replication = 7" +
+          " partition(year=2050, month=12) location" +
+          " 'file:///test-warehouse/alltypes/y2050m12' uncached");
+      // One of the partitions points to an invalid URI.
+      AnalysisError("alter table functional.alltypes add " + cl +
+          " partition(year=2050, month=10) location" +
+          " '/test-warehouse/alltypes/y2050m10' cached in 'testPool'" +
+          " partition(year=2050, month=11) location" +
+          " 'hdfs://localhost:20500/test-warehouse/alltypes/y2050m11'" +
+          " cached in 'testPool' with replication = 7" +
+          " partition(year=2050, month=12) location" +
+          " 'fil:///test-warehouse/alltypes/y2050m12' uncached",
+          "No FileSystem for scheme: fil");
+      // One of the partitions is cached in a non-existent pool.
+      AnalysisError("alter table functional.alltypes add " + cl +
+          " partition(year=2050, month=10) location" +
+          " '/test-warehouse/alltypes/y2050m10' cached in 'testPool'" +
+          " partition(year=2050, month=11) location" +
+          " 'hdfs://localhost:20500/test-warehouse/alltypes/y2050m11'" +
+          " cached in 'nonExistentTestPool' with replication = 7" +
+          " partition(year=2050, month=12) location" +
+          " 'file:///test-warehouse/alltypes/y2050m12' uncached",
+          "The specified cache pool does not exist: nonExistentTestPool");
+    }
+
+    // Test the limit for the number of partitions
+    StringBuilder stmt = new StringBuilder("alter table functional.alltypes add");
+    int year;
+    int month;
+    for (int i = 0; i < CatalogOpExecutor.MAX_PARTITION_UPDATES_PER_RPC; ++i) {
+      year = i/12 + 2050;
+      month = i%12 + 1;
+      stmt.append(String.format(" partition(year=%d, month=%d)", year, month));
+    }
+    AnalyzesOk(stmt.toString());
+    // Over the limit by one partition
+    year = CatalogOpExecutor.MAX_PARTITION_UPDATES_PER_RPC/12 + 2050;
+    month = CatalogOpExecutor.MAX_PARTITION_UPDATES_PER_RPC%12 + 1;
+    stmt.append(String.format(" partition(year=%d, month=%d)", year, month));
+    AnalysisError(stmt.toString(),
+        String.format("One ALTER TABLE ADD PARTITION cannot add more than %d partitions.",
+        CatalogOpExecutor.MAX_PARTITION_UPDATES_PER_RPC));
+
+    // If 'IF NOT EXISTS' is not used, ALTER TABLE ADD PARTITION cannot add a preexisting
+    // partition to a table.
+    AnalysisError("alter table functional.alltypes add partition(year=2050, month=1)" +
+        "partition(year=2010, month=1) partition(year=2050, month=2)",
+        "Partition spec already exists: (year=2010, month=1)");
   }
 
   @Test
@@ -1727,12 +1799,6 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "Invalid column/field name: ???");
     AnalysisError("create table new_table (i int) PARTITIONED BY (`^&*` int)",
         "Invalid column/field name: ^&*");
-    // Test HMS constraint on type name length.
-    AnalyzesOk(String.format("create table t (i %s)",
-        genTypeSql(MetaStoreUtil.MAX_TYPE_NAME_LENGTH)));
-    AnalysisError(String.format("create table t (i %s)",
-        genTypeSql(MetaStoreUtil.MAX_TYPE_NAME_LENGTH + 1)),
-        "Type of column 'i' exceeds maximum type length of 4000 characters:");
     // Test HMS constraint on comment length.
     AnalyzesOk(String.format("create table t (i int comment '%s')",
         StringUtils.repeat("c", MetaStoreUtil.CREATE_MAX_COMMENT_LENGTH)));
@@ -1791,39 +1857,6 @@ public class AnalyzeDDLTest extends FrontendTestBase {
           "Tables produced by an external data source do not support the column type: " +
           type.name());
     }
-  }
-
-  /**
-   * Generates a valid type string with exactly the given number of characters.
-   * The type is a struct with at least two fields.
-   * The given length must be at least "struct<s:int,c:int>".length() == 19.
-   */
-  private String genTypeSql(int length) {
-    Preconditions.checkState(length >= 19);
-    StringBuilder result = new StringBuilder();
-    result.append("struct<s:int");
-    // The middle fields always have a fixed length.
-    int midFieldLen = ",f000:int".length();
-    // The last field has a variable length, but this is the minimum.
-    int lastFieldMinLen = ",f:int".length();
-    int fieldIdx = 0;
-    while (result.length() < length - midFieldLen - lastFieldMinLen) {
-      String fieldStr = String.format(",f%03d:int", fieldIdx);
-      result.append(fieldStr);
-      ++fieldIdx;
-    }
-    Preconditions.checkState(result.length() == length - 1 ||
-        result.length() < length - lastFieldMinLen);
-    // Generate last field with a variable length.
-    if (result.length() < length - 1) {
-      int fieldNameLen = length - result.length() - ",:int".length() - 1;
-      Preconditions.checkState(fieldNameLen > 0);
-      String fieldStr = String.format(",%s:int", StringUtils.repeat("f", fieldNameLen));
-      result.append(fieldStr);
-    }
-    result.append(">");
-    Preconditions.checkState(result.length() == length);
-    return result.toString();
   }
 
   @Test

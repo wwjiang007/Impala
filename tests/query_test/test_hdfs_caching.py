@@ -41,9 +41,9 @@ class TestHdfsCaching(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestHdfsCaching, cls).add_test_dimensions()
-    cls.TestMatrix.add_constraint(lambda v:\
+    cls.ImpalaTestMatrix.add_constraint(lambda v:\
         v.get_value('exec_option')['batch_size'] == 0)
-    cls.TestMatrix.add_constraint(lambda v:\
+    cls.ImpalaTestMatrix.add_constraint(lambda v:\
         v.get_value('table_format').file_format == "text")
 
   # The tpch nation table is cached as part of data loading. We'll issue a query
@@ -174,9 +174,9 @@ class TestHdfsCachingDdl(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestHdfsCachingDdl, cls).add_test_dimensions()
-    cls.TestMatrix.add_dimension(create_single_exec_option_dimension())
+    cls.ImpalaTestMatrix.add_dimension(create_single_exec_option_dimension())
 
-    cls.TestMatrix.add_constraint(lambda v:\
+    cls.ImpalaTestMatrix.add_constraint(lambda v:\
         v.get_value('table_format').file_format == 'text' and \
         v.get_value('table_format').compression_codec == 'none')
 
@@ -205,6 +205,25 @@ class TestHdfsCachingDdl(ImpalaTestSuite):
 
     # Dropping the tables should cleanup cache entries leaving us with the same
     # total number of entries
+    assert num_entries_pre == get_num_cache_requests()
+
+  @pytest.mark.execute_serially
+  def test_caching_ddl_drop_database(self, vector):
+    """IMPALA-2518: DROP DATABASE CASCADE should properly drop all impacted cache
+        directives"""
+    num_entries_pre = get_num_cache_requests()
+    # Populates the `cachedb` database with some cached tables and partitions
+    self.client.execute("use cachedb")
+    self.client.execute("create table cached_tbl_nopart (i int) cached in 'testPool'")
+    self.client.execute("insert into cached_tbl_nopart select 1")
+    self.client.execute("create table cached_tbl_part (i int) partitioned by (j int) \
+                         cached in 'testPool'")
+    self.client.execute("insert into cached_tbl_part (i,j) select 1, 2")
+    # We expect the number of cached entities to grow
+    assert num_entries_pre < get_num_cache_requests()
+    self.client.execute("use default")
+    self.client.execute("drop database cachedb cascade")
+    # We want to see the number of cached entities return to the original count
     assert num_entries_pre == get_num_cache_requests()
 
   @pytest.mark.execute_serially

@@ -60,6 +60,7 @@ static const string PER_HOST_MEM_KEY = "Estimated Per-Host Mem";
 static const string PER_HOST_VCORES_KEY = "Estimated Per-Host VCores";
 static const string TABLES_MISSING_STATS_KEY = "Tables Missing Stats";
 static const string TABLES_WITH_CORRUPT_STATS_KEY = "Tables With Corrupt Table Stats";
+static const string TABLES_WITH_MISSING_DISK_IDS_KEY = "Tables With Missing Disk Ids";
 
 ImpalaServer::QueryExecState::QueryExecState(const TQueryCtx& query_ctx,
     ExecEnv* exec_env, Frontend* frontend, ImpalaServer* server,
@@ -428,6 +429,18 @@ Status ImpalaServer::QueryExecState::ExecQueryOrDmlRequest(
     summary_profile_.AddInfoString(TABLES_WITH_CORRUPT_STATS_KEY, ss.str());
   }
 
+  if (query_exec_request.query_ctx.__isset.tables_missing_diskids &&
+      !query_exec_request.query_ctx.tables_missing_diskids.empty()) {
+    stringstream ss;
+    const vector<TTableName>& tbls =
+        query_exec_request.query_ctx.tables_missing_diskids;
+    for (int i = 0; i < tbls.size(); ++i) {
+      if (i != 0) ss << ",";
+      ss << tbls[i].db_name << "." << tbls[i].table_name;
+    }
+    summary_profile_.AddInfoString(TABLES_WITH_MISSING_DISK_IDS_KEY, ss.str());
+  }
+
   {
     lock_guard<mutex> l(lock_);
     // Don't start executing the query if Cancel() was called concurrently with Exec().
@@ -551,6 +564,10 @@ void ImpalaServer::QueryExecState::Done() {
   summary_profile_.AddInfoString("Query State", PrintQueryState(query_state_));
   query_events_->MarkEvent("Unregister query");
 
+  // Update result set cache metrics, and update mem limit accounting before tearing
+  // down the coordinator.
+  ClearResultCache();
+
   if (coord_.get() != NULL) {
     // Release any reserved resources.
     Status status = exec_env_->scheduler()->Release(schedule_.get());
@@ -560,9 +577,6 @@ void ImpalaServer::QueryExecState::Done() {
     }
     coord_->TearDown();
   }
-
-  // Update result set cache metrics, and update mem limit accounting.
-  ClearResultCache();
 }
 
 Status ImpalaServer::QueryExecState::Exec(const TMetadataOpRequest& exec_request) {
@@ -1056,5 +1070,4 @@ void ImpalaServer::QueryExecState::ClearResultCache() {
   }
   result_cache_.reset(NULL);
 }
-
 }

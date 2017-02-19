@@ -72,28 +72,30 @@ fi
 # moving to a different build of the toolchain, e.g. when a version is bumped or a
 # compile option is changed. The build id can be found in the output of the toolchain
 # build jobs, it is constructed from the build number and toolchain git hash prefix.
-export IMPALA_TOOLCHAIN_BUILD_ID=333-f7c19a394a
+export IMPALA_TOOLCHAIN_BUILD_ID=344-715ee51bdc
 
 # Versions of toolchain dependencies.
 # -----------------------------------
 export IMPALA_AVRO_VERSION=1.7.4-p4
 export IMPALA_BINUTILS_VERSION=2.26-p1
-export IMPALA_BOOST_VERSION=1.57.0
+export IMPALA_BOOST_VERSION=1.57.0-p1
 export IMPALA_BREAKPAD_VERSION=20150612-p1
 export IMPALA_BZIP2_VERSION=1.0.6-p2
 export IMPALA_CMAKE_VERSION=3.2.3-p1
+export IMPALA_CRCUTIL_VERSION=440ba7babeff77ffad992df3a10c767f184e946e
 export IMPALA_CYRUS_SASL_VERSION=2.1.23
 export IMPALA_GCC_VERSION=4.9.2
 export IMPALA_GFLAGS_VERSION=2.0
 export IMPALA_GLOG_VERSION=0.3.2-p2
 export IMPALA_GPERFTOOLS_VERSION=2.5
 export IMPALA_GTEST_VERSION=1.6.0
+export IMPALA_LIBEV_VERSION=4.20
 export IMPALA_LLVM_VERSION=3.8.0-p1
 export IMPALA_LLVM_ASAN_VERSION=3.8.0-p1
 # Debug builds should use the release+asserts build to get additional coverage.
 # Don't use the LLVM debug build because the binaries are too large to distribute.
 export IMPALA_LLVM_DEBUG_VERSION=3.8.0-asserts-p1
-export IMPALA_LZ4_VERSION=svn
+export IMPALA_LZ4_VERSION=1.7.5
 export IMPALA_OPENLDAP_VERSION=2.4.25
 export IMPALA_OPENSSL_VERSION=0.9.8zf
 export IMPALA_PROTOBUF_VERSION=2.6.1
@@ -118,7 +120,7 @@ if [[ $OSTYPE == "darwin"* ]]; then
 fi
 
 # Kudu version in the toolchain; provides libkudu_client.so and minicluster binaries.
-export IMPALA_KUDU_VERSION=e018a83
+export IMPALA_KUDU_VERSION=cd7b0dd
 
 # Kudu version used to identify Java client jar from maven
 export KUDU_JAVA_VERSION=1.2.0-SNAPSHOT
@@ -324,7 +326,7 @@ else
 fi
 export NUM_CONCURRENT_TESTS="${NUM_CONCURRENT_TESTS-${CORES}}"
 
-export KUDU_MASTER="${KUDU_MASTER:-127.0.0.1}"
+export KUDU_MASTER_HOSTS="${KUDU_MASTER_HOSTS:-127.0.0.1}"
 export KUDU_MASTER_PORT="${KUDU_MASTER_PORT:-7051}"
 
 export IMPALA_FE_DIR="$IMPALA_HOME/fe"

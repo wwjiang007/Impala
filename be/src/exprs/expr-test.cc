@@ -36,12 +36,14 @@
 #include "exprs/like-predicate.h"
 #include "exprs/literal.h"
 #include "exprs/null-literal.h"
+#include "exprs/string-functions.h"
 #include "exprs/timestamp-functions.h"
 #include "gen-cpp/Exprs_types.h"
 #include "gen-cpp/hive_metastore_types.h"
 #include "rpc/thrift-client.h"
 #include "rpc/thrift-server.h"
 #include "runtime/runtime-state.h"
+#include "runtime/mem-pool.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/raw-value.inline.h"
 #include "runtime/string-value.h"
@@ -50,6 +52,7 @@
 #include "service/impala-server.h"
 #include "testutil/impalad-query-executor.h"
 #include "testutil/in-process-servers.h"
+#include "udf/udf-test-harness.h"
 #include "util/debug-util.h"
 #include "util/string-parser.h"
 #include "util/test-info.h"
@@ -400,26 +403,38 @@ class ExprTest : public testing::Test {
         "1970-01-01 00:00:00");
   }
 
+  // Verify that 'expr' has the same precision and scale as 'expected_type'.
+  void TestDecimalResultType(const string& expr, const ColumnType& expected_type) {
+    const string typeof_expr = "typeof(" + expr + ")";
+    const string typeof_result = GetValue(typeof_expr, TYPE_STRING);
+    EXPECT_EQ(expected_type.DebugString(), typeof_result) << typeof_expr;
+  }
+
   // Decimals don't work with TestValue.
   // TODO: figure out what operators need to be implemented to work with EXPECT_EQ
-  template <typename T>
+  template<typename T>
   void TestDecimalValue(const string& expr, const T& expected_result,
       const ColumnType& expected_type) {
+    // Verify precision and scale of the expression match the expected type.
+    TestDecimalResultType(expr, expected_type);
+    // Verify the expression result matches the expected result, for the given the
+    // precision and scale.
     const string value = GetValue(expr, expected_type);
-
     StringParser::ParseResult result;
+    // These require that we've passed the correct type to StringToDecimal(), so these
+    // results are valid only when TestDecimalResultType() succeeded.
     switch (expected_type.GetByteSize()) {
       case 4:
         EXPECT_EQ(expected_result.value(), StringParser::StringToDecimal<int32_t>(
-            &value[0], value.size(), expected_type, &result).value());
+            &value[0], value.size(), expected_type, &result).value()) << expr;
         break;
       case 8:
         EXPECT_EQ(expected_result.value(), StringParser::StringToDecimal<int64_t>(
-            &value[0], value.size(), expected_type, &result).value());
+            &value[0], value.size(), expected_type, &result).value()) << expr;
         break;
       case 16:
         EXPECT_EQ(expected_result.value(), StringParser::StringToDecimal<int128_t>(
-            &value[0], value.size(), expected_type, &result).value());
+            &value[0], value.size(), expected_type, &result).value()) << expr;
         break;
       default:
         EXPECT_TRUE(false) << expected_type << " " << expected_type.GetByteSize();
@@ -1019,15 +1034,16 @@ void ExprTest::TestTimestampValue(const string& expr, const TimestampValue& expe
 // Tests whether the returned TimestampValue is valid.
 // We use this function for tests where the expected value is unknown, e.g., now().
 void ExprTest::TestValidTimestampValue(const string& expr) {
-  EXPECT_TRUE(ConvertValue<TimestampValue>(GetValue(expr, TYPE_TIMESTAMP))
-      .HasDateOrTime());
+  EXPECT_TRUE(
+      ConvertValue<TimestampValue>(GetValue(expr, TYPE_TIMESTAMP)).HasDateOrTime());
 }
 
-template <typename T> void TestSingleLiteralConstruction(
+template <typename T>
+void TestSingleLiteralConstruction(
     const ColumnType& type, const T& value, const string& string_val) {
   ObjectPool pool;
   RowDescriptor desc;
-  RuntimeState state{TQueryCtx()};
+  RuntimeState state{TQueryCtx(), ExecEnv::GetInstance(), "test-pool"};
   MemTracker tracker;
 
   Expr* expr = pool.Add(new Literal(type, value));
@@ -1037,18 +1053,20 @@ template <typename T> void TestSingleLiteralConstruction(
   EXPECT_EQ(0, RawValue::Compare(ctx.GetValue(NULL), &value, type))
       << "type: " << type << ", value: " << value;
   ctx.Close(&state);
+  state.ReleaseResources();
 }
 
 TEST_F(ExprTest, NullLiteral) {
   for (int type = TYPE_BOOLEAN; type != TYPE_DATE; ++type) {
     NullLiteral expr(static_cast<PrimitiveType>(type));
     ExprContext ctx(&expr);
-    RuntimeState state{TQueryCtx()};
+    RuntimeState state{TQueryCtx(), ExecEnv::GetInstance(), "test-pool"};
     MemTracker tracker;
     EXPECT_OK(ctx.Prepare(&state, RowDescriptor(), &tracker));
     EXPECT_OK(ctx.Open(&state));
     EXPECT_TRUE(ctx.GetValue(NULL) == NULL);
     ctx.Close(&state);
+    state.ReleaseResources();
   }
 }
 
@@ -1262,64 +1280,193 @@ TEST_F(ExprTest, ArithmeticExprs) {
   TestFactorialArithmeticOp();
 }
 
-TEST_F(ExprTest, DecimalArithmeticExprs) {
-  TestDecimalValue("1.23 + cast(1 as decimal(4,3))",
-                   Decimal4Value(2230), ColumnType::CreateDecimalType(5,3));
-  TestDecimalValue("1.23 - cast(0.23 as decimal(10,3))",
-                   Decimal4Value(1000), ColumnType::CreateDecimalType(11,3));
-  TestDecimalValue("1.23 * cast(1 as decimal(20,3))",
-                   Decimal4Value(123000), ColumnType::CreateDecimalType(23,5));
-  TestDecimalValue("cast(1.23 as decimal(8,2)) / cast(1 as decimal(4,3))",
-                   Decimal4Value(12300000), ColumnType::CreateDecimalType(16,7));
-  TestDecimalValue("cast(1.23 as decimal(8,2)) % cast(1 as decimal(10,3))",
-                   Decimal4Value(230), ColumnType::CreateDecimalType(9,3));
-  TestDecimalValue("cast(1.23 as decimal(8,2)) + cast(1 as decimal(20,3))",
-                   Decimal4Value(2230), ColumnType::CreateDecimalType(21, 3));
-  TestDecimalValue("cast(1.23 as decimal(30,2)) - cast(1 as decimal(4,3))",
-                   Decimal4Value(230), ColumnType::CreateDecimalType(34,3));
-  TestDecimalValue("cast(1.23 as decimal(30,2)) * cast(1 as decimal(10,3))",
-                   Decimal4Value(123000), ColumnType::CreateDecimalType(38,5));
-  TestDecimalValue("cast(1.23 as decimal(30,2)) / cast(1 as decimal(20,3))",
-                   Decimal4Value(1230), ColumnType::CreateDecimalType(38, 3));
-  TestDecimalValue("cast(1 as decimal(38,0)) + cast(.2 as decimal(38,1))",
-                   Decimal4Value(12), ColumnType::CreateDecimalType(38, 1));
-  TestDecimalValue("cast(1 as decimal(38,0)) / cast(.2 as decimal(38,1))",
-                   Decimal4Value(50), ColumnType::CreateDecimalType(38, 1));
+// Use a table-driven approach to test DECIMAL expressions to make it easier to test
+// both the old (decimal_v2=false) and new (decimal_v2=true) DECIMAL semantics.
+struct DecimalExpectedResult {
+  bool null;
+  int128_t scaled_val;
+  int precision;
+  int scale;
+};
 
-  // Test mod() UDF
-  TestDecimalValue("mod(cast('1' as decimal(2,0)), cast('10' as decimal(2,0)))",
-      Decimal4Value(1), ColumnType::CreateDecimalType(2, 0));
-  TestDecimalValue("mod(cast('1.1' as decimal(2,1)), cast('1.0' as decimal(2,1)))",
-      Decimal4Value(1), ColumnType::CreateDecimalType(2,1));
-  TestDecimalValue("mod(cast('-1.23' as decimal(5,2)), cast('1.0' as decimal(5,2)))",
-      Decimal4Value(-23), ColumnType::CreateDecimalType(5,2));
-  TestDecimalValue("mod(cast('1' as decimal(12,0)), cast('10' as decimal(12,0)))",
-      Decimal8Value(1), ColumnType::CreateDecimalType(12, 0));
-  TestDecimalValue("mod(cast('1.1' as decimal(12,1)), cast('1.0' as decimal(12,1)))",
-      Decimal8Value(1), ColumnType::CreateDecimalType(12,1));
-  TestDecimalValue("mod(cast('-1.23' as decimal(12,2)), cast('1.0' as decimal(12,2)))",
-      Decimal8Value(-23), ColumnType::CreateDecimalType(12,2));
-  TestDecimalValue("mod(cast('1' as decimal(32,0)), cast('10' as decimal(32,0)))",
-      Decimal16Value(1), ColumnType::CreateDecimalType(32, 0));
-  TestDecimalValue("mod(cast('1.1' as decimal(32,1)), cast('1.0' as decimal(32,1)))",
-      Decimal16Value(1), ColumnType::CreateDecimalType(32,1));
-  TestDecimalValue("mod(cast('-1.23' as decimal(32,2)), cast('1.0' as decimal(32,2)))",
-      Decimal16Value(-23), ColumnType::CreateDecimalType(32,2));
-  TestIsNull("mod(cast(NULL as decimal(2,0)), cast('10' as decimal(2,0)))",
-      ColumnType::CreateDecimalType(2,0));
-  TestIsNull("mod(cast('10' as decimal(2,0)), cast(NULL as decimal(2,0)))",
-      ColumnType::CreateDecimalType(2,0));
-  TestIsNull("mod(cast('10' as decimal(2,0)), cast('0' as decimal(2,0)))",
-      ColumnType::CreateDecimalType(2,0));
-  TestIsNull("mod(cast('10' as decimal(2,0)), cast('0' as decimal(2,0)))",
-      ColumnType::CreateDecimalType(2,0));
-  TestIsNull("mod(cast(NULL as decimal(2,0)), NULL)",
-      ColumnType::CreateDecimalType(2,0));
+struct DecimalTestCase {
 
+  // Return the expected result for the given DECIMAL version. When the expected V1 and
+  // V2 results are the same, allows the V2 expected result to be unspecified in the
+  // test case table. When V2 expected results aren't specified, V2 entries have both
+  // 'null' set to false and 'precision' set to 0, which is an illegal combination and
+  // signals that V1 results should be used instead.
+  const DecimalExpectedResult& Expected(bool v2) const {
+    if (v2 && (expected[1].null || expected[1].precision != 0)) return expected[1];
+    // Either testing version 1, or the results for version 2 were not specified.
+    return expected[0];
+  }
+
+  // Expression to execute.
+  string expr;
+
+  // Expected results for version 1 and Version 2. Version 2 results can be left unset
+  // when the expected result is the same between versions.
+  DecimalExpectedResult expected[2];
+};
+
+// Format is:
+// { Test Expression (as a string),
+//  { expected null, scaled_val, precision, scale for V1
+//    expected null, scaled_val, precision, scale for V2 }}
+DecimalTestCase decimal_cases[] = {
+  // Test add/subtract operators
+  { "1.23 + cast(1 as decimal(4,3))", {{ false, 2230, 5, 3 }}},
+  { "1.23 - cast(0.23 as decimal(10,3))", {{ false, 1000, 11, 3 }}},
+  { "cast(1.23 as decimal(8,2)) + cast(1 as decimal(20,3))", {{ false, 2230, 21, 3 }}},
+  { "cast(1.23 as decimal(30,2)) - cast(1 as decimal(4,3))", {{ false, 230, 32, 3 }}},
+  { "cast(1 as decimal(38,0)) + cast(.2 as decimal(38,1))", {{ false, 12, 38, 1 }}},
+  // Test multiply operator
+  { "cast(1.23 as decimal(30,2)) * cast(1 as decimal(10,3))", {{ false, 123000, 38, 5 }}},
+  { "1.23 * cast(1 as decimal(20,3))", {{ false, 123000, 23, 5 }}},
+  // Test divide operator
+  { "cast(1.23 as decimal(8,2)) / cast(1 as decimal(4,3))", {{ false, 12300000, 16, 7}}},
+  { "cast(1.23 as decimal(30,2)) / cast(1 as decimal(20,3))",
+    {{ false,     1230, 38, 3 },
+     { false, 12300000, 38, 7 }}},
+  { "cast(1 as decimal(38,0)) / cast(.2 as decimal(38,1))",
+    {{ false,      50, 38, 1 },
+     { false, 5000000, 38, 6 }}},
+  { "cast(1 as decimal(38,0)) / cast(3 as decimal(38,0))",
+    {{ false,      0, 38, 0 },
+     { false, 333333, 38, 6 }}},
+  { "cast(99999999999999999999999999999999999999 as decimal(38,0)) / "
+    "cast(99999999999999999999999999999999999999 as decimal(38,0))",
+    {{ false,       1, 38, 0 },
+     { false, 1000000, 38, 6 }}},
+  { "cast(99999999999999999999999999999999999999 as decimal(38,0)) / "
+    "cast(0.00000000000000000000000000000000000001 as decimal(38,38))",
+    {{ true, 0, 38, 38 },
+     { true, 0, 38,  6 }}},
+  { "cast(0.00000000000000000000000000000000000001 as decimal(38,38)) / "
+    "cast(99999999999999999999999999999999999999 as decimal(38,0))",
+    {{ false, 0, 38, 38 }}},
+  { "cast(0.00000000000000000000000000000000000001 as decimal(38,38)) / "
+    "cast(0.00000000000000000000000000000000000001 as decimal(38,38))",
+    {{ true,        0, 38, 38 },
+     { false, 1000000, 38,  6 }}},
+  { "cast(9999999999999999999.9999999999999999999 as decimal(38,19)) / "
+    "cast(99999999999999999999999999999.999999999 as decimal(38,9))",
+    {{ false, 1000000000, 38, 19 },
+     { false,          1, 38, 10 }}},
+  { "cast(999999999999999999999999999999999999.99 as decimal(38,2)) / "
+    "cast(99999999999.999999999999999999999999999 as decimal(38,27))",
+    {{ true,  0, 38, 27 },
+     { false, static_cast<int128_t>(10) * 10000000000ll *
+       10000000000ll * 10000000000ll, 38, 6 }}},
+  { "cast(-2.12 as decimal(17,2)) / cast(12515.95 as decimal(17,2))",
+    {{ false, -16938386618674571, 37, 20 }}},
+  { "cast(-2.12 as decimal(18,2)) / cast(12515.95 as decimal(18,2))",
+    {{ false,                  0, 38,  2 },
+     { false, -16938386618674571, 38, 20 }}},
+  { "cast(737373 as decimal(6,0)) / cast(.52525252 as decimal(38,38))",
+    {{ true,              0, 38, 38 },
+     { false, 1403844764038, 38,  6 }}},
+  { "cast(0.000001 as decimal(6,6)) / "
+    "cast(0.0000000000000000000000000000000000001 as decimal(38,38))",
+    {{ true, 0, 38, 38 },
+     { false, static_cast<int128_t>(10000000ll) *
+       10000000000ll * 10000000000ll * 10000000000ll, 38, 6 }}},
+  { "cast(98765432109876543210 as decimal(20,0)) / "
+    "cast(98765432109876543211 as decimal(20,0))",
+    {{ false,                  0, 38,  0 },
+     { false, 999999999999999999, 38, 18 }}},
+  { "cast(111111.1111 as decimal(20, 10)) / cast(.7777 as decimal(38, 38))",
+    {{ true,             0, 38, 38 },
+     { false, 142871429985, 38,  6 }}},
+  // Test modulo operator
+  { "cast(1.23 as decimal(8,2)) % cast(1 as decimal(10,3))", {{ false, 230, 9, 3 }}},
+  { "cast(1 as decimal(38,0)) % cast(.2 as decimal(38,1))", {{ false, 0, 38, 1 }}},
+  { "cast(1 as decimal(38,0)) % cast(3 as decimal(38,0))", {{ false, 1, 38, 0 }}},
+  { "cast(-2.12 as decimal(17,2)) % cast(12515.95 as decimal(17,2))",
+    {{ false, -212, 17, 2 }}},
+  { "cast(-2.12 as decimal(18,2)) % cast(12515.95 as decimal(18,2))",
+    {{ false, -212, 18, 2 }}},
+  { "cast(99999999999999999999999999999999999999 as decimal(38,0)) % "
+    "cast(99999999999999999999999999999999999999 as decimal(38,0))",
+    {{ false, 0, 38, 0 }}},
+  { "cast(998 as decimal(38,0)) % cast(0.999 as decimal(38,38))", {{ false, 0, 38, 38 }}},
+  { "cast(0.998 as decimal(38,38)) % cast(999 as decimal(38,0))", {{ false, 0, 38, 38 }}},
+  { "cast(0.00000000000000000000000000000000000001 as decimal(38,38)) % "
+    "cast(0.0000000000000000000000000000000000001 as decimal(38,38))",
+    {{ false, 1, 38, 38 }}},
+  // Test MOD builtin
+  { "mod(cast('1' as decimal(2,0)), cast('10' as decimal(2,0)))", {{ false, 1, 2, 0 }}},
+  { "mod(cast('1.1' as decimal(2,1)), cast('1.0' as decimal(2,1)))", {{ false, 1, 2, 1 }}},
+  { "mod(cast('-1.23' as decimal(5,2)), cast('1.0' as decimal(5,2)))",
+    {{ false, -23, 5, 2 }}},
+  { "mod(cast('1' as decimal(12,0)), cast('10' as decimal(12,0)))", {{ false, 1, 12, 0 }}},
+  { "mod(cast('1.1' as decimal(12,1)), cast('1.0' as decimal(12,1)))",
+    {{ false, 1, 12, 1 }}},
+  { "mod(cast('-1.23' as decimal(12,2)), cast('1.0' as decimal(12,2)))",
+    {{ false, -23, 12, 2 }}},
+  { "mod(cast('1' as decimal(32,0)), cast('10' as decimal(32,0)))",
+    {{ false, 1, 32, 0 }}},
+  { "mod(cast('1.1' as decimal(32,1)), cast('1.0' as decimal(32,1)))",
+    {{ false, 1, 32, 1 }}},
+  { "mod(cast('-1.23' as decimal(32,2)), cast('1.0' as decimal(32,2)))",
+    {{ false, -23, 32, 2 }}},
+  { "mod(cast(NULL as decimal(2,0)), cast('10' as decimal(2,0)))", {{ true, 0, 2, 0 }}},
+  { "mod(cast('10' as decimal(2,0)), cast(NULL as decimal(2,0)))", {{ true, 0, 2, 0 }}},
+  { "mod(cast('10' as decimal(2,0)), cast('0' as decimal(2,0)))", {{ true, 0, 2, 0 }}},
+  { "mod(cast('10' as decimal(2,0)), cast('0' as decimal(2,0)))", {{ true, 0, 2, 0 }}},
+  { "mod(cast(NULL as decimal(2,0)), NULL)", {{ true, 0, 2, 0 }}},
+  // Test CAST DECIMAL -> DECIMAL
+  { "cast(cast(0.12344 as decimal(6,5)) as decimal(6,4))",
+    {{ false, 1234, 6, 4 }}},
+  { "cast(cast(0.12345 as decimal(6,5)) as decimal(6,4))",
+    {{ false, 1234, 6, 4 },
+     { false, 1235, 6, 4 }}},
+  { "cast(cast('0.999' as decimal(4,3)) as decimal(1,0))",
+    {{ false, 0, 1, 0 },
+     { false, 1, 1, 0 }}},
+  { "cast(cast(999999999.99 as DECIMAL(11,2)) as DECIMAL(9,0))",
+    {{ false, 999999999, 9, 0 },
+     { true, 0, 9, 0 }}},
+  { "cast(cast(-999999999.99 as DECIMAL(11,2)) as DECIMAL(9,0))",
+    {{ false, -999999999, 9, 0 },
+     { true, 0, 9, 0 }}},
   // IMPALA-2233: Test that implicit casts do not lose precision.
   // The overload greatest(decimal(*,*)) is available and should be used.
-  TestDecimalValue("greatest(0, cast('99999.1111' as decimal(30,10)))",
-      Decimal8Value(999991111000000), ColumnType::CreateDecimalType(30, 10));
+  { "greatest(0, cast('99999.1111' as decimal(30,10)))",
+    {{ false, 999991111000000, 30, 10 },
+     { false, 999991111000000, 30, 10 }}}
+};
+
+TEST_F(ExprTest, DecimalArithmeticExprs) {
+  // Test with both decimal_v2={false, true}
+  for (int v2: { 0, 1 }) {
+    string opt = "DECIMAL_V2=" + lexical_cast<string>(v2);
+    executor_->PushExecOption(opt);
+    for (const DecimalTestCase& c : decimal_cases) {
+      const DecimalExpectedResult& r = c.Expected(v2);
+      const ColumnType& type = ColumnType::CreateDecimalType(r.precision, r.scale);
+      if (r.null) {
+        TestDecimalResultType(c.expr, type);
+        TestIsNull(c.expr, type);
+      } else {
+        switch (type.GetByteSize()) {
+          case 4:
+            TestDecimalValue(c.expr, Decimal4Value(r.scaled_val), type);
+            break;
+          case 8:
+            TestDecimalValue(c.expr, Decimal8Value(r.scaled_val), type);
+            break;
+          case 16:
+            TestDecimalValue(c.expr, Decimal16Value(r.scaled_val), type);
+            break;
+          default:
+            DCHECK(false) << type << " " << type.GetByteSize();
+        }
+      }
+    }
+    executor_->PopExecOption();
+  }
 }
 
 // There are two tests of ranges, the second of which requires a cast
@@ -1453,6 +1600,10 @@ TEST_F(ExprTest, CastExprs) {
   TestIsNull("cast(cast(1180591620717411303425 as decimal(38, 0)) as timestamp)",
       TYPE_TIMESTAMP);
 
+  // Out of range String <--> Timestamp - invalid boundary cases.
+  TestIsNull("cast('1399-12-31 23:59:59' as timestamp)", TYPE_TIMESTAMP);
+  TestIsNull("cast('10000-01-01 00:00:00' as timestamp)", TYPE_TIMESTAMP);
+
   // Timestamp <--> Int
   TestIsNull("cast(cast('09:10:11.000000' as timestamp) as int)", TYPE_INT);
   TestValue("cast(cast('2000-01-01' as timestamp) as int)", TYPE_INT, 946684800);
@@ -1464,9 +1615,19 @@ TEST_F(ExprTest, CastExprs) {
       946717811);
   TestTimestampValue("cast(946717811 as timestamp)",
       TimestampValue("2000-01-01 09:10:11", 19));
-  TestValue("cast(cast('1400-01-01' as timestamp) as bigint)", TYPE_BIGINT, -17987443200);
-  TestTimestampValue("cast(-17987443200 as timestamp)", TimestampValue("1400-01-01", 10));
+
+  // Timestamp <--> Int conversions boundary cases
+  TestValue("cast(cast('1400-01-01 00:00:00' as timestamp) as bigint)",
+      TYPE_BIGINT, -17987443200);
+  TestTimestampValue("cast(-17987443200 as timestamp)",
+      TimestampValue("1400-01-01 00:00:00", 19));
   TestIsNull("cast(-17987443201 as timestamp)", TYPE_TIMESTAMP);
+  TestValue("cast(cast('9999-12-31 23:59:59' as timestamp) as bigint)",
+      TYPE_BIGINT, 253402300799);
+  TestTimestampValue("cast(253402300799 as timestamp)",
+      TimestampValue("9999-12-31 23:59:59", 19));
+  TestIsNull("cast(253402300800 as timestamp)", TYPE_TIMESTAMP);
+
   // Timestamp <--> Float
   TestIsNull("cast(cast('09:10:11.000000' as timestamp) as float)", TYPE_FLOAT);
   TestValue("cast(cast('2000-01-01' as timestamp) as double)", TYPE_DOUBLE, 946684800);
@@ -1478,10 +1639,7 @@ TEST_F(ExprTest, CastExprs) {
   TestValue("cast(cast('1400-01-01' as timestamp) as double)", TYPE_DOUBLE,
       -17987443200);
   TestIsNull("cast(cast(-17987443201.03 as double) as timestamp)", TYPE_TIMESTAMP);
-  // Use 4 digit years otherwise string parsing will fail.
-  TestValue("cast(cast('9999-12-31 23:59:59' as timestamp) + interval 1 year as bigint)",
-      TYPE_BIGINT, 253433923199);
-  TestTimestampValue("cast(253433923199 as timestamp) - interval 1 year",
+  TestTimestampValue("cast(253402300799 as timestamp)",
       TimestampValue("9999-12-31 23:59:59", 19));
   TestIsNull("cast(253433923200 as timestamp)", TYPE_TIMESTAMP);
   TestIsNull("cast(cast(null as bigint) as timestamp)", TYPE_TIMESTAMP);
@@ -1929,6 +2087,119 @@ TEST_F(ExprTest, StringFunctions) {
     TestValue(length_aliases[i] + "('abcdefg')", TYPE_INT, 7);
     TestIsNull(length_aliases[i] + "(NULL)", TYPE_INT);
   }
+
+  TestStringValue("replace('aaaaaa', 'a', 'b')", "bbbbbb");
+  TestStringValue("replace('aaaaaa', 'aa', 'b')", "bbb");
+  TestStringValue("replace('aaaaaaa', 'aa', 'b')", "bbba");
+  TestStringValue("replace('zzzaaaaaaqqq', 'a', 'b')", "zzzbbbbbbqqq");
+  TestStringValue("replace('zzzaaaaaaaqqq', 'aa', 'b')", "zzzbbbaqqq");
+  TestStringValue("replace('aaaaaaaaaaaaaaaaaaaa', 'a', 'b')", "bbbbbbbbbbbbbbbbbbbb");
+  TestStringValue("replace('bobobobobo', 'bobo', 'a')", "aabo");
+  TestStringValue("replace('abc', 'abcd', 'a')", "abc");
+  TestStringValue("replace('aaaaaa', '', 'b')", "aaaaaa");
+  TestStringValue("replace('abc', 'abc', '')", "");
+  TestStringValue("replace('abcdefg', 'z', '')", "abcdefg");
+  TestStringValue("replace('', 'zoltan', 'sultan')", "");
+  TestStringValue("replace('strstrstr', 'str', 'strstr')", "strstrstrstrstrstr");
+  TestStringValue("replace('aaaaaa', 'a', '')", "");
+  TestIsNull("replace(NULL, 'foo', 'bar')", TYPE_STRING);
+  TestIsNull("replace('zomg', 'foo', NULL)", TYPE_STRING);
+  TestIsNull("replace('abc', NULL, 'a')", TYPE_STRING);
+
+  // Do some tests with huge strings
+  const int huge_size = 500000;
+  std::string huge_str;
+  huge_str.reserve(huge_size);
+  huge_str.append(huge_size, 'A');
+
+  std::string huge_space;
+  huge_space.reserve(huge_size);
+  huge_space.append(huge_size, ' ');
+
+  std::string huger_str;
+  huger_str.reserve(3 * huge_size);
+  huger_str.append(3 * huge_size, 'A');
+
+  TestStringValue("replace('" + huge_str + "', 'A', ' ')", huge_space);
+  TestStringValue("replace('" + huge_str + "', 'A', '')", "");
+
+  TestStringValue("replace('" + huge_str + "', 'A', 'AAA')", huger_str);
+  TestStringValue("replace('" + huger_str + "', 'AAA', 'A')", huge_str);
+
+  auto* giga_buf = new std::array<uint8_t, StringVal::MAX_LENGTH>;
+  giga_buf->fill('A');
+  (*giga_buf)[0] = 'Z';
+  (*giga_buf)[10] = 'Z';
+  (*giga_buf)[100] = 'Z';
+  (*giga_buf)[1000] = 'Z';
+  (*giga_buf)[StringVal::MAX_LENGTH-1] = 'Z';
+
+  // Hack up a function context so we can call Replace functions directly.
+  MemTracker m;
+  MemPool pool(&m);
+  FunctionContext::TypeDesc str_desc;
+  str_desc.type = FunctionContext::Type::TYPE_STRING;
+  std::vector<FunctionContext::TypeDesc> v(3, str_desc);
+  auto context = UdfTestHarness::CreateTestContext(str_desc, v, nullptr, &pool);
+
+  StringVal giga(static_cast<uint8_t*>(giga_buf->data()), StringVal::MAX_LENGTH);
+  StringVal a("A");
+  StringVal z("Z");
+  StringVal aaa("aaa");
+
+  // Replace z's with a's on giga
+  auto r1 = StringFunctions::Replace(context, giga, z, a);
+  EXPECT_EQ(r1.ptr[0], 'A');
+  EXPECT_EQ(r1.ptr[10], 'A');
+  EXPECT_EQ(r1.ptr[100], 'A');
+  EXPECT_EQ(r1.ptr[1000], 'A');
+  EXPECT_EQ(r1.ptr[StringVal::MAX_LENGTH-1], 'A');
+
+  // Entire string match is legal
+  auto r2 = StringFunctions::Replace(context, giga, giga, a);
+  EXPECT_EQ(r2, a);
+
+  // So is replacing giga with itself
+  auto r3 = StringFunctions::Replace(context, giga, giga, giga);
+  EXPECT_EQ(r3.ptr[0], 'Z');
+  EXPECT_EQ(r3.ptr[10], 'Z');
+  EXPECT_EQ(r3.ptr[100], 'Z');
+  EXPECT_EQ(r3.ptr[1000], 'Z');
+  EXPECT_EQ(r3.ptr[StringVal::MAX_LENGTH-1], 'Z');
+
+  // Expect expansion to fail as soon as possible; test with unallocated string space
+  // This tests overflowing the first allocation.
+  auto* short_buf = new std::array<uint8_t, 4096>;
+  short_buf->fill('A');
+  (*short_buf)[1000] = 'Z';
+  StringVal bam(static_cast<uint8_t*>(short_buf->data()), StringVal::MAX_LENGTH);
+  auto r4 = StringFunctions::Replace(context, bam, z, aaa);
+  EXPECT_TRUE(r4.is_null);
+
+  // Similar test for second overflow.  This tests overflowing on re-allocation.
+  (*short_buf)[4095] = 'Z';
+  StringVal bam2(static_cast<uint8_t*>(short_buf->data()), StringVal::MAX_LENGTH-2);
+  auto r5 = StringFunctions::Replace(context, bam2, z, aaa);
+  EXPECT_TRUE(r5.is_null);
+
+  // Finally, test expanding to exactly MAX_LENGTH
+  // There are 4 Zs in giga4 (not including the trailing one, as we truncate that)
+  StringVal giga4(static_cast<uint8_t*>(giga_buf->data()), StringVal::MAX_LENGTH-8);
+  auto r6 = StringFunctions::Replace(context, giga4, z, aaa);
+  EXPECT_EQ(strncmp((char*)&r6.ptr[0], "aaaA", 4), 0);
+  EXPECT_EQ(r6.len, 1 << 30);
+
+  // Finally, an expansion in the last string position
+  (*giga_buf)[StringVal::MAX_LENGTH-11] = 'Z';
+  StringVal giga5(static_cast<uint8_t*>(giga_buf->data()), StringVal::MAX_LENGTH-10);
+  auto r7 = StringFunctions::Replace(context, giga5, z, aaa);
+  EXPECT_EQ(r7.len, 1 << 30);
+  EXPECT_EQ(strncmp((char*)&r7.ptr[StringVal::MAX_LENGTH-4], "Aaaa", 4), 0);
+
+  UdfTestHarness::CloseContext(context);
+  delete giga_buf;
+  delete short_buf;
+  pool.FreeAll();
 
   TestStringValue("reverse('abcdefg')", "gfedcba");
   TestStringValue("reverse('')", "");
@@ -3594,7 +3865,7 @@ TEST_F(ExprTest, TimestampFunctions) {
       TYPE_TIMESTAMP);
   TestIsNull(
       "CAST('1400-01-01 00:12:00' AS TIMESTAMP) - INTERVAL 13 MINUTES", TYPE_TIMESTAMP);
-  TestIsNull("CAST('9999-12-31 21:00:00' AS TIMESTAMP) + INTERVAL 100000000 SECONDS",
+  TestIsNull("CAST('9999-12-31 23:59:59' AS TIMESTAMP) + INTERVAL 1 SECONDS",
       TYPE_TIMESTAMP);
   TestIsNull(
       "CAST('1400-01-01 00:00:00' AS TIMESTAMP) - INTERVAL 1 SECONDS", TYPE_TIMESTAMP);
@@ -3804,7 +4075,7 @@ TEST_F(ExprTest, TimestampFunctions) {
     const string& lt_max_interval =
         lexical_cast<string>(static_cast<int64_t>(0.9 * it->second));
     // Test that pushing a value beyond the max/min values results in a NULL.
-    TestIsNull(unit + "_add(cast('9999-12-31 23:59:59' as timestamp) + interval 1 year, "
+    TestIsNull(unit + "_add(cast('9999-12-31 23:59:59' as timestamp), "
         + lt_max_interval + ")", TYPE_TIMESTAMP);
     TestIsNull(unit + "_sub(cast('1400-01-01 00:00:00' as timestamp), "
         + lt_max_interval + ")", TYPE_TIMESTAMP);
@@ -3952,7 +4223,7 @@ TEST_F(ExprTest, TimestampFunctions) {
       "to_date(cast('2011-12-22 09:10:11.12345678' as timestamp))", "2011-12-22");
 
   // Check that timeofday() does not crash or return incorrect results
-  GetValue("timeofday()", TYPE_STRING);
+  TestIsNotNull("timeofday()", TYPE_STRING);
 
   TestValue("timestamp_cmp('1964-05-04 15:33:45','1966-05-04 15:33:45')", TYPE_INT, -1);
   TestValue("timestamp_cmp('1966-09-04 15:33:45','1966-05-04 15:33:45')", TYPE_INT, 1);
@@ -4091,6 +4362,7 @@ TEST_F(ExprTest, TimestampFunctions) {
         TYPE_DOUBLE, 1.2938724610001E9);
     TestStringValue("cast(cast(1.3041352164485E9 as timestamp) as string)",
         "2011-04-29 20:46:56.448500000");
+
     // NULL arguments.
     TestIsNull("from_utc_timestamp(NULL, 'PST')", TYPE_TIMESTAMP);
     TestIsNull("from_utc_timestamp(cast('2011-01-01 01:01:01.1' as timestamp), NULL)",
@@ -4109,11 +4381,9 @@ TEST_F(ExprTest, TimestampFunctions) {
       TYPE_TIMESTAMP);
   TestIsNull("from_utc_timestamp(CAST(\"1400-01-01 05:00:00\" as TIMESTAMP), \"PST\")",
       TYPE_TIMESTAMP);
-  // TODO: IMPALA-4549: these should return NULL, but validation doesn't catch year 10000.
-  // Just check that we don't crash.
-  GetValue("from_utc_timestamp(CAST(\"10000-12-31 21:00:00\" as TIMESTAMP), \"JST\")",
+  TestIsNull("from_utc_timestamp(CAST(\"9999-12-31 21:00:00\" as TIMESTAMP), \"JST\")",
       TYPE_TIMESTAMP);
-  GetValue("to_utc_timestamp(CAST(\"10000-12-31 21:00:00\" as TIMESTAMP), \"PST\")",
+  TestIsNull("to_utc_timestamp(CAST(\"9999-12-31 21:00:00\" as TIMESTAMP), \"PST\")",
       TYPE_TIMESTAMP);
 
   // With support of date strings this generates a date and 0 time.
@@ -4242,7 +4512,6 @@ TEST_F(ExprTest, TimestampFunctions) {
 
   TestIsNull("unix_timestamp('1970-01', 'yyyy-MM-dd')", TYPE_BIGINT);
   TestIsNull("unix_timestamp('1970-20-01', 'yyyy-MM-dd')", TYPE_BIGINT);
-
 
   // regression test for IMPALA-1105
   TestIsNull("cast(trunc('2014-07-22 01:34:55 +0100', 'year') as STRING)", TYPE_STRING);
@@ -4653,8 +4922,6 @@ TEST_F(ExprTest, TimestampFunctions) {
   TestNextDayFunction();
 }
 
-
-
 TEST_F(ExprTest, ConditionalFunctions) {
   // If first param evaluates to true, should return second parameter,
   // false or NULL should return the third.
@@ -5024,7 +5291,6 @@ TEST_F(ExprTest, ConditionalFunctionIsNotFalse) {
 //     exprs that have the same byte size can end up in a number of locations
 void ValidateLayout(const vector<Expr*>& exprs, int expected_byte_size,
     int expected_var_begin, const map<int, set<int>>& expected_offsets) {
-
   vector<int> offsets;
   set<int> offsets_found;
 
@@ -5435,75 +5701,75 @@ TEST_F(ExprTest, DecimalFunctions) {
 
   // Ceil()
   TestDecimalValue("ceil(cast('0' as decimal(6,5)))", Decimal4Value(0),
-      ColumnType::CreateDecimalType(6, 0));
+      ColumnType::CreateDecimalType(2, 0));
   TestDecimalValue("ceil(cast('3.14159' as decimal(6,5)))", Decimal4Value(4),
-      ColumnType::CreateDecimalType(6, 0));
+      ColumnType::CreateDecimalType(2, 0));
   TestDecimalValue("ceil(cast('-3.14159' as decimal(6,5)))", Decimal4Value(-3),
-      ColumnType::CreateDecimalType(6, 0));
+      ColumnType::CreateDecimalType(2, 0));
   TestDecimalValue("ceil(cast('3' as decimal(6,5)))", Decimal4Value(3),
-      ColumnType::CreateDecimalType(6, 0));
+      ColumnType::CreateDecimalType(2, 0));
   TestDecimalValue("ceil(cast('3.14159' as decimal(13,5)))", Decimal8Value(4),
-      ColumnType::CreateDecimalType(13, 0));
+      ColumnType::CreateDecimalType(9, 0));
   TestDecimalValue("ceil(cast('-3.14159' as decimal(13,5)))", Decimal8Value(-3),
-      ColumnType::CreateDecimalType(13, 0));
+      ColumnType::CreateDecimalType(9, 0));
   TestDecimalValue("ceil(cast('3' as decimal(13,5)))", Decimal8Value(3),
-      ColumnType::CreateDecimalType(13, 0));
+      ColumnType::CreateDecimalType(9, 0));
   TestDecimalValue("ceil(cast('3.14159' as decimal(33,5)))", Decimal16Value(4),
-      ColumnType::CreateDecimalType(33, 0));
+      ColumnType::CreateDecimalType(29, 0));
   TestDecimalValue("ceil(cast('-3.14159' as decimal(33,5)))", Decimal16Value(-3),
-      ColumnType::CreateDecimalType(33, 0));
+      ColumnType::CreateDecimalType(29, 0));
   TestDecimalValue("ceil(cast('3' as decimal(33,5)))", Decimal16Value(3),
-      ColumnType::CreateDecimalType(33, 0));
+      ColumnType::CreateDecimalType(29, 0));
   TestDecimalValue("ceil(cast('9.14159' as decimal(6,5)))", Decimal4Value(10),
       ColumnType::CreateDecimalType(2, 0));
   TestIsNull("ceil(cast(NULL as decimal(2,0)))", ColumnType::CreateDecimalType(2,0));
 
   // Floor()
   TestDecimalValue("floor(cast('3.14159' as decimal(6,5)))", Decimal4Value(3),
-      ColumnType::CreateDecimalType(6, 0));
+      ColumnType::CreateDecimalType(2, 0));
   TestDecimalValue("floor(cast('-3.14159' as decimal(6,5)))", Decimal4Value(-4),
-      ColumnType::CreateDecimalType(6, 0));
+      ColumnType::CreateDecimalType(2, 0));
   TestDecimalValue("floor(cast('3' as decimal(6,5)))", Decimal4Value(3),
-      ColumnType::CreateDecimalType(6, 0));
+      ColumnType::CreateDecimalType(2, 0));
   TestDecimalValue("floor(cast('3.14159' as decimal(13,5)))", Decimal8Value(3),
-      ColumnType::CreateDecimalType(13, 0));
+      ColumnType::CreateDecimalType(9, 0));
   TestDecimalValue("floor(cast('-3.14159' as decimal(13,5)))", Decimal8Value(-4),
-      ColumnType::CreateDecimalType(13, 0));
+      ColumnType::CreateDecimalType(9, 0));
   TestDecimalValue("floor(cast('3' as decimal(13,5)))", Decimal8Value(3),
-      ColumnType::CreateDecimalType(13, 0));
+      ColumnType::CreateDecimalType(9, 0));
   TestDecimalValue("floor(cast('3.14159' as decimal(33,5)))", Decimal16Value(3),
-      ColumnType::CreateDecimalType(33, 0));
+      ColumnType::CreateDecimalType(29, 0));
   TestDecimalValue("floor(cast('-3.14159' as decimal(33,5)))", Decimal16Value(-4),
-      ColumnType::CreateDecimalType(33, 0));
+      ColumnType::CreateDecimalType(29, 0));
   TestDecimalValue("floor(cast('3' as decimal(33,5)))", Decimal16Value(3),
-      ColumnType::CreateDecimalType(33, 0));
+      ColumnType::CreateDecimalType(29, 0));
   TestDecimalValue("floor(cast('-9.14159' as decimal(6,5)))", Decimal4Value(-10),
       ColumnType::CreateDecimalType(2, 0));
   TestIsNull("floor(cast(NULL as decimal(2,0)))", ColumnType::CreateDecimalType(2,0));
 
   // Dfloor() alias
   TestDecimalValue("dfloor(cast('3.14159' as decimal(6,5)))", Decimal4Value(3),
-      ColumnType::CreateDecimalType(6, 0));
+      ColumnType::CreateDecimalType(2, 0));
 
   // Round()
   TestDecimalValue("round(cast('3.14159' as decimal(6,5)))", Decimal4Value(3),
-      ColumnType::CreateDecimalType(6, 0));
+      ColumnType::CreateDecimalType(2, 0));
   TestDecimalValue("round(cast('-3.14159' as decimal(6,5)))", Decimal4Value(-3),
-      ColumnType::CreateDecimalType(6, 0));
+      ColumnType::CreateDecimalType(2, 0));
   TestDecimalValue("round(cast('3' as decimal(6,5)))", Decimal4Value(3),
-      ColumnType::CreateDecimalType(6, 0));
+      ColumnType::CreateDecimalType(2, 0));
   TestDecimalValue("round(cast('3.14159' as decimal(13,5)))", Decimal8Value(3),
-      ColumnType::CreateDecimalType(13, 0));
+      ColumnType::CreateDecimalType(9, 0));
   TestDecimalValue("round(cast('-3.14159' as decimal(13,5)))", Decimal8Value(-3),
-      ColumnType::CreateDecimalType(13, 0));
+      ColumnType::CreateDecimalType(9, 0));
   TestDecimalValue("round(cast('3' as decimal(13,5)))", Decimal8Value(3),
-      ColumnType::CreateDecimalType(13, 0));
+      ColumnType::CreateDecimalType(9, 0));
   TestDecimalValue("round(cast('3.14159' as decimal(33,5)))", Decimal16Value(3),
-      ColumnType::CreateDecimalType(33, 0));
+      ColumnType::CreateDecimalType(29, 0));
   TestDecimalValue("round(cast('-3.14159' as decimal(33,5)))", Decimal16Value(-3),
-      ColumnType::CreateDecimalType(33, 0));
+      ColumnType::CreateDecimalType(29, 0));
   TestDecimalValue("round(cast('3' as decimal(33,5)))", Decimal16Value(3),
-      ColumnType::CreateDecimalType(33, 0));
+      ColumnType::CreateDecimalType(29, 0));
   TestDecimalValue("round(cast('9.54159' as decimal(6,5)))", Decimal4Value(10),
       ColumnType::CreateDecimalType(2, 0));
   TestDecimalValue("round(cast('-9.54159' as decimal(6,5)))", Decimal4Value(-10),
@@ -5512,23 +5778,23 @@ TEST_F(ExprTest, DecimalFunctions) {
 
   // Truncate()
   TestDecimalValue("truncate(cast('3.54159' as decimal(6,5)))", Decimal4Value(3),
-      ColumnType::CreateDecimalType(6, 0));
+      ColumnType::CreateDecimalType(1, 0));
   TestDecimalValue("truncate(cast('-3.54159' as decimal(6,5)))", Decimal4Value(-3),
-      ColumnType::CreateDecimalType(6, 0));
+      ColumnType::CreateDecimalType(1, 0));
   TestDecimalValue("truncate(cast('3' as decimal(6,5)))", Decimal4Value(3),
-      ColumnType::CreateDecimalType(6, 0));
+      ColumnType::CreateDecimalType(1, 0));
   TestDecimalValue("truncate(cast('3.54159' as decimal(13,5)))", Decimal8Value(3),
-      ColumnType::CreateDecimalType(13, 0));
+      ColumnType::CreateDecimalType(8, 0));
   TestDecimalValue("truncate(cast('-3.54159' as decimal(13,5)))", Decimal8Value(-3),
-      ColumnType::CreateDecimalType(13, 0));
+      ColumnType::CreateDecimalType(8, 0));
   TestDecimalValue("truncate(cast('3' as decimal(13,5)))", Decimal8Value(3),
-      ColumnType::CreateDecimalType(13, 0));
+      ColumnType::CreateDecimalType(8, 0));
   TestDecimalValue("truncate(cast('3.54159' as decimal(33,5)))", Decimal16Value(3),
-      ColumnType::CreateDecimalType(33, 0));
+      ColumnType::CreateDecimalType(28, 0));
   TestDecimalValue("truncate(cast('-3.54159' as decimal(33,5)))", Decimal16Value(-3),
-      ColumnType::CreateDecimalType(33, 0));
+      ColumnType::CreateDecimalType(28, 0));
   TestDecimalValue("truncate(cast('3' as decimal(33,5)))", Decimal16Value(3),
-      ColumnType::CreateDecimalType(33, 0));
+      ColumnType::CreateDecimalType(28, 0));
   TestDecimalValue("truncate(cast('9.54159' as decimal(6,5)))", Decimal4Value(9),
       ColumnType::CreateDecimalType(1, 0));
   TestIsNull("truncate(cast(NULL as decimal(2,0)))", ColumnType::CreateDecimalType(2,0));
@@ -5537,15 +5803,15 @@ TEST_F(ExprTest, DecimalFunctions) {
   TestIsNull("round(cast(NULL as decimal(2,0)), 1)", ColumnType::CreateDecimalType(2,0));
 
   TestDecimalValue("round(cast('3.1615' as decimal(6,4)), 0)", Decimal4Value(3),
-      ColumnType::CreateDecimalType(2, 0));
+      ColumnType::CreateDecimalType(3, 0));
   TestDecimalValue("round(cast('-3.1615' as decimal(6,4)), 1)", Decimal4Value(-32),
-      ColumnType::CreateDecimalType(3, 1));
+      ColumnType::CreateDecimalType(4, 1));
   TestDecimalValue("round(cast('3.1615' as decimal(6,4)), 2)", Decimal4Value(316),
-      ColumnType::CreateDecimalType(4, 2));
+      ColumnType::CreateDecimalType(5, 2));
   TestDecimalValue("round(cast('3.1615' as decimal(6,4)), 3)", Decimal4Value(3162),
-      ColumnType::CreateDecimalType(5, 3));
+      ColumnType::CreateDecimalType(6, 3));
   TestDecimalValue("round(cast('-3.1615' as decimal(6,4)), 3)", Decimal4Value(-3162),
-      ColumnType::CreateDecimalType(5, 3));
+      ColumnType::CreateDecimalType(6, 3));
   TestDecimalValue("round(cast('3.1615' as decimal(6,4)), 4)", Decimal4Value(31615),
       ColumnType::CreateDecimalType(6, 4));
   TestDecimalValue("round(cast('-3.1615' as decimal(6,4)), 5)", Decimal4Value(-316150),
@@ -5564,21 +5830,21 @@ TEST_F(ExprTest, DecimalFunctions) {
       ColumnType::CreateDecimalType(5, 1));
 
   TestDecimalValue("round(cast('-3.1615' as decimal(16,4)), 0)", Decimal8Value(-3),
-      ColumnType::CreateDecimalType(12, 0));
+      ColumnType::CreateDecimalType(13, 0));
   TestDecimalValue("round(cast('3.1615' as decimal(16,4)), 1)", Decimal8Value(32),
-      ColumnType::CreateDecimalType(13, 1));
+      ColumnType::CreateDecimalType(14, 1));
   TestDecimalValue("round(cast('-3.1615' as decimal(16,4)), 2)", Decimal8Value(-316),
-      ColumnType::CreateDecimalType(14, 2));
+      ColumnType::CreateDecimalType(15, 2));
   TestDecimalValue("round(cast('3.1615' as decimal(16,4)), 3)", Decimal8Value(3162),
-      ColumnType::CreateDecimalType(15, 3));
+      ColumnType::CreateDecimalType(16, 3));
   TestDecimalValue("round(cast('-3.1615' as decimal(16,4)), 3)", Decimal8Value(-3162),
-      ColumnType::CreateDecimalType(15, 3));
+      ColumnType::CreateDecimalType(16, 3));
   TestDecimalValue("round(cast('-3.1615' as decimal(16,4)), 4)", Decimal8Value(-31615),
       ColumnType::CreateDecimalType(16, 4));
   TestDecimalValue("round(cast('3.1615' as decimal(16,4)), 5)", Decimal8Value(316150),
       ColumnType::CreateDecimalType(17, 5));
   TestDecimalValue("round(cast('-999.951' as decimal(16,3)), 1)", Decimal8Value(-10000),
-      ColumnType::CreateDecimalType(17, 1));
+      ColumnType::CreateDecimalType(15, 1));
 
   TestDecimalValue("round(cast('-175.0' as decimal(15,1)), 0)", Decimal8Value(-175),
       ColumnType::CreateDecimalType(15, 0));
@@ -5592,19 +5858,19 @@ TEST_F(ExprTest, DecimalFunctions) {
       ColumnType::CreateDecimalType(15, 0));
 
   TestDecimalValue("round(cast('3.1615' as decimal(32,4)), 0)", Decimal16Value(3),
-      ColumnType::CreateDecimalType(32, 0));
+      ColumnType::CreateDecimalType(29, 0));
   TestDecimalValue("round(cast('-3.1615' as decimal(32,4)), 1)", Decimal16Value(-32),
-      ColumnType::CreateDecimalType(33, 1));
+      ColumnType::CreateDecimalType(30, 1));
   TestDecimalValue("round(cast('3.1615' as decimal(32,4)), 2)", Decimal16Value(316),
-      ColumnType::CreateDecimalType(34, 2));
+      ColumnType::CreateDecimalType(31, 2));
   TestDecimalValue("round(cast('3.1615' as decimal(32,4)), 3)", Decimal16Value(3162),
-      ColumnType::CreateDecimalType(35, 3));
+      ColumnType::CreateDecimalType(32, 3));
   TestDecimalValue("round(cast('-3.1615' as decimal(32,4)), 3)", Decimal16Value(-3162),
-      ColumnType::CreateDecimalType(36, 3));
+      ColumnType::CreateDecimalType(32, 3));
   TestDecimalValue("round(cast('3.1615' as decimal(32,4)), 4)", Decimal16Value(31615),
-      ColumnType::CreateDecimalType(37, 4));
+      ColumnType::CreateDecimalType(32, 4));
   TestDecimalValue("round(cast('-3.1615' as decimal(32,5)), 5)", Decimal16Value(-316150),
-      ColumnType::CreateDecimalType(38, 5));
+      ColumnType::CreateDecimalType(32, 5));
   TestDecimalValue("round(cast('-175.0' as decimal(35,1)), 0)", Decimal16Value(-175),
       ColumnType::CreateDecimalType(35, 0));
   TestDecimalValue("round(cast('175.0' as decimal(35,1)), -1)", Decimal16Value(180),
@@ -5616,40 +5882,40 @@ TEST_F(ExprTest, DecimalFunctions) {
   TestDecimalValue("round(cast('-175.0' as decimal(35,1)), -4)", Decimal16Value(0),
       ColumnType::CreateDecimalType(35, 0));
   TestDecimalValue("round(cast('99999.9951' as decimal(35,4)), 2)",
-      Decimal16Value(10000000), ColumnType::CreateDecimalType(36, 2));
+      Decimal16Value(10000000), ColumnType::CreateDecimalType(34, 2));
 
   // Dround() alias
   TestDecimalValue("dround(cast('3.14159' as decimal(6,5)))", Decimal4Value(3),
-      ColumnType::CreateDecimalType(6, 0));
+      ColumnType::CreateDecimalType(2, 0));
   TestDecimalValue("dround(cast('99999.9951' as decimal(35,4)), 2)",
-      Decimal16Value(10000000), ColumnType::CreateDecimalType(36, 2));
+      Decimal16Value(10000000), ColumnType::CreateDecimalType(34, 2));
 
   // TruncateTo()
   TestIsNull("truncate(cast(NULL as decimal(2,0)), 1)",
       ColumnType::CreateDecimalType(2,0));
 
   TestDecimalValue("truncate(cast('-3.1615' as decimal(6,4)), 0)", Decimal4Value(-3),
-      ColumnType::CreateDecimalType(6, 0));
+      ColumnType::CreateDecimalType(2, 0));
   TestDecimalValue("truncate(cast('3.1615' as decimal(6,4)), 1)", Decimal4Value(31),
-      ColumnType::CreateDecimalType(6, 1));
+      ColumnType::CreateDecimalType(3, 1));
   TestDecimalValue("truncate(cast('-3.1615' as decimal(6,4)), 2)", Decimal4Value(-316),
-      ColumnType::CreateDecimalType(6, 2));
+      ColumnType::CreateDecimalType(4, 2));
   TestDecimalValue("truncate(cast('3.1615' as decimal(6,4)), 3)", Decimal4Value(3161),
-      ColumnType::CreateDecimalType(6, 3));
+      ColumnType::CreateDecimalType(5, 3));
   TestDecimalValue("truncate(cast('-3.1615' as decimal(6,4)), 4)", Decimal4Value(-31615),
       ColumnType::CreateDecimalType(6, 4));
   TestDecimalValue("truncate(cast('3.1615' as decimal(6,4)), 5)", Decimal4Value(316150),
       ColumnType::CreateDecimalType(7, 5));
   TestDecimalValue("truncate(cast('175.0' as decimal(6,1)), 0)", Decimal4Value(175),
-      ColumnType::CreateDecimalType(6, 0));
+      ColumnType::CreateDecimalType(5, 0));
   TestDecimalValue("truncate(cast('-175.0' as decimal(6,1)), -1)", Decimal4Value(-170),
-      ColumnType::CreateDecimalType(6, 0));
+      ColumnType::CreateDecimalType(5, 0));
   TestDecimalValue("truncate(cast('175.0' as decimal(6,1)), -2)", Decimal4Value(100),
-      ColumnType::CreateDecimalType(6, 0));
+      ColumnType::CreateDecimalType(5, 0));
   TestDecimalValue("truncate(cast('-175.0' as decimal(6,1)), -3)", Decimal4Value(0),
-      ColumnType::CreateDecimalType(6, 0));
+      ColumnType::CreateDecimalType(5, 0));
   TestDecimalValue("truncate(cast('175.0' as decimal(6,1)), -4)", Decimal4Value(0),
-      ColumnType::CreateDecimalType(6, 0));
+      ColumnType::CreateDecimalType(5, 0));
 
   TestDecimalValue("truncate(cast('-3.1615' as decimal(16,4)), 0)", Decimal8Value(-3),
       ColumnType::CreateDecimalType(12, 0));
@@ -5664,15 +5930,15 @@ TEST_F(ExprTest, DecimalFunctions) {
   TestDecimalValue("truncate(cast('-3.1615' as decimal(16,4)), 5)",
       Decimal8Value(-316150), ColumnType::CreateDecimalType(17, 5));
   TestDecimalValue("truncate(cast('-175.0' as decimal(15,1)), 0)", Decimal8Value(-175),
-      ColumnType::CreateDecimalType(15, 0));
+      ColumnType::CreateDecimalType(14, 0));
   TestDecimalValue("truncate(cast('175.0' as decimal(15,1)), -1)", Decimal8Value(170),
-      ColumnType::CreateDecimalType(15, 0));
+      ColumnType::CreateDecimalType(14, 0));
   TestDecimalValue("truncate(cast('-175.0' as decimal(15,1)), -2)", Decimal8Value(-100),
-      ColumnType::CreateDecimalType(15, 0));
+      ColumnType::CreateDecimalType(14, 0));
   TestDecimalValue("truncate(cast('175.0' as decimal(15,1)), -3)", Decimal8Value(0),
-      ColumnType::CreateDecimalType(15, 0));
+      ColumnType::CreateDecimalType(14, 0));
   TestDecimalValue("truncate(cast('-175.0' as decimal(15,1)), -4)", Decimal8Value(0),
-      ColumnType::CreateDecimalType(15, 0));
+      ColumnType::CreateDecimalType(14, 0));
 
   TestDecimalValue("truncate(cast('-3.1615' as decimal(32,4)), 0)",
       Decimal16Value(-3), ColumnType::CreateDecimalType(28, 0));
@@ -5687,21 +5953,21 @@ TEST_F(ExprTest, DecimalFunctions) {
   TestDecimalValue("truncate(cast('3.1615' as decimal(32,4)), 5)",
       Decimal16Value(316150), ColumnType::CreateDecimalType(33, 5));
   TestDecimalValue("truncate(cast('-175.0' as decimal(35,1)), 0)",
-      Decimal16Value(-175), ColumnType::CreateDecimalType(35, 0));
+      Decimal16Value(-175), ColumnType::CreateDecimalType(34, 0));
   TestDecimalValue("truncate(cast('175.0' as decimal(35,1)), -1)",
-      Decimal16Value(170), ColumnType::CreateDecimalType(35, 0));
+      Decimal16Value(170), ColumnType::CreateDecimalType(34, 0));
   TestDecimalValue("truncate(cast('-175.0' as decimal(35,1)), -2)",
-      Decimal16Value(-100), ColumnType::CreateDecimalType(35, 0));
+      Decimal16Value(-100), ColumnType::CreateDecimalType(34, 0));
   TestDecimalValue("truncate(cast('175.0' as decimal(35,1)), -3)",
-      Decimal16Value(0), ColumnType::CreateDecimalType(35, 0));
+      Decimal16Value(0), ColumnType::CreateDecimalType(34, 0));
   TestDecimalValue("truncate(cast('-175.0' as decimal(35,1)), -4)",
-      Decimal16Value(0), ColumnType::CreateDecimalType(35, 0));
+      Decimal16Value(0), ColumnType::CreateDecimalType(34, 0));
 
   // Dtrunc() alias
   TestDecimalValue("dtrunc(cast('3.54159' as decimal(6,5)))", Decimal4Value(3),
-      ColumnType::CreateDecimalType(6, 0));
+      ColumnType::CreateDecimalType(1, 0));
   TestDecimalValue("dtrunc(cast('-3.1615' as decimal(6,4)), 0)", Decimal4Value(-3),
-      ColumnType::CreateDecimalType(6, 0));
+      ColumnType::CreateDecimalType(2, 0));
 
   // Overflow on Round()/etc. This can only happen when the input is has enough
   // leading 9's.
@@ -6148,7 +6414,7 @@ TEST_F(ExprTest, UuidTest) {
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   InitCommonRuntime(argc, argv, true, TestInfo::BE_TEST);
-  InitFeSupport();
+  InitFeSupport(false);
   impala::LlvmCodeGen::InitializeLlvm();
 
   // Disable llvm optimization passes if the env var is no set to true. Running without
@@ -6174,33 +6440,32 @@ int main(int argc, char **argv) {
 
   // Disable FE expr rewrites to make sure the Exprs get executed exactly as specified
   // in the tests here.
-  vector<string> options;
-  options.push_back("ENABLE_EXPR_REWRITES=0");
-  options.push_back("DISABLE_CODEGEN=1");
+  int ret;
   disable_codegen_ = true;
   enable_expr_rewrites_ = false;
-  executor_->setExecOptions(options);
+  executor_->ClearExecOptions();
+  executor_->PushExecOption("ENABLE_EXPR_REWRITES=0");
+  executor_->PushExecOption("DISABLE_CODEGEN=1");
   cout << "Running without codegen" << endl;
-  int ret = RUN_ALL_TESTS();
+  ret = RUN_ALL_TESTS();
   if (ret != 0) return ret;
 
-  options.clear();
-  options.push_back("ENABLE_EXPR_REWRITES=0");
-  options.push_back("DISABLE_CODEGEN=0");
   disable_codegen_ = false;
   enable_expr_rewrites_ = false;
-  executor_->setExecOptions(options);
+  executor_->ClearExecOptions();
+  executor_->PushExecOption("ENABLE_EXPR_REWRITES=0");
+  executor_->PushExecOption("DISABLE_CODEGEN=0");
+  executor_->PushExecOption("EXEC_SINGLE_NODE_ROWS_THRESHOLD=0");
   cout << endl << "Running with codegen" << endl;
   ret = RUN_ALL_TESTS();
   if (ret != 0) return ret;
 
   // Enable FE expr rewrites to get test for constant folding over all exprs.
-  options.clear();
-  options.push_back("ENABLE_EXPR_REWRITES=1");
-  options.push_back("DISABLE_CODEGEN=1");
   disable_codegen_ = true;
   enable_expr_rewrites_ = true;
-  executor_->setExecOptions(options);
+  executor_->ClearExecOptions();
+  executor_->PushExecOption("ENABLE_EXPR_REWRITES=1");
+  executor_->PushExecOption("DISABLE_CODEGEN=1");
   cout << endl << "Running without codegen and expr rewrites" << endl;
   return RUN_ALL_TESTS();
 }

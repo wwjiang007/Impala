@@ -86,6 +86,7 @@ import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.common.NotImplementedException;
+import org.apache.impala.planner.HdfsScanNode;
 import org.apache.impala.planner.PlanFragment;
 import org.apache.impala.planner.Planner;
 import org.apache.impala.planner.ScanNode;
@@ -887,7 +888,7 @@ public class Frontend {
 
     AnalysisContext analysisCtx = new AnalysisContext(impaladCatalog_, queryCtx,
         authzConfig_);
-    if (LOG.isTraceEnabled()) LOG.trace("analyze query " + queryCtx.client_request.stmt);
+    LOG.info("Compiling query: " + queryCtx.client_request.stmt);
 
     // Run analysis in a loop until it any of the following events occur:
     // 1) Analysis completes successfully.
@@ -909,8 +910,8 @@ public class Frontend {
 
           // Some tables/views were missing, request and wait for them to load.
           if (!requestTblLoadAndWait(missingTbls, MISSING_TBL_LOAD_WAIT_TIMEOUT_MS)) {
-            if (LOG.isTraceEnabled()) {
-              LOG.trace(String.format("Missing tables were not received in %dms. Load " +
+            if (LOG.isWarnEnabled()) {
+              LOG.warn(String.format("Missing tables were not received in %dms. Load " +
                   "request will be retried.", MISSING_TBL_LOAD_WAIT_TIMEOUT_MS));
             }
             analysisCtx.getTimeline().markEvent("Metadata load timeout");
@@ -924,6 +925,7 @@ public class Frontend {
       // AuthorizationExceptions must take precedence over any AnalysisException
       // that has been thrown, so perform the authorization first.
       analysisCtx.authorize(getAuthzChecker());
+      LOG.info("Compiled query.");
     }
   }
 
@@ -946,14 +948,17 @@ public class Frontend {
     LOG.trace("get scan range locations");
     Set<TTableName> tablesMissingStats = Sets.newTreeSet();
     Set<TTableName> tablesWithCorruptStats = Sets.newTreeSet();
+    Set<TTableName> tablesWithMissingDiskIds = Sets.newTreeSet();
     for (ScanNode scanNode: scanNodes) {
       result.putToPer_node_scan_ranges(
           scanNode.getId().asInt(), scanNode.getScanRangeLocations());
-      if (scanNode.isTableMissingStats()) {
-        tablesMissingStats.add(scanNode.getTupleDesc().getTableName().toThrift());
-      }
-      if (scanNode.hasCorruptTableStats()) {
-        tablesWithCorruptStats.add(scanNode.getTupleDesc().getTableName().toThrift());
+
+      TTableName tableName = scanNode.getTupleDesc().getTableName().toThrift();
+      if (scanNode.isTableMissingStats()) tablesMissingStats.add(tableName);
+      if (scanNode.hasCorruptTableStats()) tablesWithCorruptStats.add(tableName);
+      if (scanNode instanceof HdfsScanNode &&
+          ((HdfsScanNode) scanNode).hasMissingDiskIds()) {
+        tablesWithMissingDiskIds.add(tableName);
       }
     }
 
@@ -962,6 +967,9 @@ public class Frontend {
     }
     for (TTableName tableName: tablesWithCorruptStats) {
       queryCtx.addToTables_with_corrupt_stats(tableName);
+    }
+    for (TTableName tableName: tablesWithMissingDiskIds) {
+      queryCtx.addToTables_missing_diskids(tableName);
     }
 
     // Compute resource requirements after scan range locations because the cost

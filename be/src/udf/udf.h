@@ -189,21 +189,25 @@ class FunctionContext {
   const TypeDesc& GetIntermediateType() const;
 
   /// Returns the number of arguments to this function (not including the FunctionContext*
-  /// argument).
+  /// argument or the output of a UDA).
+  /// For UDAs, returns the number of logical arguments of the aggregate function, not
+  /// the number of arguments of the C++ function being executed.
   int GetNumArgs() const;
 
   /// Returns the type information for the arg_idx-th argument (0-indexed, not including
   /// the FunctionContext* argument). Returns NULL if arg_idx is invalid.
+  /// For UDAs, returns the logical argument types of the aggregate function, not the
+  /// argument types of the C++ function being executed.
   const TypeDesc* GetArgType(int arg_idx) const;
 
-  /// Returns true if the arg_idx-th input argument (0 indexed, not including the
-  /// FunctionContext* argument) is a constant (e.g. 5, "string", 1 + 1).
+  /// Returns true if the arg_idx-th input argument (indexed in the same way as
+  /// GetArgType()) is a constant (e.g. 5, "string", 1 + 1).
   bool IsArgConstant(int arg_idx) const;
 
-  /// Returns a pointer to the value of the arg_idx-th input argument (0 indexed, not
-  /// including the FunctionContext* argument). Returns NULL if the argument is not
-  /// constant. This function can be used to obtain user-specified constants in a UDF's
-  /// Init() or Close() functions.
+  /// Returns a pointer to the value of the arg_idx-th input argument (indexed in the
+  /// same way as GetArgType()). Returns NULL if the argument is not constant. This
+  /// function can be used to obtain user-specified constants in a UDF's Init() or
+  /// Close() functions.
   AnyVal* GetConstantArg(int arg_idx) const;
 
   /// TODO: Do we need to add arbitrary key/value metadata. This would be plumbed
@@ -578,7 +582,21 @@ struct StringVal : public AnyVal {
   /// If the memory allocation fails, e.g. because the intermediate value would be too
   /// large, the constructor will construct a NULL string and set an error on the function
   /// context.
+  ///
+  /// The memory backing this StringVal is a local allocation, and so doesn't need
+  /// to be explicitly freed.
   StringVal(FunctionContext* context, int len) noexcept;
+
+  /// Reallocate a StringVal that is backed by a local allocation so that it as
+  /// at least as large as len.  May shrink or / expand the string.  If the
+  /// string is expanded, the content of the new space is undefined.
+  ///
+  /// If the resize fails, the original StringVal remains in place.  Callers do not
+  /// otherwise need to be concerned with backing storage, which is allocated from a
+  /// local allocation.
+  ///
+  /// Returns true on success, false on failure.
+  bool Resize(FunctionContext* context, int len) noexcept;
 
   /// Will create a new StringVal with the given dimension and copy the data from the
   /// parameters. In case of an error will return a NULL string and set an error on the

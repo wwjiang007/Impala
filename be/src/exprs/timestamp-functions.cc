@@ -38,15 +38,23 @@ using boost::local_time::time_zone_ptr;
 using boost::posix_time::ptime;
 using boost::posix_time::to_iso_extended_string;
 
+typedef boost::gregorian::date Date;
+
 namespace impala {
 
-// This function is not cross-compiled to avoid including unnecessary boost library's
-// header files which bring in a bunch of unused code and global variables and increase
-// the codegen time. boost::posix_time::to_iso_extended_string() is large enough that
-// it won't benefit much from inlining.
-string TimestampFunctions::ToIsoExtendedString(const TimestampValue& ts_value) {
-  return to_iso_extended_string(ts_value.date());
-}
+// Constant strings used for DayName function.
+const char* TimestampFunctions::SUNDAY = "Sunday";
+const char* TimestampFunctions::MONDAY = "Monday";
+const char* TimestampFunctions::TUESDAY = "Tuesday";
+const char* TimestampFunctions::WEDNESDAY = "Wednesday";
+const char* TimestampFunctions::THURSDAY = "Thursday";
+const char* TimestampFunctions::FRIDAY = "Friday";
+const char* TimestampFunctions::SATURDAY = "Saturday";
+
+const string TimestampFunctions::DAY_ARRAY[7] = {"Sun", "Mon", "Tue", "Wed", "Thu",
+    "Fri", "Sat"};
+const string TimestampFunctions::MONTH_ARRAY[12] = {"Jan", "Feb", "Mar", "Apr", "May",
+    "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
 
 namespace {
 /// Uses Boost's internal checking to throw an exception if 'date' is out of the
@@ -68,7 +76,7 @@ void ThrowIfDateOutOfRange(const boost::gregorian::date& date) {
 
 // This function uses inline asm functions, which we believe to be from the boost library.
 // Inline asm is not currently supported by JIT, so this function should always be run in
-// the interpreted mode. This is handled in ScalarFnCall::GetUdf().
+// the interpreted mode. This is handled in LlvmCodeGen::LoadFunction().
 TimestampVal TimestampFunctions::FromUtc(FunctionContext* context,
     const TimestampVal& ts_val, const StringVal& tz_string_val) {
   if (ts_val.is_null || tz_string_val.is_null) return TimestampVal::null();
@@ -106,7 +114,7 @@ TimestampVal TimestampFunctions::FromUtc(FunctionContext* context,
 
 // This function uses inline asm functions, which we believe to be from the boost library.
 // Inline asm is not currently supported by JIT, so this function should always be run in
-// the interpreted mode. This is handled in ScalarFnCall::GetUdf().
+// the interpreted mode. This is handled in LlvmCodeGen::LoadFunction().
 TimestampVal TimestampFunctions::ToUtc(FunctionContext* context,
     const TimestampVal& ts_val, const StringVal& tz_string_val) {
   if (ts_val.is_null || tz_string_val.is_null) return TimestampVal::null();

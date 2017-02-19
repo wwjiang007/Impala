@@ -62,7 +62,7 @@ under the License.
       <conbody>
         <p>
         </p>
-        <p><b>Bug:</b> <xref href="https://issues.cloudera.org/browse/" scope="external" format="html"></xref></p>
+        <p><b>Bug:</b> <xref keyref="" scope="external" format="html"></xref></p>
         <p><b>Severity:</b> High</p>
         <p><b>Resolution:</b> </p>
         <p><b>Workaround:</b> </p>
@@ -141,6 +141,50 @@ https://issues.cloudera.org/browse/IMPALA-2144 - Don't have
 
     </conbody>
 
+    <concept id="IMPALA-4828">
+      <title>Altering Kudu table schema outside of Impala may result in crash on read</title>
+      <conbody>
+        <p>
+          Creating a table in Impala, changing the column schema outside of Impala,
+          and then reading again in Impala may result in a crash. Neither Impala nor
+          the Kudu client validates the schema immediately before reading, so Impala may attempt to
+          dereference pointers that aren't there. This happens if a string column is dropped
+          and then a new, non-string column is added with the old string column's name.
+        </p>
+        <p><b>Bug:</b> <xref keyref="IMPALA-4828" scope="external" format="html">IMPALA-4828</xref></p>
+        <p><b>Severity:</b> High</p>
+        <p><b>Workaround:</b> Run the statement <codeph>REFRESH <varname>table_name</varname></codeph>
+          after any occasion when the table structure, such as the number, names, and data types
+          of columns, are modified outside of Impala using the Kudu API.
+        </p>
+      </conbody>
+    </concept>
+
+    <concept id="IMPALA-1972" rev="IMPALA-1972">
+
+      <title>Queries that take a long time to plan can cause webserver to block other queries</title>
+
+      <conbody>
+
+        <p>
+          Trying to get the details of a query through the debug web page
+          while the query is planning will block new queries that had not
+          started when the web page was requested. The web UI becomes
+          unresponsive until the planning phase is finished.
+        </p>
+
+        <p>
+          <b>Bug:</b> <xref keyref="IMPALA-1972">IMPALA-1972</xref>
+        </p>
+
+        <p>
+          <b>Severity:</b> High
+        </p>
+
+      </conbody>
+
+    </concept>
+
     <concept id="IMPALA-3069" rev="IMPALA-3069">
 
       <title>Setting BATCH_SIZE query option too large can cause a crash</title>
@@ -168,7 +212,7 @@ https://issues.cloudera.org/browse/IMPALA-2144 - Don't have
 
     <concept id="IMPALA-3441" rev="IMPALA-3441">
 
-      <title></title>
+      <title>Impala should not crash for invalid avro serialized data</title>
 
       <conbody>
 
@@ -261,7 +305,7 @@ https://issues.cloudera.org/browse/IMPALA-2144 - Don't have
         </p>
 
         <p>
-          <b>Bug:</b> <xref href="https://issues.cloudera.org/browse/IMPALA-1480" scope="external" format="html"></xref>IMPALA-1480
+          <b>Bug:</b> <xref href="https://issues.cloudera.org/browse/IMPALA-1480" scope="external" format="html">IMPALA-1480</xref>
         </p>
 
         <p>
@@ -412,7 +456,7 @@ https://issues.cloudera.org/browse/IMPALA-2144 - Don't have
 
 <!-- To do: Hiding for the moment. https://jira.cloudera.com/browse/CDH-38736 reports the issue is fixed. -->
 
-    <concept id="impala-shell_ssl_dependency" audience="Cloudera" rev="impala-shell_ssl_dependency">
+    <concept id="impala-shell_ssl_dependency" audience="hidden" rev="impala-shell_ssl_dependency">
 
       <title>impala-shell requires Python with ssl module</title>
 
@@ -572,7 +616,7 @@ impala-shell -s impala --ssl --ca_cert /path_to_truststore/truststore.pem
           in out-of-memory errors in catalogd and leading to query failures.
         </p>
 
-        <p audience="Cloudera">
+        <p audience="hidden">
           <b>Bug:</b> <xref href="https://jira.cloudera.com/browse/TSB-168" scope="external" format="html">TSB-168</xref>
         </p>
 
@@ -1377,7 +1421,7 @@ ALTER TABLE table_name SET TBLPROPERTIES('EXTERNAL'='TRUE');
           table. See <xref href="impala_tables.xml#tables"/> for the differences between internal and external tables.
         </note>
 
-        <p audience="Cloudera">
+        <p audience="hidden">
           <b>Bug:</b> <xref href="https://issues.cloudera.org/browse/CDH-41605" scope="external" format="html">CDH-41605</xref>
         </p>
 
@@ -1397,7 +1441,7 @@ ALTER TABLE table_name SET TBLPROPERTIES('EXTERNAL'='TRUE');
 
       <conbody>
 
-        <p audience="Cloudera">
+        <p audience="hidden">
           <b>Cloudera Bug:</b> <xref href="https://jira.cloudera.com/browse/IMP-469" scope="external" format="html"/>; KI added 0.1
           <i>Cloudera internal only</i>
         </p>
@@ -1427,7 +1471,7 @@ ALTER TABLE table_name SET TBLPROPERTIES('EXTERNAL'='TRUE');
           allowed value of type (Hive returns NULL).
         </p>
 
-        <p audience="Cloudera">
+        <p audience="hidden">
           <b>Cloudera Bug:</b> <xref href="https://jira.cloudera.com/browse/IMP-175" scope="external" format="html">IMPALA-175</xref> ; KI
           added 0.1 <i>Cloudera internal only</i>
         </p>

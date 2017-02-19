@@ -296,9 +296,11 @@ public class ToSqlTest extends FrontendTestBase {
 
   @Test
   public void TestCreateTable() throws AnalysisException {
-    testToSql("create table p (a int)",
+    testToSql("create table p (a int) partitioned by (day string) " +
+        "comment 'This is a test'",
         "default",
-        "CREATE TABLE default.p ( a INT ) STORED AS TEXTFILE", true);
+        "CREATE TABLE default.p ( a INT ) PARTITIONED BY ( day STRING ) " +
+        "COMMENT 'This is a test' STORED AS TEXTFILE", true);
   }
 
   @Test
@@ -1043,6 +1045,48 @@ public class ToSqlTest extends FrontendTestBase {
     testToSql("upsert into table functional_kudu.testtbl (zip, id, name) values " +
         "(1, 1, 'a')", "UPSERT INTO TABLE functional_kudu.testtbl(zip, id, name) " +
         "VALUES(1, 1, 'a')");
+  }
+
+  @Test
+  public void alterTableAddPartitionTest() {
+    // Add partition
+    testToSql(
+        "alter table functional.alltypes add partition (year=2050, month=1)",
+        "ALTER TABLE functional.alltypes ADD PARTITION (year=2050, month=1)");
+    // Add multiple partitions
+    testToSql(
+        "alter table functional.alltypes add partition (year=2050, month=1) " +
+        "partition (year=2050, month=2)",
+        "ALTER TABLE functional.alltypes ADD PARTITION (year=2050, month=1) " +
+        "PARTITION (year=2050, month=2)");
+    // with IF NOT EXISTS
+    testToSql(
+        "alter table functional.alltypes add if not exists " +
+        "partition (year=2050, month=1) " +
+        "partition (year=2050, month=2)",
+        "ALTER TABLE functional.alltypes ADD IF NOT EXISTS " +
+        "PARTITION (year=2050, month=1) " +
+        "PARTITION (year=2050, month=2)");
+    // with location
+    testToSql(
+        "alter table functional.alltypes add if not exists " +
+        "partition (year=2050, month=1) location 'hdfs://localhost:20500/y2050m1' " +
+        "partition (year=2050, month=2) location '/y2050m2'",
+        "ALTER TABLE functional.alltypes ADD IF NOT EXISTS "+
+        "PARTITION (year=2050, month=1) LOCATION 'hdfs://localhost:20500/y2050m1' " +
+        "PARTITION (year=2050, month=2) LOCATION 'hdfs://localhost:20500/y2050m2'");
+    // and caching
+    testToSql(
+        "alter table functional.alltypes add if not exists " +
+        "partition (year=2050, month=1) location 'hdfs://localhost:20500/y2050m1' " +
+        "cached in 'testPool' with replication=3 " +
+        "partition (year=2050, month=2) location '/y2050m2' " +
+        "uncached",
+        "ALTER TABLE functional.alltypes ADD IF NOT EXISTS "+
+        "PARTITION (year=2050, month=1) LOCATION 'hdfs://localhost:20500/y2050m1' " +
+        "CACHED IN 'testPool' WITH REPLICATION = 3 " +
+        "PARTITION (year=2050, month=2) LOCATION 'hdfs://localhost:20500/y2050m2' " +
+        "UNCACHED");
   }
 
   @Test

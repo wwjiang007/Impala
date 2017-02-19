@@ -18,14 +18,14 @@
 #ifndef IMPALA_EXPRS_ANYVAL_UTIL_H
 #define IMPALA_EXPRS_ANYVAL_UTIL_H
 
+#include <algorithm>
+
 #include "runtime/runtime-state.h"
 #include "runtime/string-value.inline.h"
 #include "runtime/timestamp-value.h"
 #include "udf/udf-internal.h"
 #include "util/decimal-util.h"
 #include "util/hash-util.h"
-
-#include "common/names.h"
 
 using namespace impala_udf;
 
@@ -220,7 +220,7 @@ class AnyValUtil {
   static void TruncateIfNecessary(const FunctionContext::TypeDesc& type, StringVal *val) {
     if (type.type == FunctionContext::TYPE_VARCHAR) {
       DCHECK(type.len >= 0);
-      val->len = min(val->len, type.len);
+      val->len = std::min(val->len, type.len);
     }
   }
 
@@ -229,6 +229,8 @@ class AnyValUtil {
   }
 
   static FunctionContext::TypeDesc ColumnTypeToTypeDesc(const ColumnType& type);
+  static std::vector<FunctionContext::TypeDesc> ColumnTypesToTypeDescs(
+      const std::vector<ColumnType>& types);
   // Note: constructing a ColumnType is expensive and should be avoided in query execution
   // paths (i.e. non-setup paths).
   static ColumnType TypeDescToColumnType(const FunctionContext::TypeDesc& type);

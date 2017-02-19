@@ -337,12 +337,7 @@ Status TmpFileMgr::FileGroup::AllocateSpace(
                  << ". Will try another scratch file.";
     scratch_errors_.push_back(status);
   }
-  // TODO: IMPALA-4697: the merged errors do not show up in the query error log,
-  // so we must point users to the impalad error log.
-  Status err_status(
-      "No usable scratch files: space could not be allocated in any of "
-      "the configured scratch directories (--scratch_dirs). See logs for previous "
-      "errors that may have caused this.");
+  Status err_status(TErrorCode::SCRATCH_ALLOCATION_FAILED);
   // Include all previous errors that may have caused the failure.
   for (Status& err : scratch_errors_) err_status.MergeStatus(err);
   return err_status;
@@ -418,14 +413,13 @@ Status TmpFileMgr::FileGroup::CancelWriteAndRestoreData(
   DCHECK_EQ(handle->len(), buffer.len());
   handle->Cancel();
 
-  // Decrypt regardless of whether the write is still in flight or not. An in-flight
-  // write may write bogus data to disk but this lets us get some work done while the
-  // write is being cancelled.
+  handle->WaitForWrite();
+  // Decrypt after the write is finished, so that we don't accidentally write decrypted
+  // data to disk.
   Status status;
   if (FLAGS_disk_spill_encryption) {
     status = handle->CheckHashAndDecrypt(buffer);
   }
-  handle->WaitForWrite();
   RecycleFileRange(move(handle));
   return status;
 }
@@ -516,21 +510,38 @@ Status TmpFileMgr::WriteHandle::Write(DiskIoMgr* io_mgr, DiskIoRequestContext* i
 
   if (FLAGS_disk_spill_encryption) RETURN_IF_ERROR(EncryptAndHash(buffer));
 
+  // Set all member variables before calling AddWriteRange(): after it succeeds,
+  // WriteComplete() may be called concurrently with the remainder of this function.
   file_ = file;
-  write_in_flight_ = true;
   write_range_.reset(
       new DiskIoMgr::WriteRange(file->path(), offset, file->AssignDiskQueue(), callback));
   write_range_->SetData(buffer.data(), buffer.len());
-  return io_mgr->AddWriteRange(io_ctx, write_range_.get());
+  write_in_flight_ = true;
+  Status status = io_mgr->AddWriteRange(io_ctx, write_range_.get());
+  if (!status.ok()) {
+    // The write will not be in flight if we returned with an error.
+    write_in_flight_ = false;
+    // We won't return this WriteHandle to the client of FileGroup, so it won't be
+    // cancelled in the normal way. Mark the handle as cancelled so it can be
+    // cleanly destroyed.
+    is_cancelled_ = true;
+    return status;
+  }
+  return Status::OK();
 }
 
 Status TmpFileMgr::WriteHandle::RetryWrite(
     DiskIoMgr* io_mgr, DiskIoRequestContext* io_ctx, File* file, int64_t offset) {
   DCHECK(write_in_flight_);
   file_ = file;
-  write_in_flight_ = true;
   write_range_->SetRange(file->path(), offset, file->AssignDiskQueue());
-  return io_mgr->AddWriteRange(io_ctx, write_range_.get());
+  Status status = io_mgr->AddWriteRange(io_ctx, write_range_.get());
+  if (!status.ok()) {
+    // The write will not be in flight if we returned with an error.
+    write_in_flight_ = false;
+    return status;
+  }
+  return Status::OK();
 }
 
 void TmpFileMgr::WriteHandle::WriteComplete(const Status& write_status) {
@@ -539,13 +550,16 @@ void TmpFileMgr::WriteHandle::WriteComplete(const Status& write_status) {
     lock_guard<mutex> lock(write_state_lock_);
     DCHECK(write_in_flight_);
     write_in_flight_ = false;
-    // Need to extract 'cb_' because once 'write_in_flight_' is false, the WriteHandle
-    // may be destroyed.
+    // Need to extract 'cb_' because once 'write_in_flight_' is false and we release
+    // 'write_state_lock_', 'this' may be destroyed.
     cb = move(cb_);
+
+    // Notify before releasing the lock - after the lock is released 'this' may be
+    // destroyed.
+    write_complete_cv_.NotifyAll();
   }
-  write_complete_cv_.NotifyAll();
-  // Call 'cb' once we've updated the state. We must do this last because once 'cb' is
-  // called, it is valid to call Read() on the handle.
+  // Call 'cb' last - once 'cb' is called client code may call Read() or destroy this
+  // handle.
   cb(write_status);
 }
 

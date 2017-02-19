@@ -2046,11 +2046,24 @@ public class ParserTest extends FrontendTestBase {
     ParsesOk("ALTER TABLE Foo ADD PARTITION (i=NULL, j=2, k=NULL)");
     ParsesOk("ALTER TABLE Foo ADD PARTITION (i=abc, j=(5*8+10), k=!true and false)");
 
+    // Multiple partition specs
+    ParsesOk("ALTER TABLE Foo ADD PARTITION (i=1, s='one') " +
+        "PARTITION (i=2, s='two') PARTITION (i=3, s='three')");
+    ParsesOk("ALTER TABLE TestDb.Foo ADD PARTITION (i=1, s='one') LOCATION 'a/b' " +
+        "PARTITION (i=2, s='two') LOCATION 'c/d' " +
+        "PARTITION (i=3, s='three') " +
+        "PARTITION (i=4, s='four') LOCATION 'e/f'");
+    ParsesOk("ALTER TABLE TestDb.Foo ADD IF NOT EXISTS " +
+        "PARTITION (i=1, s='one') " +
+        "PARTITION (i=2, s='two') LOCATION 'c/d'");
+    ParserError("ALTER TABLE TestDb.Foo ADD " +
+        "PARTITION (i=1, s='one') " +
+        "IF NOT EXISTS PARTITION (i=2, s='two') LOCATION 'c/d'");
+
     // Location needs to be a string literal
     ParserError("ALTER TABLE TestDb.Foo ADD PARTITION (i=1, s='Hello') LOCATION a/b");
 
     // Caching ops
-    ParsesOk("ALTER TABLE Foo ADD PARTITION (j=2) CACHED IN 'pool'");
     ParsesOk("ALTER TABLE Foo ADD PARTITION (j=2) CACHED IN 'pool'");
     ParserError("ALTER TABLE Foo ADD PARTITION (j=2) CACHED 'pool'");
     ParserError("ALTER TABLE Foo ADD PARTITION (j=2) CACHED IN");
@@ -2065,6 +2078,13 @@ public class ParserTest extends FrontendTestBase {
         "with replication = 3");
     ParserError("ALTER TABLE Foo ADD PARTITION (j=2) CACHED IN 'pool' LOCATION 'a/b'");
     ParserError("ALTER TABLE Foo ADD PARTITION (j=2) UNCACHED LOCATION 'a/b'");
+
+    // Multiple partition specs with caching ops
+    ParsesOk("ALTER TABLE Foo ADD PARTITION (j=2) CACHED IN 'pool' " +
+        "PARTITION (j=3) UNCACHED " +
+        "PARTITION (j=4) CACHED IN 'pool' WITH replication = 3 " +
+        "PARTITION (j=5) LOCATION 'a/b' CACHED IN 'pool' " +
+        "PARTITION (j=5) LOCATION 'c/d' CACHED IN 'pool' with replication = 3");
 
     ParserError("ALTER TABLE Foo ADD IF EXISTS PARTITION (i=1, s='Hello')");
     ParserError("ALTER TABLE TestDb.Foo ADD (i=1, s='Hello')");
@@ -3007,7 +3027,7 @@ public class ParserTest extends FrontendTestBase {
         "       ^\n" +
         "Encountered: FROM\n" +
         "Expected: ALL, CASE, CAST, DEFAULT, DISTINCT, EXISTS, " +
-        "FALSE, IF, INTERVAL, NOT, NULL, " +
+        "FALSE, IF, INTERVAL, NOT, NULL, REPLACE, " +
         "STRAIGHT_JOIN, TRUNCATE, TRUE, IDENTIFIER\n");
 
     // missing from
@@ -3034,7 +3054,7 @@ public class ParserTest extends FrontendTestBase {
         "                           ^\n" +
         "Encountered: EOF\n" +
         "Expected: CASE, CAST, DEFAULT, EXISTS, FALSE, " +
-        "IF, INTERVAL, NOT, NULL, TRUNCATE, TRUE, IDENTIFIER\n");
+        "IF, INTERVAL, NOT, NULL, REPLACE, TRUNCATE, TRUE, IDENTIFIER\n");
 
     // missing predicate in where clause (group by)
     ParserError("select c, b, c from t where group by a, b",
@@ -3043,7 +3063,7 @@ public class ParserTest extends FrontendTestBase {
         "                            ^\n" +
         "Encountered: GROUP\n" +
         "Expected: CASE, CAST, DEFAULT, EXISTS, FALSE, " +
-        "IF, INTERVAL, NOT, NULL, TRUNCATE, TRUE, IDENTIFIER\n");
+        "IF, INTERVAL, NOT, NULL, REPLACE, TRUNCATE, TRUE, IDENTIFIER\n");
 
     // unmatched string literal starting with "
     ParserError("select c, \"b, c from t",
@@ -3104,7 +3124,7 @@ public class ParserTest extends FrontendTestBase {
         "                             ^\n" +
         "Encountered: COMMA\n" +
         "Expected: CASE, CAST, DEFAULT, EXISTS, FALSE, " +
-        "IF, INTERVAL, NOT, NULL, TRUNCATE, TRUE, IDENTIFIER\n");
+        "IF, INTERVAL, NOT, NULL, REPLACE, TRUNCATE, TRUE, IDENTIFIER\n");
 
     // Parsing identifiers that have different names printed as EXPECTED
     ParserError("DROP DATA SRC foo",

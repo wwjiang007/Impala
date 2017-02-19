@@ -112,9 +112,14 @@ struct TStringLiteral {
   1: required string value;
 }
 
+// Additional information for aggregate functions.
 struct TAggregateExpr {
   // Indicates whether this expr is the merge() of an aggregation.
   1: required bool is_merge_agg
+
+  // The types of the input arguments to the aggregate function. May differ from the
+  // input expr types if this is the merge() of an aggregation.
+  2: required list<Types.TColumnType> arg_types;
 }
 
 // This is essentially a union over the subclasses of Expr.
@@ -123,26 +128,29 @@ struct TExprNode {
   2: required Types.TColumnType type
   3: required i32 num_children
 
+  // Whether the Expr is constant according to the frontend.
+  4: required bool is_constant
+
   // The function to execute. Not set for SlotRefs and Literals.
-  4: optional Types.TFunction fn
+  5: optional Types.TFunction fn
 
   // If set, child[vararg_start_idx] is the first vararg child.
-  5: optional i32 vararg_start_idx
+  6: optional i32 vararg_start_idx
 
-  6: optional TBoolLiteral bool_literal
-  7: optional TCaseExpr case_expr
-  8: optional TDateLiteral date_literal
-  9: optional TFloatLiteral float_literal
-  10: optional TIntLiteral int_literal
-  11: optional TInPredicate in_predicate
-  12: optional TIsNullPredicate is_null_pred
-  13: optional TLiteralPredicate literal_pred
-  14: optional TSlotRef slot_ref
-  15: optional TStringLiteral string_literal
-  16: optional TTupleIsNullPredicate tuple_is_null_pred
-  17: optional TDecimalLiteral decimal_literal
-  18: optional TAggregateExpr agg_expr
-  19: optional TTimestampLiteral timestamp_literal
+  7: optional TBoolLiteral bool_literal
+  8: optional TCaseExpr case_expr
+  9: optional TDateLiteral date_literal
+  10: optional TFloatLiteral float_literal
+  11: optional TIntLiteral int_literal
+  12: optional TInPredicate in_predicate
+  13: optional TIsNullPredicate is_null_pred
+  14: optional TLiteralPredicate literal_pred
+  15: optional TSlotRef slot_ref
+  16: optional TStringLiteral string_literal
+  17: optional TTupleIsNullPredicate tuple_is_null_pred
+  18: optional TDecimalLiteral decimal_literal
+  19: optional TAggregateExpr agg_expr
+  20: optional TTimestampLiteral timestamp_literal
 }
 
 // A flattened representation of a tree of Expr nodes, obtained by depth-first

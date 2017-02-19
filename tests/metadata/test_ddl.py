@@ -253,6 +253,11 @@ class TestDdlStatements(TestDdlBase):
         file_data='1984')
     self.run_test_case('QueryTest/alter-table', vector, use_db=unique_database,
         multiple_impalad=self._use_multiple_impalad(vector))
+    # The following tests require HDFS caching which is supported only in the HDFS
+    # filesystem.
+    if IS_HDFS:
+      self.run_test_case('QueryTest/alter-table-hdfs-caching', vector,
+          use_db=unique_database, multiple_impalad=self._use_multiple_impalad(vector))
 
   @UniqueDatabase.parametrize(sync_ddl=True)
   def test_alter_set_column_stats(self, vector, unique_database):
@@ -408,7 +413,7 @@ class TestLibCache(TestDdlBase):
   @classmethod
   def add_test_dimensions(cls):
     super(TestLibCache, cls).add_test_dimensions()
-    cls.TestMatrix.add_dimension(create_single_exec_option_dimension())
+    cls.ImpalaTestMatrix.add_dimension(create_single_exec_option_dimension())
 
   def test_create_drop_function(self, vector, unique_database):
     """This will create, run, and drop the same function repeatedly, exercising the

@@ -72,11 +72,13 @@ set_dep_root(AVRO)
 set_dep_root(BOOST)
 set_dep_root(BREAKPAD)
 set_dep_root(BZIP2)
+set_dep_root(CRCUTIL)
 set_dep_root(GCC)
 set_dep_root(GFLAGS)
 set_dep_root(GLOG)
 set_dep_root(GPERFTOOLS)
 set_dep_root(GTEST)
+set_dep_root(LIBEV)
 set_dep_root(LLVM)
 set(LLVM_DEBUG_ROOT $ENV{IMPALA_TOOLCHAIN}/llvm-$ENV{IMPALA_LLVM_DEBUG_VERSION})
 set_dep_root(LZ4)
@@ -111,8 +113,7 @@ if (CMAKE_DEBUG)
   set(Boost_DEBUG TRUE)
 endif()
 
-find_package(Boost $ENV{IMPALA_BOOST_VERSION} REQUIRED
-  COMPONENTS thread regex system filesystem date_time)
+find_package(Boost REQUIRED COMPONENTS thread regex system filesystem date_time)
 include_directories(${Boost_INCLUDE_DIRS})
 set(LIBS ${LIBS} ${Boost_LIBRARIES})
 message(STATUS "Boost include dir: " ${Boost_INCLUDE_DIRS})
@@ -309,6 +310,16 @@ ADD_THIRDPARTY_LIB(protobuf
 ADD_THIRDPARTY_LIB(protoc
   STATIC_LIB "${PROTOBUF_PROTOC_STATIC_LIBRARY}"
   DEPS protobuf)
+
+find_package(LibEv REQUIRED)
+include_directories(SYSTEM ${LIBEV_INCLUDE_DIR})
+ADD_THIRDPARTY_LIB(libev
+  STATIC_LIB "${LIBEV_STATIC_LIB}")
+
+find_package(Crcutil REQUIRED)
+include_directories(SYSTEM ${CRCUTIL_INCLUDE_DIR})
+ADD_THIRDPARTY_LIB(crcutil
+  STATIC_LIB "${CRCUTIL_STATIC_LIB}")
 
 ###################################################################
 

@@ -45,14 +45,14 @@ from textwrap import dedent
 from threading import Lock
 from time import time
 
-from common import (
+from tests.comparison.common import (
     ArrayColumn,
     Column,
     MapColumn,
     StructColumn,
     Table,
     TableExprList)
-from db_types import (
+from tests.comparison.db_types import (
     Char,
     Decimal,
     Double,
@@ -123,7 +123,7 @@ class DbCursor(object):
           mismatch = True
           break
         for left, right in izip(common_table.cols, table.cols):
-          if not left.name == right.name and left.type == right.type:
+          if not (left.name == right.name and left.type == right.type):
             LOG.debug('Ignoring table %s. It has different columns %s vs %s.' %
                 (table_name, left, right))
             mismatch = True

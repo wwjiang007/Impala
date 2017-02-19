@@ -47,7 +47,7 @@ from tests.common.test_result_verifier import (
     apply_error_match_filter,
     verify_raw_results,
     verify_runtime_profile)
-from tests.common.test_vector import TestDimension
+from tests.common.test_vector import ImpalaTestDimension
 from tests.performance.query import Query
 from tests.performance.query_exec_functions import execute_using_jdbc
 from tests.performance.query_executor import JdbcQueryExecConfig
@@ -96,9 +96,9 @@ class ImpalaTestSuite(BaseTestSuite):
     add more dimensions or different dimensions they can override this function.
     """
     super(ImpalaTestSuite, cls).add_test_dimensions()
-    cls.TestMatrix.add_dimension(
+    cls.ImpalaTestMatrix.add_dimension(
         cls.create_table_info_dimension(cls.exploration_strategy()))
-    cls.TestMatrix.add_dimension(cls.__create_exec_option_dimension())
+    cls.ImpalaTestMatrix.add_dimension(cls.__create_exec_option_dimension())
 
   @classmethod
   def setup_class(cls):
@@ -196,6 +196,41 @@ class ImpalaTestSuite(BaseTestSuite):
         impalad_client.execute(query_str)
       except Exception as e:
         LOG.info('Unexpected exception when executing ' + query_str + ' : ' + str(e))
+
+  def get_impala_partition_info(self, table_name, *include_fields):
+    """
+    Find information about partitions of a table, as returned by a SHOW PARTITION
+    statement. Return a list that contains one tuple for each partition.
+
+    If 'include_fields' is not specified, the tuples will contain all the fields returned
+    by SHOW PARTITION. Otherwise, return only those fields whose names are listed in
+    'include_fields'. Field names are compared case-insensitively.
+    """
+    exec_result = self.client.execute('show partitions %s' % table_name)
+    fieldSchemas = exec_result.schema.fieldSchemas
+    fields_dict = {}
+    for idx, fs in enumerate(fieldSchemas):
+      fields_dict[fs.name.lower()] = idx
+
+    rows = exec_result.get_data().split('\n')
+    rows.pop()
+    fields_idx = []
+    for fn in include_fields:
+      fn = fn.lower()
+      assert fn in fields_dict, 'Invalid field: %s' % fn
+      fields_idx.append(fields_dict[fn])
+
+    result = []
+    for row in rows:
+      fields = row.split('\t')
+      if not fields_idx:
+        result_fields = fields
+      else:
+        result_fields = []
+        for i in fields_idx:
+          result_fields.append(fields[i])
+      result.append(tuple(result_fields))
+    return result
 
   def __verify_exceptions(self, expected_strs, actual_str, use_db):
     """
@@ -331,7 +366,7 @@ class ImpalaTestSuite(BaseTestSuite):
         if len(query_options_changed) > 0:
           self.__restore_query_options(query_options_changed, target_impalad_client)
 
-      if 'CATCH' in test_section:
+      if 'CATCH' in test_section and '__NO_ERROR__' not in test_section['CATCH']:
         expected_str = " or ".join(test_section['CATCH']).strip() \
           .replace('$FILESYSTEM_PREFIX', FILESYSTEM_PREFIX) \
           .replace('$NAMENODE', NAMENODE) \
@@ -574,6 +609,15 @@ class ImpalaTestSuite(BaseTestSuite):
       raise RuntimeError(stderr)
     return stdout
 
+  def hive_partition_names(self, table_name):
+    """Find the names of the partitions of a table, as Hive sees them.
+
+    The return format is a list of strings. Each string represents a partition
+    value of a given column in a format like 'column1=7/column2=8'.
+    """
+    return self.run_stmt_in_hive(
+        'show partitions %s' % table_name).split('\n')[1:-1]
+
   @classmethod
   def create_table_info_dimension(cls, exploration_strategy):
     # If the user has specified a specific set of table formats to run against, then
@@ -583,7 +627,7 @@ class ImpalaTestSuite(BaseTestSuite):
       for tf in pytest.config.option.table_formats.split(','):
         dataset = get_dataset_from_workload(cls.get_workload())
         table_formats.append(TableFormatInfo.create_from_string(dataset, tf))
-      tf_dimensions = TestDimension('table_format', *table_formats)
+      tf_dimensions = ImpalaTestDimension('table_format', *table_formats)
     else:
       tf_dimensions = load_table_info_dimension(cls.get_workload(), exploration_strategy)
     # If 'skip_hbase' is specified or the filesystem is isilon, s3 or local, we don't

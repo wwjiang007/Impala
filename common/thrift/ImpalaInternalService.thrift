@@ -218,6 +218,9 @@ struct TQueryOptions {
   // Indicates whether the FE should rewrite Exprs for optimization purposes.
   // It's sometimes useful to disable rewrites for testing, e.g., expr-test.cc.
   51: optional bool enable_expr_rewrites = true
+
+  // Indicates whether to use the new decimal semantics.
+  52: optional bool decimal_v2 = false
 }
 
 // Impala currently has two types of sessions: Beeswax and HiveServer2
@@ -319,6 +322,9 @@ struct TQueryCtx {
   // backend in NativeEvalExprsWithoutRow() in FESupport. This flag is only advisory to
   // avoid the overhead of codegen and can be ignored if codegen is needed functionally.
   14: optional bool disable_codegen_hint = false;
+
+  // List of tables with scan ranges that map to blocks with missing disk IDs.
+  15: optional list<CatalogObjects.TTableName> tables_missing_diskids
 }
 
 // Context to collect information, which is shared among all instances of that plan

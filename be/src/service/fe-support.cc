@@ -52,6 +52,8 @@
 using namespace impala;
 using namespace apache::thrift::server;
 
+static bool fe_support_disable_codegen = true;
+
 // Called from the FE when it explicitly loads libfesupport.so for tests.
 // This creates the minimal state necessary to service the other JNI calls.
 // This is not called when we first start up the BE.
@@ -91,26 +93,22 @@ Java_org_apache_impala_service_FeSupport_NativeEvalExprsWithoutRow(
   DeserializeThriftMsg(env, thrift_expr_batch, &expr_batch);
   DeserializeThriftMsg(env, thrift_query_ctx_bytes, &query_ctx);
   vector<TExpr>& texprs = expr_batch.exprs;
-  // Disable codegen advisory to avoid unnecessary latency.
-  query_ctx.disable_codegen_hint = true;
+  // Disable codegen advisorily to avoid unnecessary latency. For testing purposes
+  // (expr-test.cc), fe_support_disable_codegen may be set to false.
+  query_ctx.disable_codegen_hint = fe_support_disable_codegen;
   // Allow logging of at least one error, so we can detect and convert it into a
   // Java exception.
   query_ctx.client_request.query_options.max_errors = 1;
-  RuntimeState state(query_ctx);
+
+  // Track memory against a dummy "fe-eval-exprs" resource pool - we don't
+  // know what resource pool the query has been assigned to yet.
+  RuntimeState state(query_ctx, ExecEnv::GetInstance(), "fe-eval-exprs");
   // Make sure to close the runtime state no matter how this scope is exited.
   const auto close_runtime_state =
       MakeScopeExitTrigger([&state]() { state.ReleaseResources(); });
 
-  THROW_IF_ERROR_RET(jni_frame.push(env), env, JniUtil::internal_exc_class(),
-      result_bytes);
-  // Exprs can allocate memory so we need to set up the mem trackers before
-  // preparing/running the exprs.
-  int64_t mem_limit = -1;
-  if (query_ctx.client_request.query_options.__isset.mem_limit
-      && query_ctx.client_request.query_options.mem_limit > 0) {
-    mem_limit = query_ctx.client_request.query_options.mem_limit;
-  }
-  state.InitMemTrackers(NULL, mem_limit);
+  THROW_IF_ERROR_RET(
+      jni_frame.push(env), env, JniUtil::internal_exc_class(), result_bytes);
 
   // Prepare() the exprs. Always Close() the exprs even in case of errors.
   vector<ExprContext*> expr_ctxs;
@@ -373,7 +371,8 @@ static JNINativeMethod native_methods[] = {
   },
 };
 
-void InitFeSupport() {
+void InitFeSupport(bool disable_codegen) {
+  fe_support_disable_codegen = disable_codegen;
   JNIEnv* env = getJNIEnv();
   jclass native_backend_cl = env->FindClass("org/apache/impala/service/FeSupport");
   env->RegisterNatives(native_backend_cl, native_methods,
