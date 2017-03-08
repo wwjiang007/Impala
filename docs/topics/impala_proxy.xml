@@ -143,15 +143,6 @@ under the License.
           Run the load-balancing proxy server, pointing it at the configuration file that you set up.
         </li>
 
-        <li audience="hidden">
-          On systems managed by Cloudera Manager, on the page
-          <menucascade><uicontrol>Impala</uicontrol><uicontrol>Configuration</uicontrol><uicontrol>Impala Daemon
-          Default Group</uicontrol></menucascade>, specify a value for the <uicontrol>Impala Daemons Load
-          Balancer</uicontrol> field. Specify the address of the load balancer in
-          <codeph><varname>host</varname>:<varname>port</varname></codeph> format. This setting lets Cloudera
-          Manager route all appropriate Impala-related operations through the proxy server.
-        </li>
-
         <li>
           For any scripts, jobs, or configuration settings for applications that formerly connected to a specific
           datanode to run Impala SQL statements, change the connection information (such as the <codeph>-i</codeph>
@@ -269,14 +260,94 @@ under the License.
           running the <cmdname>impalad</cmdname> daemon.
         </li>
 
+
         <li rev="CDH-40363" audience="hidden">
           For a cluster managed by Cloudera Manager (5.4.2 or higher), fill in the Impala configuration setting
           <uicontrol>Impala Daemons Load Balancer</uicontrol> with the appropriate host:port combination.
           Then restart the Impala service.
           For systems using a recent level of Cloudera Manager, this is all the configuration you need; you can skip the remaining steps in this procedure.
         </li>
+        
+        <li>
+          Copy the keytab file from the proxy host to all other hosts in the cluster that run the
+          <cmdname>impalad</cmdname> daemon. (For optimal performance, <cmdname>impalad</cmdname> should be running
+          on all DataNodes in the cluster.) Put the keytab file in a secure location on each of these other hosts.
+        </li>
+        
+        <li>
+          Add an entry <codeph>impala/<varname>actual_hostname</varname>@<varname>realm</varname></codeph> to the keytab on each
+          host running the <cmdname>impalad</cmdname> daemon.
+        </li>
+        
+        <li>
+         
+         For each impalad node, merge the existing keytab with the proxy’s keytab using
+          <cmdname>ktutil</cmdname>, producing a new keytab file. For example:
+          <codeblock>$ ktutil
+  ktutil: read_kt proxy.keytab
+  ktutil: read_kt impala.keytab
+  ktutil: write_kt proxy_impala.keytab
+  ktutil: quit</codeblock>
+          
+        </li>
+        
+        <li>
+          
+          To verify that the keytabs are merged, run the command:
+<codeblock>
+klist -k <varname>keytabfile</varname>
+</codeblock>
+          which lists the credentials for both <codeph>principal</codeph> and <codeph>be_principal</codeph> on
+          all nodes.
+        </li>
+        
 
         <li>
+          
+          Make sure that the <codeph>impala</codeph> user has permission to read this merged keytab file. 
+          
+        </li>
+        
+        <li>
+          Change the following configuration settings for each host in the cluster that participates
+          in the load balancing:
+          <ul>
+            <li>
+              In the <cmdname>impalad</cmdname> option definition, add:
+<codeblock>
+--principal=impala/<i>proxy_host@realm</i>
+  --be_principal=impala/<i>actual_host@realm</i>
+  --keytab_file=<i>path_to_merged_keytab</i>
+</codeblock>
+              <note>
+                Every host has different <codeph>--be_principal</codeph> because the actual hostname
+                is different on each host.
+                
+                Specify the fully qualified domain name (FQDN) for the proxy host, not the IP
+                address. Use the exact FQDN as returned by a reverse DNS lookup for the associated
+                IP address.
+                
+              </note>
+            </li>
+            
+            <li>
+              Modify the startup options. See <xref href="impala_config_options.xml#config_options"/> for the procedure to modify the startup
+              options.
+            </li>
+          </ul>
+        </li>
+        
+        
+        <li>
+          
+          Restart Impala to make the changes take effect. Restart the <cmdname>impalad</cmdname> daemons on all
+          hosts in the cluster, as well as the <cmdname>statestored</cmdname> and <cmdname>catalogd</cmdname>
+          daemons.
+          
+        </li>
+        
+
+        <li audience="hidden">
           On systems not managed by Cloudera Manager, or systems using Cloudera Manager earlier than 5.4.2:
 
         <ol>
@@ -320,24 +391,6 @@ under the License.
                 configuration snippet, add: <codeblock>--principal=impala/<varname>proxy_host</varname>@<varname>realm</varname>
   --be_principal=impala/<varname>actual_host</varname>@<varname>realm</varname>
   --keytab_file=<varname>path_to_merged_keytab</varname></codeblock>
-                <note audience="hidden">
-                  <p>On a cluster managed by Cloudera Manager 5.1 (or higher),
-                    when you set up Kerberos authentication using the wizard, you
-                    can choose to allow Cloudera Manager to deploy the
-                      <systemoutput>krb5.conf</systemoutput> on your cluster. In
-                    such a case, you do not need to explicitly modify safety valve
-                    parameters as directed above. </p>
-                  <p>Every host has a different <codeph>--be_principal</codeph>
-                    because the actual hostname is different on each host. </p>
-                  <p> Specify the fully qualified domain name (FQDN) for the proxy
-                    host, not the IP address. Use the exact FQDN as returned by a
-                    reverse DNS lookup for the associated IP address. </p>
-                </note>
-              </li>
-
-              <li audience="hidden">
-                On a cluster managed by Cloudera Manager, create a role group to set the configuration values from
-                the preceding step on a per-host basis.
               </li>
 
               <li>
@@ -352,10 +405,6 @@ under the License.
             Restart Impala to make the changes take effect. Follow the appropriate steps depending on whether you use
             Cloudera Manager or not:
             <ul>
-              <li audience="hidden">
-                On a cluster managed by Cloudera Manager, restart the Impala service.
-              </li>
-
               <li>
                 On a cluster not managed by Cloudera Manager, restart the <cmdname>impalad</cmdname> daemons on all
                 hosts in the cluster, as well as the <cmdname>statestored</cmdname> and <cmdname>catalogd</cmdname>
@@ -632,9 +681,7 @@ Using service name 'impala'
 Connected to c2104.hal.cloudera.com:25003
 <ph conref="../shared/ImpalaVariables.xml#impala_vars/ImpaladBanner"/>
 Welcome to the Impala shell. Press TAB twice to see a list of available commands.
-
-Copyright (c) 2012 Cloudera, Inc. All rights reserved.
-
+...
 <ph conref="../shared/ImpalaVariables.xml#impala_vars/ShellBanner"/>
 [c2104.hal.cloudera.com:25003] &gt; show tables;
 Query: show tables

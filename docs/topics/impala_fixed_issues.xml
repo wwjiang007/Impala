@@ -46,7 +46,23 @@ under the License.
     <p outputclass="toc inpage"/>
   </conbody>
 
-<!-- All 2.7.x / 5.9.x subsections go under here -->
+<!-- All 2.8.x subsections go under here -->
+
+  <concept rev="2.8.0" id="fixed_issues_280">
+
+    <title>Issues Fixed in <keyword keyref="impala28_full"/></title>
+
+    <conbody>
+
+      <p>
+        For the full list of Impala fixed issues in <keyword keyref="impala28_full"/>, see
+        <xref href="https://issues.cloudera.org/issues/?jql=type%20%3D%20bug%20and%20project%20%3D%20IMPALA%20AND%20resolution%20%3D%20fixed%20AND%20affectedVersion%20!%3D%20%22Impala%202.8.0%22%20AND%20fixVersion%20%3D%20%22Impala%202.8.0%22%20and%20not%20labels%20%3D%20broken-build%20order%20by%20priority%20desc" scope="external" format="html">this report in the Impala JIRA tracker</xref>.
+      </p>
+
+    </conbody>
+  </concept>
+
+<!-- All 2.7.x subsections go under here -->
 
   <concept rev="2.7.0" id="fixed_issues_270">
 
@@ -77,7 +93,7 @@ under the License.
     </conbody>
   </concept>
 
-<!-- All 2.6.x / 5.8.x subsections go under here -->
+<!-- All 2.6.x subsections go under here -->
 
   <concept rev="2.6.3" id="fixed_issues_263">
     <title>Issues Fixed in Impala for CDH 5.8.3</title>
@@ -258,7 +274,7 @@ under the License.
     </concept>
 
   </concept>
-<!-- All 2.5.x / 5.7.x subsections go under here -->
+<!-- All 2.5.x subsections go under here -->
 
   <concept rev="2.5.4" id="fixed_issues_254">
     <title>Issues Fixed in Impala for CDH 5.7.4</title>
@@ -615,7 +631,7 @@ select 2061013007, conv(cast(cast(2061013007 as decimal(20,0)) as bigint), 16, 1
 
   </concept>
 
-<!-- All 2.4.x / 5.6.x subsections go under here -->
+<!-- All 2.4.x subsections go under here -->
 
   <concept rev="2.4.1" id="fixed_issues_241">
 
@@ -664,7 +680,7 @@ select 2061013007, conv(cast(cast(2061013007 as decimal(20,0)) as bigint), 16, 1
 
   </concept>
 
-<!-- All 2.3.x / 5.5.x subsections go under here -->
+<!-- All 2.3.x subsections go under here -->
 
   <concept rev="2.3.4" id="fixed_issues_234">
 
@@ -1262,7 +1278,7 @@ IMPALA-1917
 
   </concept>
 
-<!-- All 2.2.x / 5.4.x subsections go under here -->
+<!-- All 2.2.x subsections go under here -->
 
   <concept rev="2.2.10" id="fixed_issues_2210">
 
@@ -2184,7 +2200,7 @@ ce601ec : Enable using isilon as the underlying filesystem.
 
   <concept rev="2.2.0" id="fixed_issues_220">
 
-    <title>Issues Fixed in the 2.2.0 Release / CDH 5.4.0</title>
+    <title>Issues Fixed in <keyword keyref="impala22_full"/></title>
 
     <conbody>
 
@@ -2194,13 +2210,6 @@ ce601ec : Enable using isilon as the underlying filesystem.
 
       <p>
         For the full list of fixed issues in Impala 2.2.0, including over 40 critical issues, see
-<!--
-  In maintenance releases, the CDH fixed issues topics did include a nice compact list of Impala JIRAs.
-  But now in 5.4, it's back to lengthy descriptions for fixed issues and the Impala ones don't have a
-  complete compact list anywhere in the docs. So returning to the practice of linking to the list in
-  the JIRA system like was done before.
--->
-        <!-- <xref audience="standalone" href="http://www.cloudera.com/documentation/enterprise/latest/topics/cdh_rn_fixed_in_540.html" format="html" scope="external">the CDH 5.4.0 release notes</xref><xref audience="integrated" href="cdh_rn_fixed_in_540.xml"/>. -->
         <xref href="https://issues.cloudera.org/secure/IssueNavigator.jspa?reset=true&amp;jqlQuery=project%3Dimpala+and+fixVersion%3D%22Impala+2.2%22+and+resolution%3D%22Fixed%22" format="html" scope="external">
         this report in the JIRA system</xref>.
       </p>
@@ -2378,7 +2387,7 @@ IMPALA-1607
 
   </concept>
 
-<!-- All 2.1.x / 5.3.x subsections go under here -->
+<!-- All 2.1.x subsections go under here -->
 
   <concept rev="2.3.10" id="fixed_issues_2310">
 
@@ -2406,12 +2415,12 @@ IMPALA-1607
 
   <concept rev="2.1.7" id="fixed_issues_217">
 
-    <title>Issues Fixed in the 2.1.7 Release / CDH 5.3.9</title>
+    <title>Issues Fixed in Impala 2.1.7</title>
 
     <conbody>
 
       <p>
-        This section lists the most significant Impala issues fixed in Impala 2.1.7 for CDH 5.3.9.
+        This section lists the most significant Impala issues fixed in Impala 2.1.7.
       </p>
 
       <p> For the full list of Impala fixed issues in this release, see <xref
@@ -2504,12 +2513,12 @@ e591cf4 IMPALA-2141: UnionNode::GetNext() doesn't check for query errors
 
   <concept rev="2.1.6" id="fixed_issues_216">
 
-    <title>Issues Fixed in the 2.1.6 Release / CDH 5.3.8</title>
+    <title>Issues Fixed in Impala 2.1.6</title>
 
     <conbody>
 
       <p>
-        This section lists the most significant Impala issues fixed in Impala 2.1.6 for CDH 5.3.8.
+        This section lists the most significant Impala issues fixed in Impala 2.1.6.
       </p>
 
       <p> For the full list of Impala fixed issues in this release, see <!-- Don't think we have quite the right combination of conditional options to make this reference be a web link in Impala PDF and a normal xref in Release Notes PDF. -->
@@ -2592,12 +2601,12 @@ e591cf4 IMPALA-2141: UnionNode::GetNext() doesn't check for query errors
 
   <concept rev="2.1.5" id="fixed_issues_215">
 
-    <title>Issues Fixed in the 2.1.5 Release / CDH 5.3.6</title>
+    <title>Issues Fixed in Impala 2.1.5</title>
 
     <conbody>
 
       <p>
-        This section lists the most significant Impala issues fixed in Impala 2.1.5 for CDH 5.3.6.
+        This section lists the most significant Impala issues fixed in Impala 2.1.5.
       </p>
 
       <p> For the full list of Impala fixed issues in this release, see <!-- Don't think we have quite the right combination of conditional options to make this reference be a web link in Impala PDF and a normal xref in Release Notes PDF. -->
@@ -2634,17 +2643,17 @@ e591cf4 IMPALA-2141: UnionNode::GetNext() doesn't check for query errors
 
   <concept rev="2.1.4" id="fixed_issues_214">
 
-    <title>Issues Fixed in the 2.1.4 Release /  CDH 5.3.4</title>
+    <title>Issues Fixed in Impala 2.1.4</title>
 
     <conbody>
 
       <p>
-        This section lists the most significant Impala issues fixed in Impala 2.1.4 for CDH 5.3.4.
+        This section lists the most significant Impala issues fixed in Impala 2.1.4.
         <ph conref="../shared/impala_common.xml#common/impala_214_redux"/>
       </p>
 
-      <p> For the full list of Impala fixed issues in Impala 2.1.4 for CDH
-        5.3.4, see <xref audience="standalone"
+      <p> For the full list of Impala fixed issues in Impala 2.1.4,
+        see <xref audience="standalone"
           href="http://www.cloudera.com/documentation/enterprise/latest/topics/cdh_rn_fixed_in_534.html"
           format="html" scope="external">the CDH 5.3.4 release notes</xref><xref
           href="cdh_rn_fixed_in_53.xml#fixed_issues_534" audience="integrated"
@@ -2780,7 +2789,7 @@ c132c75 IMPALA-1808: AnalyticEvalNode cannot handle partition/order by exprs wit
 
   <concept rev="2.1.3" id="fixed_issues_213">
 
-    <title>Issues Fixed in the 2.1.3 Release / CDH 5.3.3</title>
+    <title>Issues Fixed in Impala 2.1.3</title>
 
     <conbody>
 
@@ -2924,7 +2933,7 @@ c132c75 IMPALA-1808: AnalyticEvalNode cannot handle partition/order by exprs wit
 
   <concept rev="2.1.2" id="fixed_issues_212">
 
-    <title>Issues Fixed in the 2.1.2 Release / CDH 5.3.2</title>
+    <title>Issues Fixed in Impala 2.1.2</title>
 
     <conbody>
 
@@ -2994,7 +3003,7 @@ IMPALA-1120: Fetch column statistics using Hive 0.13 bulk API - also in 5.2.4 / 
 
   <concept rev="2.1.1" id="fixed_issues_211">
 
-    <title>Issues Fixed in the 2.1.1 Release / CDH 5.3.1</title>
+    <title>Issues Fixed in Impala 2.1.1</title>
 
     <conbody>
 
@@ -3057,7 +3066,7 @@ IMPALA-1120: Fetch column statistics using Hive 0.13 bulk API - also in 5.2.4 / 
 
   <concept rev="2.1.0" id="fixed_issues_210">
 
-    <title>Issues Fixed in the 2.1.0 Release / CDH 5.3.0</title>
+    <title>Issues Fixed in Impala 2.1.0</title>
 
     <conbody>
 
@@ -3177,7 +3186,7 @@ IMPALA-1120: Fetch column statistics using Hive 0.13 bulk API - also in 5.2.4 / 
 
   <concept rev="2.0.5" id="fixed_issues_205">
 
-    <title>Issues Fixed in the 2.0.5 Release / CDH 5.2.6</title>
+    <title>Issues Fixed in Impala 2.0.5</title>
 
     <conbody>
 
@@ -3194,7 +3203,7 @@ IMPALA-1120: Fetch column statistics using Hive 0.13 bulk API - also in 5.2.4 / 
 
   <concept rev="2.0.4" id="fixed_issues_204">
 
-    <title>Issues Fixed in the 2.0.4 Release / CDH 5.2.5</title>
+    <title>Issues Fixed in Impala 2.0.4</title>
 
     <conbody>
 
@@ -3263,7 +3272,7 @@ db3362f IMPALA-1801: external-data-source-executor leaking global jni refs
 
   <concept rev="2.0.3" id="fixed_issues_203">
 
-    <title>Issues Fixed in the 2.0.3 Release / CDH 5.2.4</title>
+    <title>Issues Fixed in Impala 2.0.3</title>
 
     <conbody>
 
@@ -3322,7 +3331,7 @@ IMPALA-1120: Fetch column statistics using Hive 0.13 bulk API    this one fix th
 
   <concept rev="2.0.2" id="fixed_issues_202">
 
-    <title>Issues Fixed in the 2.0.2 Release / CDH 5.2.3</title>
+    <title>Issues Fixed in Impala 2.0.2</title>
 
     <conbody>
 
@@ -3340,8 +3349,6 @@ IMPALA-1120: Fetch column statistics using Hive 0.13 bulk API    this one fix th
 
       <p outputclass="toc inpage"/>
     </conbody>
-
-<!-- These fixed JIRAs are copied from from impala_fixed_issues.xml. Going forward, the content in this file is the baseline for future changes. -->
 
     <concept id="IMPALA-1453">
 
@@ -3451,7 +3458,7 @@ IMPALA-1120: Fetch column statistics using Hive 0.13 bulk API    this one fix th
 
   <concept rev="2.0.1" id="fixed_issues_201">
 
-    <title>Issues Fixed in the 2.0.1 Release / CDH 5.2.1</title>
+    <title>Issues Fixed in Impala 2.0.1</title>
 
     <conbody>
 
@@ -3499,7 +3506,7 @@ IMPALA-1120: Fetch column statistics using Hive 0.13 bulk API    this one fix th
 
   <concept rev="2.0.0" id="fixed_issues_200">
 
-    <title>Issues Fixed in the 2.0.0 Release / CDH 5.2.0</title>
+    <title>Issues Fixed in Impala 2.0.0</title>
 
     <conbody>
 
@@ -3829,12 +3836,11 @@ IMPALA-1120: Fetch column statistics using Hive 0.13 bulk API    this one fix th
   </concept>
 
   <concept rev="1.4.4" id="fixed_issues_144">
-  <title>Issues Fixed in the 1.4.4 Release / CDH 5.1.5</title>
+  <title>Issues Fixed in Impala 1.4.4</title>
     <conbody>
       <p>
         For the list of fixed issues, see
-        <xref href="http://www.cloudera.com/documentation/enterprise/release-notes/topics/cdh_rn_fixed_in_51.html" scope="external" format="html">Issues Fixed in CDH 5.1.5</xref>
-        in the <cite>CDH 5 Release Notes</cite>.
+        <xref href="http://www.cloudera.com/documentation/enterprise/release-notes/topics/cdh_rn_fixed_in_51.html" scope="external" format="html">Issues Fixed in CDH 5.1.5</xref>.
       </p>
 
       <note conref="../shared/impala_common.xml#common/only_cdh5_144"/>
@@ -3844,7 +3850,7 @@ IMPALA-1120: Fetch column statistics using Hive 0.13 bulk API    this one fix th
 
   <concept rev="1.4.3" id="fixed_issues_143">
 
-    <title>Issues Fixed in the 1.4.3 Release / CDH 5.1.4</title>
+    <title>Issues Fixed in Impala 1.4.3</title>
 
     <conbody>
 
@@ -3860,7 +3866,7 @@ IMPALA-1120: Fetch column statistics using Hive 0.13 bulk API    this one fix th
 
   <concept rev="1.4.2" id="fixed_issues_142">
 
-    <title>Issues Fixed in the 1.4.2 Release / CDH 5.1.3</title>
+    <title>Issues Fixed in Impala 1.4.2</title>
 
     <conbody>
 
@@ -3882,7 +3888,7 @@ IMPALA-1120: Fetch column statistics using Hive 0.13 bulk API    this one fix th
 
   <concept rev="1.4.1" id="fixed_issues_141">
 
-    <title>Issues Fixed in the 1.4.1 Release / CDH 5.1.2</title>
+    <title>Issues Fixed in Impala 1.4.1</title>
 
     <conbody>
 
@@ -4049,7 +4055,7 @@ IMPALA-1120: Fetch column statistics using Hive 0.13 bulk API    this one fix th
 
   <concept rev="1.4.0" id="fixed_issues_140">
 
-    <title>Issues Fixed in the 1.4.0 Release / CDH 5.1.0</title>
+    <title>Issues Fixed in Impala 1.4.0</title>
 
     <conbody>
 
@@ -4116,8 +4122,19 @@ IMPALA-1120: Fetch column statistics using Hive 0.13 bulk API    this one fix th
           <b>Bug:</b>
           <xref href="https://issues.cloudera.org/browse/IMPALA-1019" scope="external" format="html">IMPALA-1019</xref>
         </p>
-
+        
         <p>
+          <b>Workaround:</b> On CDH 5.0.x, upgrade to CDH 5.0.4 with Impala 1.3.2, where this issue is fixed. In
+          Impala 1.3.0 or 1.3.1 on CDH 5.0.x, do not use HDFS caching for Impala data files in Impala internal or
+          external tables. If some of these data files are cached (for example because they are used by other
+          components that take advantage of HDFS caching), set the query option
+          <codeph>DISABLE_CACHED_READS=true</codeph>. To set that option for all Impala queries across all
+          sessions, start <cmdname>impalad</cmdname> with the <codeph>-default_query_options</codeph> option and
+          include this setting in the option argument.
+        </p>
+        
+
+        <p audience="hidden">
           <b>Workaround:</b> On CDH 5.0.x, upgrade to CDH 5.0.4 with Impala 1.3.2, where this issue is fixed. In
           Impala 1.3.0 or 1.3.1 on CDH 5.0.x, do not use HDFS caching for Impala data files in Impala internal or
           external tables. If some of these data files are cached (for example because they are used by other
@@ -4312,7 +4329,7 @@ IMPALA-1120: Fetch column statistics using Hive 0.13 bulk API    this one fix th
 
   <concept rev="1.3.3" id="fixed_issues_133">
 
-    <title>Issues Fixed in the 1.3.3 Release / CDH 5.0.5</title>
+    <title>Issues Fixed in Impala 1.3.3</title>
 
     <conbody>
 
@@ -4329,7 +4346,7 @@ IMPALA-1120: Fetch column statistics using Hive 0.13 bulk API    this one fix th
 
   <concept rev="1.3.2" id="fixed_issues_132">
 
-    <title>Issues Fixed in the 1.3.2 Release / CDH 5.0.4</title>
+    <title>Issues Fixed in Impala 1.3.2</title>
 
     <conbody>
 
@@ -4365,8 +4382,18 @@ IMPALA-1120: Fetch column statistics using Hive 0.13 bulk API    this one fix th
           <b>Bug:</b>
           <xref href="https://issues.cloudera.org/browse/IMPALA-1019" scope="external" format="html">IMPALA-1019</xref>
         </p>
-
+        
         <p>
+          <b>Workaround:</b> Upgrade to CDH 5.0.4 with Impala 1.3.2, where this issue is fixed. In
+          Impala 1.3.0 or 1.3.1, do not use HDFS caching for Impala data files in Impala internal or
+          external tables. If some of these data files are cached (for example because they are used by other
+          components that take advantage of HDFS caching), set the query option
+          <codeph>DISABLE_CACHED_READS=true</codeph>. To set that option for all Impala queries across all
+          sessions, start <cmdname>impalad</cmdname> with the <codeph>-default_query_options</codeph> option and
+          include this setting in the option argument.
+        </p>
+
+        <p audience="hidden">
           <b>Workaround:</b> On CDH 5.0.x, upgrade to CDH 5.0.4 with Impala 1.3.2, where this issue is fixed. In
           Impala 1.3.0 or 1.3.1 on CDH 5.0.x, do not use HDFS caching for Impala data files in Impala internal or
           external tables. If some of these data files are cached (for example because they are used by other
@@ -4378,8 +4405,8 @@ IMPALA-1120: Fetch column statistics using Hive 0.13 bulk API    this one fix th
         </p>
 
         <p>
-          <b>Resolution:</b> This issue is fixed in Impala 1.3.2 for CDH 5.0.4. The addition of HDFS caching
-          support in Impala 1.4 means that this issue does not apply to any new level of Impala on CDH 5.
+          <b>Resolution:</b> This issue is fixed in Impala 1.3.2. The addition of HDFS caching
+          support in Impala 1.4 means that this issue does not apply to any new level of Impala.
         </p>
       </conbody>
     </concept>
@@ -4387,7 +4414,7 @@ IMPALA-1120: Fetch column statistics using Hive 0.13 bulk API    this one fix th
 
   <concept rev="1.3.1" id="fixed_issues_131">
 
-    <title>Issues Fixed in the 1.3.1 Release / CDH 5.0.3</title>
+    <title>Issues Fixed in Impala 1.3.1</title>
 
     <conbody>
 
@@ -4398,9 +4425,7 @@ IMPALA-1120: Fetch column statistics using Hive 0.13 bulk API    this one fix th
       <p>
         For the full list of fixed issues in Impala 1.3.1, see
         <xref href="https://issues.cloudera.org/secure/IssueNavigator.jspa?reset=true&amp;jqlQuery=project%3Dimpala+and+fixVersion%3D%22Impala+1.3.1%22+and+resolution%3D%22Fixed%22" format="html" scope="external">
-        this report in the JIRA system</xref>. Because 1.3.1 is the first 1.3.x release for CDH 4, if you are on
-        CDH 4, also consult <xref href="impala_fixed_issues.xml#fixed_issues_130"/>.
-<!--      <xref href="https://issues.cloudera.org/secure/IssueNavigator.jspa?reset=true&amp;jqlQuery=project%3Dimpala+and+fixVersion%3D%22Impala+1.3%22+and+resolution%3D%22Fixed%22" format="html" scope="external">list of issues fixed in 1.3.0</xref>. -->
+        this report in the JIRA system</xref>.
       </p>
 
       <p outputclass="toc inpage"/>
@@ -4626,7 +4651,7 @@ IMPALA-1120: Fetch column statistics using Hive 0.13 bulk API    this one fix th
 
   <concept rev="1.3.0" id="fixed_issues_130">
 
-    <title>Issues Fixed in the 1.3.0 Release / CDH 5.0.0</title>
+    <title>Issues Fixed in Impala 1.3.0</title>
 
     <conbody>
 

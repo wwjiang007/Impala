@@ -50,6 +50,9 @@ class ParquetMetadataUtils {
       const char* filename, int row_group_idx, int col_idx,
       const parquet::SchemaElement& schema_element, const SlotDescriptor* slot_desc,
       RuntimeState* state);
+
+  /// Returns whether column 'col_idx' in 'row_group' has statistics attached to it.
+  static bool HasRowGroupStats(const parquet::RowGroup& row_group, int col_idx);
 };
 
 struct ParquetFileVersion {
@@ -185,7 +188,9 @@ class ParquetSchemaResolver {
       int next_idx, SchemaNode* node, bool* missing_field) const;
 
   /// Returns the index of 'node's child with 'name', or the number of children if not
-  /// found.
+  /// found. The name comparison is case-insensitive because that's how Impala treats
+  /// db/table/column/field names. If there are several matches with different casing,
+  /// then the index of the first match is returned.
   int FindChildWithName(SchemaNode* node, const string& name) const;
 
   /// The ResolvePathHelper() logic for arrays.

@@ -288,6 +288,21 @@ class TestParquet(ImpalaTestSuite):
     vector.get_value('exec_option')['abort_on_error'] = 1
     self.run_test_case('QueryTest/parquet-zero-rows', vector, unique_database)
 
+  def test_huge_num_rows(self, vector, unique_database):
+    """IMPALA-5021: Tests that a zero-slot scan on a file with a huge num_rows in the
+    footer succeeds without errors."""
+    self.client.execute("create table %s.huge_num_rows (i int) stored as parquet"
+      % unique_database)
+    huge_num_rows_loc = get_fs_path(
+        "/test-warehouse/%s.db/%s" % (unique_database, "huge_num_rows"))
+    check_call(['hdfs', 'dfs', '-copyFromLocal',
+        os.environ['IMPALA_HOME'] + "/testdata/data/huge_num_rows.parquet",
+        huge_num_rows_loc])
+    result = self.client.execute("select count(*) from %s.huge_num_rows"
+      % unique_database)
+    assert len(result.data) == 1
+    assert "4294967294" in result.data
+
   def test_corrupt_rle_counts(self, vector, unique_database):
     """IMPALA-3646: Tests that a certain type of file corruption for plain
     dictionary encoded values is gracefully handled. Cases tested:
@@ -311,6 +326,10 @@ class TestParquet(ImpalaTestSuite):
     vector.get_value('exec_option')['abort_on_error'] = 1
     self.run_test_case('QueryTest/parquet-corrupt-rle-counts-abort',
                        vector, unique_database)
+
+  def test_filtering(self, vector):
+    """IMPALA-4624: Test that dictionary filtering eliminates row groups correctly."""
+    self.run_test_case('QueryTest/parquet-filtering', vector)
 
   @SkipIfS3.hdfs_block_size
   @SkipIfIsilon.hdfs_block_size
@@ -507,7 +526,7 @@ class TestParquet(ImpalaTestSuite):
     assert d_schema_elt.converted_type == None
 
   @SkipIfOldAggsJoins.nested_types
-  def test_resolution_by_name(self, unique_database, vector):
+  def test_resolution_by_name(self, vector, unique_database):
     self.run_test_case('QueryTest/parquet-resolution-by-name', vector,
                        use_db=unique_database)
 

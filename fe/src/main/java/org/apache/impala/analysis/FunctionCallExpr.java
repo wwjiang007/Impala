@@ -227,6 +227,26 @@ public class FunctionCallExpr extends Expr {
   public void setIsAnalyticFnCall(boolean v) { isAnalyticFnCall_ = v; }
   public void setIsInternalFnCall(boolean v) { isInternalFnCall_ = v; }
 
+  static boolean isNondeterministicBuiltinFnName(String fnName) {
+    if (fnName.equalsIgnoreCase("rand") || fnName.equalsIgnoreCase("random")
+        || fnName.equalsIgnoreCase("uuid")) {
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Returns true if function is a non-deterministic builtin function, i.e. for a fixed
+   * input, it may not always produce the same output for every invocation.
+   * Functions that use randomness or variable runtime state are non-deterministic.
+   * This only applies to builtin functions, and does not provide any information
+   * about user defined functions.
+   */
+  public boolean isNondeterministicBuiltinFn() {
+    String fnName = fnName_.getFunction();
+    return isNondeterministicBuiltinFnName(fnName);
+  }
+
   @Override
   protected void toThrift(TExprNode msg) {
     if (isAggregateFunction() || isAnalyticFnCall_) {
@@ -256,8 +276,7 @@ public class FunctionCallExpr extends Expr {
       fnName = path.get(path.size() - 1);
     }
     // Non-deterministic functions are never constant.
-    if (fnName.equalsIgnoreCase("rand") || fnName.equalsIgnoreCase("random")
-        || fnName.equalsIgnoreCase("uuid")) {
+    if (!isNondeterministicBuiltinFnName(fnName)) {
       return false;
     }
     // Sleep is a special function for testing.
@@ -331,7 +350,21 @@ public class FunctionCallExpr extends Expr {
 
     int digitsBefore = childType.decimalPrecision() - childType.decimalScale();
     int digitsAfter = childType.decimalScale();
-    if (fnName_.getFunction().equalsIgnoreCase("ceil") ||
+    if (fnName_.getFunction().equalsIgnoreCase("avg") &&
+        analyzer.getQueryOptions().isDecimal_v2()) {
+      // AVG() always gets at least MIN_ADJUSTED_SCALE decimal places since it performs
+      // an implicit divide. The output type isn't always the same as SUM()/COUNT().
+      // Scale is set the same as MS SQL Server, which takes the max of the input scale
+      // and MIN_ADJUST_SCALE. For precision, MS SQL always sets it to 38. We choose to
+      // trim it down to the size that's needed because the absolute value of the result
+      // is less than the absolute value of the largest input. Using a smaller precision
+      // allows for better DECIMAL types to be chosen for the overall expression when
+      // AVG() is a subexpression. For DECIMAL_V1, we set the output type to be the same
+      // as the input type.
+      int resultScale = Math.max(ScalarType.MIN_ADJUSTED_SCALE, digitsAfter);
+      int resultPrecision = digitsBefore + resultScale;
+      return ScalarType.createAdjustedDecimalType(resultPrecision, resultScale);
+    } else if (fnName_.getFunction().equalsIgnoreCase("ceil") ||
                fnName_.getFunction().equalsIgnoreCase("ceiling") ||
                fnName_.getFunction().equals("floor") ||
                fnName_.getFunction().equals("dfloor")) {

@@ -146,6 +146,8 @@ class Expr {
   virtual TimestampVal GetTimestampVal(ExprContext* context, const TupleRow*);
   virtual DecimalVal GetDecimalVal(ExprContext* context, const TupleRow*);
 
+  const std::string& function_name() const { return fn_.name.function_name; }
+
   /// Get the number of digits after the decimal that should be displayed for this value.
   /// Returns -1 if no scale has been specified (currently the scale is only set for
   /// doubles set by RoundUpTo). GetValue() must have already been called.
@@ -207,17 +209,6 @@ class Expr {
   /// Convenience function for closing multiple expr trees.
   static void Close(const std::vector<ExprContext*>& ctxs, RuntimeState* state);
 
-  /// Create a new literal expr of 'type' with initial 'data'.
-  /// data should match the ColumnType (i.e. type == TYPE_INT, data is a int*)
-  /// The new Expr will be allocated from the pool.
-  static Expr* CreateLiteral(ObjectPool* pool, const ColumnType& type, void* data);
-
-  /// Create a new literal expr of 'type' by parsing the string.
-  /// NULL will be returned if the string and type are not compatible.
-  /// The new Expr will be allocated from the pool.
-  static Expr* CreateLiteral(ObjectPool* pool, const ColumnType& type,
-      const std::string&);
-
   /// Computes a memory efficient layout for storing the results of evaluating
   /// 'exprs'. The results are assumed to be void* slot types (vs AnyVal types). Varlen
   /// data is not included (e.g. there will be space for a StringValue, but not the data
@@ -264,10 +255,7 @@ class Expr {
 
  protected:
   friend class AggFnEvaluator;
-  friend class CastExpr;
-  friend class ComputeFunctions;
   friend class DecimalFunctions;
-  friend class DecimalLliteral;
   friend class DecimalOperators;
   friend class MathFunctions;
   friend class StringFunctions;
@@ -276,7 +264,6 @@ class Expr {
   friend class UtilityFunctions;
   friend class CaseExpr;
   friend class InPredicate;
-  friend class FunctionCall;
   friend class ScalarFnCall;
 
   Expr(const ColumnType& type, bool is_constant, bool is_slotref);

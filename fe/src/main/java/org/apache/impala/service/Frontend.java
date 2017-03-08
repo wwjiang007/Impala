@@ -700,7 +700,7 @@ public class Frontend {
     resultSchema.addToColumns(
         new TColumn("#Distinct Values", Type.BIGINT.toThrift()));
     resultSchema.addToColumns(new TColumn("#Nulls", Type.BIGINT.toThrift()));
-    resultSchema.addToColumns(new TColumn("Max Size", Type.INT.toThrift()));
+    resultSchema.addToColumns(new TColumn("Max Size", Type.BIGINT.toThrift()));
     resultSchema.addToColumns(new TColumn("Avg Size", Type.DOUBLE.toThrift()));
 
     for (Column c: table.getColumnsInHiveOrder()) {
@@ -1026,8 +1026,7 @@ public class Frontend {
         queryCtx.client_request.query_options.isDisable_unsafe_spills()
           && !queryCtx.tables_missing_stats.isEmpty()
           && !analysisResult.getAnalyzer().hasPlanHints();
-    // for now, always disable spilling for multi-threaded execution
-    if (isMtExec || disableSpilling) queryCtx.setDisable_spilling(true);
+    queryCtx.setDisable_spilling(disableSpilling);
 
     // assign fragment idx
     int idx = 0;

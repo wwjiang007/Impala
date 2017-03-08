@@ -73,6 +73,7 @@ set_dep_root(BOOST)
 set_dep_root(BREAKPAD)
 set_dep_root(BZIP2)
 set_dep_root(CRCUTIL)
+set_dep_root(FLATBUFFERS)
 set_dep_root(GCC)
 set_dep_root(GFLAGS)
 set_dep_root(GLOG)
@@ -92,6 +93,10 @@ set_dep_root(ZLIB)
 if (APPLE)
   set_dep_root(OPENSSL)
 endif()
+
+# The boost-cmake project hasn't been maintained for years. Let's make sure we
+# don't accidentally use it if it can be found.
+set(Boost_NO_BOOST_CMAKE ON)
 
 set(Boost_USE_STATIC_LIBS NOT ${BUILD_SHARED_LIBS})
 set(Boost_USE_STATIC_RUNTIME ON)
@@ -197,7 +202,8 @@ find_package(LlvmBinaries REQUIRED)
 # Find LLVM libraries to link against.
 if ("${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG"
     OR "${CMAKE_BUILD_TYPE}" STREQUAL "ADDRESS_SANITIZER"
-    OR "${CMAKE_BUILD_TYPE}" STREQUAL "TIDY")
+    OR "${CMAKE_BUILD_TYPE}" STREQUAL "TIDY"
+    OR "${CMAKE_BUILD_TYPE}" STREQUAL "UBSAN")
   # Use the LLVM libaries with assertions for debug builds.
   set(LLVM_ROOT ${LLVM_DEBUG_ROOT})
 endif()
@@ -238,6 +244,14 @@ message(STATUS "Thrift contrib dir: ${THRIFT_CONTRIB_DIR}")
 message(STATUS "Thrift library path: ${THRIFT_LIBS}")
 message(STATUS "Thrift static library: ${THRIFT_STATIC_LIB}")
 message(STATUS "Thrift compiler: ${THRIFT_COMPILER}")
+
+# find flatbuffers headers, lib and compiler
+find_package(FlatBuffers REQUIRED)
+include_directories(${FLATBUFFERS_INCLUDE_DIR})
+set(LIBS ${LIBS} ${FLATBUFFERS_LIBS})
+message(STATUS "FlatBuffers include dir: ${FLATBUFFERS_INCLUDE_DIR}")
+message(STATUS "FlatBuffers library path: ${FLATBUFFERS_LIBS}")
+message(STATUS "FlatBuffers compiler: ${FLATBUFFERS_COMPILER}")
 
 # find Snappy headers and libs
 find_package(Snappy REQUIRED)
@@ -337,7 +351,7 @@ else()
 endif()
 # When KUDU_IS_SUPPORTED is false, the Kudu client is expected to be a non-functional
 # stub. It's still needed to link though.
-find_package(kuduClient REQUIRED)
+find_package(kuduClient REQUIRED NO_DEFAULT_PATH)
 include_directories(SYSTEM ${KUDU_CLIENT_INCLUDE_DIR})
 
 # find jni headers and libs

@@ -23,7 +23,6 @@ from copy import deepcopy
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.skip import SkipIfOldAggsJoins
 from tests.common.test_vector import ImpalaTestDimension
-from tests.common.test_vector import ImpalaTestVector
 
 # COMPUTE STATS on Parquet tables automatically sets MT_DOP=4, so include
 # the value 0 to cover the non-MT path as well.
@@ -43,7 +42,7 @@ class TestMtDop(ImpalaTestSuite):
     vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
     self.run_test_case('QueryTest/mt-dop', vector)
 
-  def test_compute_stats(self, unique_database, vector):
+  def test_compute_stats(self, vector, unique_database):
     vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
     file_format = vector.get_value('table_format').file_format
     fq_table_name = "%s.mt_dop" % unique_database
@@ -98,3 +97,19 @@ class TestMtDopParquet(ImpalaTestSuite):
   def test_parquet_nested(self, vector):
     vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
     self.run_test_case('QueryTest/mt-dop-parquet-nested', vector)
+
+# Parquet filtering test rlies on a specific mt_dop value, so keep in its own test
+class TestMtDopParquetFiltering(ImpalaTestSuite):
+  @classmethod
+  def get_workload(cls):
+    return 'functional-query'
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestMtDopParquetFiltering, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_constraint(
+      lambda v: v.get_value('table_format').file_format == 'parquet')
+
+  def test_parquet_filtering(self, vector):
+    vector.get_value('exec_option')['mt_dop'] = 3
+    self.run_test_case('QueryTest/mt-dop-parquet-filtering', vector)

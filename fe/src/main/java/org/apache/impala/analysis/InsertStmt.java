@@ -51,8 +51,6 @@ import com.google.common.collect.Sets;
  * whose results are to be inserted.
  */
 public class InsertStmt extends StatementBase {
-  private final static Logger LOG = LoggerFactory.getLogger(InsertStmt.class);
-
   // Target table name as seen by the parser
   private final TableName originalTableName_;
 
@@ -131,6 +129,11 @@ public class InsertStmt extends StatementBase {
   // the 'sortby()' hint must not contain partition columns. For Kudu tables, it must not
   // contain primary key columns.
   private List<Expr> sortByExprs_ = Lists.newArrayList();
+
+  // Stores the indices into the list of non-clustering columns of the target table that
+  // are mentioned in the 'sortby()' hint. This is sent to the backend to populate the
+  // RowGroup::sorting_columns list in parquet files.
+  private List<Integer> sortByColumns_ = Lists.newArrayList();
 
   // Output expressions that produce the final results to write to the target table. May
   // include casts. Set in prepareExpressions().
@@ -806,6 +809,7 @@ public class InsertStmt extends StatementBase {
       for (int i = 0; i < columns.size(); ++i) {
         if (columns.get(i).getName().equals(columnName)) {
           sortByExprs_.add(resultExprs_.get(i));
+          sortByColumns_.add(i);
           foundColumn = true;
           break;
         }
@@ -838,7 +842,6 @@ public class InsertStmt extends StatementBase {
    * Only valid after analysis
    */
   public QueryStmt getQueryStmt() { return queryStmt_; }
-  public void setQueryStmt(QueryStmt stmt) { queryStmt_ = stmt; }
   public List<Expr> getPartitionKeyExprs() { return partitionKeyExprs_; }
   public boolean hasShuffleHint() { return hasShuffleHint_; }
   public boolean hasNoShuffleHint() { return hasNoShuffleHint_; }
@@ -857,7 +860,8 @@ public class InsertStmt extends StatementBase {
     // analyze() must have been called before.
     Preconditions.checkState(table_ != null);
     return TableSink.create(table_, isUpsert_ ? TableSink.Op.UPSERT : TableSink.Op.INSERT,
-        partitionKeyExprs_, mentionedColumns_, overwrite_, hasClusteredHint_);
+        partitionKeyExprs_, mentionedColumns_, overwrite_, hasClusteredHint_,
+        sortByColumns_);
   }
 
   /**

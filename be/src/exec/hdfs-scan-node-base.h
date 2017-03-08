@@ -143,6 +143,13 @@ class HdfsScanNodeBase : public ScanNode {
   /// Returns number of partition key slots.
   int num_materialized_partition_keys() const { return partition_key_slots_.size(); }
 
+  int min_max_tuple_id() const { return min_max_tuple_id_; }
+
+  const std::vector<ExprContext*> min_max_conjunct_ctxs() const {
+    return min_max_conjunct_ctxs_;
+  }
+
+  const TupleDescriptor* min_max_tuple_desc() const { return min_max_tuple_desc_; }
   const TupleDescriptor* tuple_desc() const { return tuple_desc_; }
   const HdfsTableDescriptor* hdfs_table() { return hdfs_table_; }
   const AvroSchemaElement& avro_schema() { return *avro_schema_.get(); }
@@ -152,6 +159,12 @@ class HdfsScanNodeBase : public ScanNode {
 
   typedef std::map<TupleId, std::vector<ExprContext*>> ConjunctsMap;
   const ConjunctsMap& conjuncts_map() const { return conjuncts_map_; }
+
+  /// Slot Id => Dictionary Filter eligible conjuncts for that slot
+  typedef std::map<SlotId, std::vector<ExprContext*>> DictFilterConjunctsMap;
+  const DictFilterConjunctsMap& dict_filter_conjuncts_map() const {
+    return dict_filter_conjuncts_map_;
+  }
 
   RuntimeProfile::HighWaterMarkCounter* max_compressed_text_file_length() {
     return max_compressed_text_file_length_;
@@ -280,6 +293,15 @@ class HdfsScanNodeBase : public ScanNode {
 
   RuntimeState* runtime_state_;
 
+  /// Tuple id of the tuple used to evaluate conjuncts on parquet::Statistics.
+  const int min_max_tuple_id_;
+
+  /// Conjuncts to evaluate on parquet::Statistics.
+  vector<ExprContext*> min_max_conjunct_ctxs_;
+
+  /// Descriptor for the tuple used to evaluate conjuncts on parquet::Statistics.
+  TupleDescriptor* min_max_tuple_desc_;
+
   // Number of header lines to skip at the beginning of each file of this table. Only set
   // to values > 0 for hdfs text files.
   const int skip_header_line_count_;
@@ -319,6 +341,9 @@ class HdfsScanNodeBase : public ScanNode {
   /// Conjuncts for each materialized tuple (top-level row batch tuples and collection
   /// item tuples). Includes a copy of ExecNode.conjuncts_.
   ConjunctsMap conjuncts_map_;
+
+  /// Dictionary filtering eligible conjuncts for each slot
+  DictFilterConjunctsMap dict_filter_conjuncts_map_;
 
   /// Set to true when the initial scan ranges are issued to the IoMgr. This happens on
   /// the first call to GetNext(). The token manager, in a different thread, will read

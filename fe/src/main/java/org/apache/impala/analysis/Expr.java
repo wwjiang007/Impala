@@ -49,8 +49,6 @@ import com.google.common.collect.Sets;
  *
  */
 abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneable {
-  private final static Logger LOG = LoggerFactory.getLogger(Expr.class);
-
   // Limits on the number of expr children and the depth of an expr tree. These maximum
   // values guard against crashes due to stack overflows (IMPALA-432) and were
   // experimentally determined to be safe.
@@ -165,6 +163,16 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         public boolean apply(Expr arg) { return arg instanceof BinaryPredicate; }
       };
 
+  public final static com.google.common.base.Predicate<Expr>
+      IS_NONDETERMINISTIC_BUILTIN_FN_PREDICATE =
+      new com.google.common.base.Predicate<Expr>() {
+        @Override
+        public boolean apply(Expr arg) {
+          return arg instanceof FunctionCallExpr &&
+             !((FunctionCallExpr)arg).isNondeterministicBuiltinFn();
+        }
+      };
+
   // id that's unique across the entire query statement and is assigned by
   // Analyzer.registerConjuncts(); only assigned for the top-level terms of a
   // conjunction, and therefore null for most Exprs
@@ -252,7 +260,6 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   public boolean isOnClauseConjunct() { return isOnClauseConjunct_; }
   public void setIsOnClauseConjunct(boolean b) { isOnClauseConjunct_ = b; }
   public boolean isAuxExpr() { return isAuxExpr_; }
-  public boolean isRegisteredPredicate() { return id_ != null; }
   public void setIsAuxExpr() { isAuxExpr_ = true; }
   public Function getFn() { return fn_; }
 
@@ -917,25 +924,11 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   }
 
   /**
-   * Returns true if expr is fully bound by slotId, otherwise false.
-   */
-  public boolean isBound(SlotId slotId) {
-    return isBoundBySlotIds(Lists.newArrayList(slotId));
-  }
-
-  /**
    * Returns true if expr is fully bound by slotIds, otherwise false.
    */
   public boolean isBoundBySlotIds(List<SlotId> slotIds) {
     for (Expr child: children_) {
       if (!child.isBoundBySlotIds(slotIds)) return false;
-    }
-    return true;
-  }
-
-  public static boolean isBound(List<? extends Expr> exprs, List<TupleId> tids) {
-    for (Expr expr: exprs) {
-      if (!expr.isBoundByTupleIds(tids)) return false;
     }
     return true;
   }

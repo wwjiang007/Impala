@@ -564,19 +564,17 @@ under the License.
     <p rev="IMPALA-2660 CDH-40241" id="auth_to_local_instructions">
       In <keyword keyref="impala26_full"/> and higher, Impala recognizes the <codeph>auth_to_local</codeph> setting,
       specified through the HDFS configuration setting
-      <codeph>hadoop.security.auth_to_local</codeph>
-      or the Cloudera Manager setting
-      <uicontrol>Additional Rules to Map Kerberos Principals to Short Names</uicontrol>.
+      <codeph>hadoop.security.auth_to_local</codeph>.
       This feature is disabled by default, to avoid an unexpected change in security-related behavior.
       To enable it:
       <ul>
         <li>
           <p>
-            For clusters not managed by Cloudera Manager, specify <codeph>--load_auth_to_local_rules=true</codeph>
-            in the <cmdname>impalad</cmdname> and <cmdname>catalogd</cmdname>configuration settings.
+            Specify <codeph>--load_auth_to_local_rules=true</codeph>
+            in the <cmdname>impalad</cmdname> and <cmdname>catalogd</cmdname> configuration settings.
           </p>
         </li>
-        <li audience="Cloudera">
+        <li audience="hidden">
           <p>
             For clusters managed by Cloudera Manager, select the 
             <uicontrol>Use HDFS Rules to Map Kerberos Principals to Short Names</uicontrol>
@@ -585,7 +583,6 @@ under the License.
           </p>
         </li>
       </ul>
-      See <xref href="http://www.cloudera.com/documentation/enterprise/latest/topics/sg_auth_to_local_isolate.html" scope="external" format="html">Using Auth-to-Local Rules to Isolate Cluster Users</xref> for general information about this feature.
     </p>
 
     <note id="authentication_vs_authorization">
@@ -605,12 +602,6 @@ under the License.
       Sentry logs all facts that lead up to authorization decisions at the debug level. If you do not understand
       why Sentry is denying access, the best way to debug is to temporarily turn on debug logging:
       <ul>
-        <li audience="hidden">
-          In Cloudera Manager, add <codeph>log4j.logger.org.apache.sentry=DEBUG</codeph> to the logging settings
-          for your service through the corresponding <uicontrol>Logging Safety Valve</uicontrol> field for the
-          Impala, Hive Server 2, or Solr Server services.
-        </li>
-
         <li>
           Add <codeph>log4j.logger.org.apache.sentry=DEBUG</codeph> to the <filepath>log4j.properties</filepath>
           file on each host in the cluster, in the appropriate configuration directory for each service.
@@ -1472,15 +1463,14 @@ explain select s from yy2 where year in (select year from yy where year between 
         operation finishes. (Multiple concurrent queries can perform operations that use the <q>spill to disk</q>
         technique, without any name conflicts for these temporary files.) You can specify a different location by
         starting the <cmdname>impalad</cmdname> daemon with the
-        <codeph>--scratch_dirs="<varname>path_to_directory</varname>"</codeph> configuration option or the
-        equivalent configuration option in the Cloudera Manager user interface. You can specify a single directory,
-        or a comma-separated list of directories. The scratch directories must be on the local filesystem, not in
-        HDFS. You might specify different directory paths for different hosts, depending on the capacity and speed
-        of the available storage devices. In CDH 5.5 / Impala 2.3 or higher, Impala successfully starts (with a warning
-        written to the log) if it cannot create or read and write files in one of the scratch directories.
-        If there is less than 1 GB free on the filesystem where that directory resides, Impala still runs, but writes a
-        warning message to its log.  If Impala encounters an error reading or writing files in a scratch directory during
-        a query, Impala logs the error and the query fails.
+        <codeph>--scratch_dirs="<varname>path_to_directory</varname>"</codeph> configuration option. 
+        You can specify a single directory, or a comma-separated list of directories. The scratch directories must 
+        be on the local filesystem, not in HDFS. You might specify different directory paths for different hosts, 
+        depending on the capacity and speed of the available storage devices. In CDH 5.5 / Impala 2.3 or higher, 
+        Impala successfully starts (with a warning written to the log) if it cannot create or read and write files 
+        in one of the scratch directories. If there is less than 1 GB free on the filesystem where that directory resides, 
+        Impala still runs, but writes a warning message to its log.  If Impala encounters an error reading or writing 
+        files in a scratch directory during a query, Impala logs the error and the query fails.
       </p>
 
       <p id="order_by_view_restriction">
@@ -3131,7 +3121,7 @@ select * from header_line limit 10;
             Other security settings may prevent Impala from writing core dumps even when this option is enabled.
           </p>
         </li>
-        <li rev="CDH-34070" audience="Cloudera">
+        <li rev="CDH-34070" audience="hidden">
           <p>
             On systems managed by Cloudera Manager, the default location for core dumps is on a temporary
             filesystem, which can lead to out-of-space issues if the core dumps are large, frequent, or
@@ -3194,7 +3184,7 @@ sudo pip-python install ssl</codeblock>
         <codeph>SYNC_DDL</codeph> query option.
       </note>
 
-      <p rev="1.2" id="cm48_upgrade" audience="Cloudera"><!-- conref'ed in 2 places under 'incompatible changes' -->
+      <p rev="1.2" id="cm48_upgrade" audience="hidden"><!-- conref'ed in 2 places under 'incompatible changes' -->
         In a Cloudera Manager environment, the catalog service is not recognized or managed by Cloudera Manager
         versions prior to 4.8. Cloudera Manager 4.8 and higher require the catalog service to be present for
         Impala. Therefore, if you upgrade to Cloudera Manager 4.8 or higher, you must also upgrade Impala to 1.2.1
@@ -3290,19 +3280,18 @@ sudo pip-python install ssl</codeblock>
 
       <note id="llama_query_options_obsolete">
         <p>
-          This query option is no longer supported, because it affects interaction
-          between Impala and Llama.
-          The use of the Llama component for integrated
-          resource management within YARN is no longer supported with CDH 5.5 /
-          Impala 2.3 and higher.
+          This query option no longer has any effect.
+          The use of the Llama component for integrated resource management within YARN is no
+          longer supported with <keyword keyref="impala23_full"/> and higher, and the Llama
+          support code is removed entirely in <keyword keyref="impala28_full"/> and higher.
         </p>
       </note>
 
-      <note id="impala_llama_obsolete">
+      <note id="impala_llama_obsolete" rev="IMPALA-4160">
         <p>
-          The use of the Llama component for integrated
-          resource management within YARN is no longer supported with CDH 5.5 /
-          Impala 2.3 and higher.
+          The use of the Llama component for integrated resource management within YARN
+          is no longer supported with <keyword keyref="impala23_full"/> and higher.
+          The Llama support code is removed entirely in <keyword keyref="impala28_full"/> and higher.
         </p>
         <p>
           For clusters running Impala alongside
@@ -3318,7 +3307,6 @@ sudo pip-python install ssl</codeblock>
           <uicontrol>Max Memory</uicontrol> relies on the <uicontrol>Default
           Query Memory Limit</uicontrol> to produce a reliable estimate of
         overall memory consumption for a query. </note>
-
 
       <p id="admission_control_mem_limit_interaction">
         For example, consider the following scenario:
@@ -3369,9 +3357,9 @@ sudo pip-python install ssl</codeblock>
       <p id="impala_mr">
         For a detailed information about configuring a cluster to share resources between Impala queries and MapReduce jobs, see
         <xref audience="integrated" href="../topics/admin_howto_multitenancy.xml#howto_multitenancy"/><xref audience="standalone" href="https://www.cloudera.com/documentation/enterprise/latest/topics/admin_howto_multitenancy.html" format="html" scope="external"/>
-        and <xref href="../topics/impala_howto_rm.xml#howto_impala_rm"/>.
+        <!--and <xref href="../topics/impala_howto_rm.xml#howto_impala_rm"/>-->.
       </p>
-
+      
       <note id="llama_beta" type="warning">
         In CDH 5.0.0, the Llama component is in beta. It is intended for evaluation of resource management in test
         environments, in combination with Impala and YARN. It is currently not recommended for production
@@ -3663,7 +3651,7 @@ sudo pip-python install ssl</codeblock>
   JAVA_TOOL_OPTIONS="-Xmx8g"
   </codeblock>
           </li>
-          <li audience="Cloudera">
+          <li audience="hidden">
             <p rev="OPSAPS-26483">
               On systems managed by Cloudera Manager, include this value in the configuration field
               <uicontrol>Java Heap Size of Catalog Server in Bytes</uicontrol> (Cloudera Manager 5.7 and higher), or
@@ -3674,7 +3662,7 @@ sudo pip-python install ssl</codeblock>
           </li>
           <li>
             <p>
-              On systems not managed by Cloudera Manager, put this environment variable setting into the
+              On systems not using cluster management software, put this environment variable setting into the
               startup script for the <cmdname>catalogd</cmdname> daemon, then restart the <cmdname>catalogd</cmdname>
               daemon.
             </p>

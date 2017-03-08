@@ -212,8 +212,6 @@ public class HdfsTable extends Table {
         new HdfsPartitionLocationCompressor(numClusteringCols_);
   }
 
-  public boolean spansMultipleFileSystems() { return multipleFileSystems_; }
-
   /**
    * Returns true if the table resides at a location which supports caching (e.g. HDFS).
    */
@@ -487,9 +485,6 @@ public class HdfsTable extends Table {
 
   public Collection<HdfsPartition> getPartitions() { return partitionMap_.values(); }
   public Map<Long, HdfsPartition> getPartitionMap() { return partitionMap_; }
-  public Map<String, HdfsPartition> getNameToPartitionMap() {
-    return nameToPartitionMap_;
-  }
   public Set<Long> getNullPartitionIds(int i) { return nullPartitionIds_.get(i); }
   public HdfsPartitionLocationCompressor getPartitionLocationCompressor() {
     return partitionLocationCompressor_;
@@ -504,7 +499,6 @@ public class HdfsTable extends Table {
    * Set during load.
    */
   public String getNullPartitionKeyValue() { return nullPartitionKeyValue_; }
-  public String getNullColumnValue() { return nullColumnValue_; }
 
   /*
    * Returns the storage location (HDFS path) of this table.
@@ -815,7 +809,7 @@ public class HdfsTable extends Table {
       // Iterate through the current snapshot of the partition directory listing to
       // figure out files that were newly added/modified.
       List<FileDescriptor> newFileDescs = Lists.newArrayList();
-      int newPartSizeBytes = 0;
+      long newPartSizeBytes = 0;
       for (FileStatus fileStatus : fs.listStatus(partDir)) {
         if (!FileSystemUtil.isValidDataFile(fileStatus)) continue;
         String fileName = fileStatus.getPath().getName().toString();
@@ -1672,7 +1666,6 @@ public class HdfsTable extends Table {
     return hdfsTable;
   }
 
-  public long getNumHdfsFiles() { return numHdfsFiles_; }
   public long getTotalHdfsBytes() { return totalHdfsBytes_; }
   public String getHdfsBaseDir() { return hdfsBaseDir_; }
   public Path getHdfsBaseDirPath() { return new Path(hdfsBaseDir_); }

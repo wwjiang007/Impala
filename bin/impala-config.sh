@@ -72,7 +72,7 @@ fi
 # moving to a different build of the toolchain, e.g. when a version is bumped or a
 # compile option is changed. The build id can be found in the output of the toolchain
 # build jobs, it is constructed from the build number and toolchain git hash prefix.
-export IMPALA_TOOLCHAIN_BUILD_ID=344-715ee51bdc
+export IMPALA_TOOLCHAIN_BUILD_ID=349-1b15a6c8f4
 
 # Versions of toolchain dependencies.
 # -----------------------------------
@@ -84,6 +84,7 @@ export IMPALA_BZIP2_VERSION=1.0.6-p2
 export IMPALA_CMAKE_VERSION=3.2.3-p1
 export IMPALA_CRCUTIL_VERSION=440ba7babeff77ffad992df3a10c767f184e946e
 export IMPALA_CYRUS_SASL_VERSION=2.1.23
+export IMPALA_FLATBUFFERS_VERSION=1.6.0
 export IMPALA_GCC_VERSION=4.9.2
 export IMPALA_GFLAGS_VERSION=2.0
 export IMPALA_GLOG_VERSION=0.3.2-p2
@@ -120,19 +121,19 @@ if [[ $OSTYPE == "darwin"* ]]; then
 fi
 
 # Kudu version in the toolchain; provides libkudu_client.so and minicluster binaries.
-export IMPALA_KUDU_VERSION=cd7b0dd
+export IMPALA_KUDU_VERSION=2b0edbe
 
 # Kudu version used to identify Java client jar from maven
-export KUDU_JAVA_VERSION=1.2.0-SNAPSHOT
+export KUDU_JAVA_VERSION=1.3.0-SNAPSHOT
 
 # Versions of Hadoop ecosystem dependencies.
 # ------------------------------------------
 export CDH_MAJOR_VERSION=5
-export IMPALA_HADOOP_VERSION=2.6.0-cdh5.11.0-SNAPSHOT
-export IMPALA_HBASE_VERSION=1.2.0-cdh5.11.0-SNAPSHOT
-export IMPALA_HIVE_VERSION=1.1.0-cdh5.11.0-SNAPSHOT
-export IMPALA_SENTRY_VERSION=1.5.1-cdh5.11.0-SNAPSHOT
-export IMPALA_PARQUET_VERSION=1.5.0-cdh5.11.0-SNAPSHOT
+export IMPALA_HADOOP_VERSION=2.6.0-cdh5.12.0-SNAPSHOT
+export IMPALA_HBASE_VERSION=1.2.0-cdh5.12.0-SNAPSHOT
+export IMPALA_HIVE_VERSION=1.1.0-cdh5.12.0-SNAPSHOT
+export IMPALA_SENTRY_VERSION=1.5.1-cdh5.12.0-SNAPSHOT
+export IMPALA_PARQUET_VERSION=1.5.0-cdh5.12.0-SNAPSHOT
 export IMPALA_LLAMA_MINIKDC_VERSION=1.0.0
 
 # Source the branch and local config override files here to override any

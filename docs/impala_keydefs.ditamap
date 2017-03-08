@@ -22,8 +22,8 @@ under the License.
   <title>Apache Impala (incubating) Key Definitions</title>
 
 <!-- Definitions for substitution variables, particularly for upstream/downstream differences in terminology and versioning. -->
-  <keydef keys="hadoop_distro"><topicmeta><keywords><keyword>CDH</keyword></keywords></topicmeta></keydef>
-  <keydef keys="support_org"><topicmeta><keywords><keyword>Cloudera Support</keyword></keywords></topicmeta></keydef>
+  <keydef keys="hadoop_distro"><topicmeta><keywords><keyword>Apache Hadoop</keyword></keywords></topicmeta></keydef>
+  <keydef keys="support_org"><topicmeta><keywords><keyword>the appropriate support channel</keyword></keywords></topicmeta></keydef>
 
 <!-- URLs used in external links. Many, perhaps most, to be turned into keydefs to genericize and optionally re-point. -->
 
@@ -32,6 +32,18 @@ under the License.
     <topicmeta><linktext></linktext></topicmeta>
   </keydef>
 -->
+
+  <keydef href="https://web.mit.edu/kerberos/krb5-latest/doc/admin/install_kdc.html" scope="external" format="html" keys="mit_install_kdc">
+    <topicmeta><linktext>Kerberos Key Distribution Center (KDC)</linktext></topicmeta>
+  </keydef>
+
+  <keydef href="https://web.mit.edu/kerberos/krb5-latest/doc/index.html" scope="external" format="html" keys="mit_kerberos_docs">
+    <topicmeta><linktext>MIT Kerberos documentation</linktext></topicmeta>
+  </keydef>
+
+  <keydef href="https://hadoop.apache.org/docs/stable/hadoop-project-dist/hadoop-common/SecureMode.html#Authentication" scope="external" format="html" keys="upstream_hadoop_authentication">
+    <topicmeta><linktext>Authentication in Hadoop</linktext></topicmeta>
+  </keydef>
 
   <keydef keys="upstream_hbase_docs" href="https://hbase.apache.org/book.html" scope="external" format="html">
     <topicmeta><linktext>the Apache HBase documentation</linktext></topicmeta>
@@ -10329,7 +10341,7 @@ https://issues.cloudera.org/secure/IssueNavigator.jspa?reset=true&amp;jqlQuery=p
   <keydef href="topics/impala_admin.xml" keys="admin"/>
   <keydef href="topics/impala_admission.xml" keys="admission_control"/>
   <keydef href="topics/impala_resource_management.xml" keys="resource_management"/>
-  <keydef href="topics/impala_howto_rm.xml" keys="howto_impala_rm"/>
+<!--<keydef href="topics/impala_howto_rm.xml" keys="howto_impala_rm"/>-->
   <keydef href="topics/impala_timeouts.xml" keys="timeouts"/>
   <keydef href="topics/impala_proxy.xml" keys="proxy"/>
   <keydef href="topics/impala_disk_space.xml" keys="disk_space"/>

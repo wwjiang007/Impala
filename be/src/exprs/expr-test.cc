@@ -403,42 +403,55 @@ class ExprTest : public testing::Test {
         "1970-01-01 00:00:00");
   }
 
-  // Verify that 'expr' has the same precision and scale as 'expected_type'.
-  void TestDecimalResultType(const string& expr, const ColumnType& expected_type) {
-    const string typeof_expr = "typeof(" + expr + ")";
-    const string typeof_result = GetValue(typeof_expr, TYPE_STRING);
-    EXPECT_EQ(expected_type.DebugString(), typeof_result) << typeof_expr;
+  // Verify that output of 'query' has the same precision and scale as 'expected_type'.
+  // 'query' is an expression, optionally followed by a from clause which is needed
+  // for testing aggregate expressions.
+  void TestDecimalResultType(const string& query, const ColumnType& expected_type) {
+    // For the case with from clause, we need to generate the "typeof query" by first
+    // extracting the select list.
+    size_t from_offset = query.find("from");
+    string typeof_query;
+    if (from_offset != string::npos) {
+      int query_len = query.length();
+      typeof_query = "typeof(" + query.substr(0, from_offset) + ")" +
+          query.substr(from_offset, query_len - from_offset);
+    } else {
+      typeof_query = "typeof(" + query + ")";
+    }
+    const string typeof_result = GetValue(typeof_query, TYPE_STRING);
+    EXPECT_EQ(expected_type.DebugString(), typeof_result) << typeof_query;
   }
 
   // Decimals don't work with TestValue.
   // TODO: figure out what operators need to be implemented to work with EXPECT_EQ
   template<typename T>
-  void TestDecimalValue(const string& expr, const T& expected_result,
+  void TestDecimalValue(const string& query, const T& expected_result,
       const ColumnType& expected_type) {
     // Verify precision and scale of the expression match the expected type.
-    TestDecimalResultType(expr, expected_type);
+    TestDecimalResultType(query, expected_type);
     // Verify the expression result matches the expected result, for the given the
     // precision and scale.
-    const string value = GetValue(expr, expected_type);
+    const string value = GetValue(query, expected_type);
     StringParser::ParseResult result;
     // These require that we've passed the correct type to StringToDecimal(), so these
     // results are valid only when TestDecimalResultType() succeeded.
     switch (expected_type.GetByteSize()) {
       case 4:
         EXPECT_EQ(expected_result.value(), StringParser::StringToDecimal<int32_t>(
-            &value[0], value.size(), expected_type, &result).value()) << expr;
+            &value[0], value.size(), expected_type, &result).value()) << query;
         break;
       case 8:
         EXPECT_EQ(expected_result.value(), StringParser::StringToDecimal<int64_t>(
-            &value[0], value.size(), expected_type, &result).value()) << expr;
+            &value[0], value.size(), expected_type, &result).value()) << query;
         break;
       case 16:
         EXPECT_EQ(expected_result.value(), StringParser::StringToDecimal<int128_t>(
-            &value[0], value.size(), expected_type, &result).value()) << expr;
+            &value[0], value.size(), expected_type, &result).value()) << query;
         break;
       default:
         EXPECT_TRUE(false) << expected_type << " " << expected_type.GetByteSize();
     }
+    EXPECT_EQ(result, StringParser::PARSE_SUCCESS);
   }
 
   template <class T> void TestValue(const string& expr, const ColumnType& expr_type,
@@ -1374,11 +1387,380 @@ DecimalTestCase decimal_cases[] = {
        10000000000ll * 10000000000ll * 10000000000ll, 38, 6 }}},
   { "cast(98765432109876543210 as decimal(20,0)) / "
     "cast(98765432109876543211 as decimal(20,0))",
-    {{ false,                  0, 38,  0 },
-     { false, 999999999999999999, 38, 18 }}},
+    {{ false,                   0, 38,  0 },
+     { false, 1000000000000000000, 38, 18 }}},
   { "cast(111111.1111 as decimal(20, 10)) / cast(.7777 as decimal(38, 38))",
     {{ true,             0, 38, 38 },
-     { false, 142871429985, 38,  6 }}},
+     { false, 142871429986, 38,  6 }}},
+  { "2.0 / 3.0",
+    {{ false,   6666, 6, 4},
+     { false, 666667, 8, 6}}},
+  { "-2.0 / 3.0",
+    {{ false,   -6666, 6, 4},
+     { false, -666667, 8, 6}}},
+  { "2.0 / -3.0",
+    {{ false,   -6666, 6, 4},
+     { false, -666667, 8, 6}}},
+  { "-2.0 / -3.0",
+    {{ false,   6666, 6, 4},
+     { false, 666667, 8, 6}}},
+  // Test divide rounding
+  { "10.10 / 3.0",
+    {{ false, 336666, 8, 5 },
+     { false, 3366667, 9, 6 }}},
+  { "cast(-10.10 as decimal(4,2)) / 3.0", // XXX JIRA: IMPALA-4877
+    {{ false, -336666, 8, 5 },
+     { false, -3366667, 9, 6 }}},
+  { "10.10 / 20.3",
+    {{ false, 497536, 9, 6 },
+     { false, 497537, 9, 6 }}},
+  { "10.10 / -20.3",
+    {{ false, -497536, 9, 6 },
+     { false, -497537, 9, 6 }}},
+  // N.B. - Google and python both insist that 999999.998 / 999 is 1001.000999
+  // However, multiplying the result back, 999 * 1001.000998999 gives the
+  // original value exactly, while their answer does not, 999 * 10001.000999 =
+  // 999999.998001. The same issue comes up many times during the following
+  // computations.  Division is hard, let's go shopping.
+  { "cast(999999.998 as decimal(9,3)) / 999",
+    {{ false, 1001000998998, 15, 9 },
+     { false, 1001000998999, 15, 9 }}},
+  { "cast(999.999998 as decimal(9,3)) / 999",
+    {{ false, 1001000000, 15, 9 },
+     { false, 1001001001, 15, 9 }}},
+  { "cast(999.999998 as decimal(9,6)) / 999",
+    {{ false, 1001000998998, 15, 12 },
+     { false, 1001000998999, 15, 12 }}},
+  { "cast(0.999999998 as decimal(9,6)) / 999",
+    {{ false, 1001000000, 15, 12 },
+     { false, 1001001001, 15, 12 }}},
+  { "cast(0.999999998 as decimal(9,9)) / 999",
+    {{ false, 1001000998998, 15, 15 },
+     { false, 1001000998999, 15, 15 }}},
+  { "cast(-999999.998 as decimal(9,3)) / 999",
+    {{ false, -1001000998998, 15, 9 },
+     { false, -1001000998999, 15, 9 }}},
+  { "cast(-999.999998 as decimal(9,3)) / 999",
+    {{ false, -1001000000, 15, 9 },
+     { false, -1001001001, 15, 9 }}},
+  { "cast(-999.999998 as decimal(9,6)) / 999",
+    {{ false, -1001000998998, 15, 12 },
+     { false, -1001000998999, 15, 12 }}},
+  { "cast(-0.999999998 as decimal(9,6)) / 999",
+    {{ false, -1001000000, 15, 12 },
+     { false, -1001001001, 15, 12 }}},
+  { "cast(-0.999999998 as decimal(9,9)) / 999",
+    {{ false, -1001000998998, 15, 15 },
+     { false, -1001000998999, 15, 15 }}},
+  { "cast(-999999.998 as decimal(9,3)) / -999",
+    {{ false, 1001000998998, 15, 9 },
+     { false, 1001000998999, 15, 9 }}},
+  { "cast(-999.999998 as decimal(9,3)) / -999",
+    {{ false, 1001000000, 15, 9 },
+     { false, 1001001001, 15, 9 }}},
+  { "cast(-999.999998 as decimal(9,6)) / -999",
+    {{ false, 1001000998998, 15, 12 },
+     { false, 1001000998999, 15, 12 }}},
+  { "cast(-0.999999998 as decimal(9,6)) / -999",
+    {{ false, 1001000000, 15, 12 },
+     { false, 1001001001, 15, 12 }}},
+  { "cast(-0.999999998 as decimal(9,9)) / -999",
+    {{ false, 1001000998998, 15, 15 },
+     { false, 1001000998999, 15, 15 }}},
+  { "cast(999999.998 as decimal(9,3)) / -999",
+    {{ false, -1001000998998, 15, 9 },
+     { false, -1001000998999, 15, 9 }}},
+  { "cast(999.999998 as decimal(9,3)) / -999",
+    {{ false, -1001000000, 15, 9 },
+     { false, -1001001001, 15, 9 }}},
+  { "cast(999.999998 as decimal(9,6)) / -999",
+    {{ false, -1001000998998, 15, 12 },
+     { false, -1001000998999, 15, 12 }}},
+  { "cast(0.999999998 as decimal(9,6)) / -999",
+    {{ false, -1001000000, 15, 12 },
+     { false, -1001001001, 15, 12 }}},
+  { "cast(0.999999998 as decimal(9,9)) / -999",
+    {{ false, -1001000998998, 15, 15 },
+     { false, -1001000998999, 15, 15 }}},
+  { "cast(999.999998 as decimal(9,3)) / 999999999",
+    {{ false, 99999900, 20, 14 },
+     { false, 100000000, 20, 14 }}},
+  { "cast(999.999998 as decimal(9,6)) / 999999999",
+    {{ false, 99999999899, 20, 17 },
+     { false, 99999999900, 20, 17 }}},
+  { "cast(0.999999998 as decimal(9,6)) / 999999999",
+    {{ false, 99999900, 20, 17 },
+     { false, 100000000, 20, 17 }}},
+  { "cast(0.999999998 as decimal(9,9)) / 999999999",
+    {{ false, 99999999899, 20, 20 },
+     { false, 99999999900, 20, 20 }}},
+  { "cast(-999999.998 as decimal(9,3)) / 999999999",
+    {{ false, -99999999899, 20, 14 },
+     { false, -99999999900, 20, 14 }}},
+  { "cast(-999.999998 as decimal(9,3)) / 999999999",
+    {{ false, -99999900, 20, 14 },
+     { false, -100000000, 20, 14 }}},
+  { "cast(-999.999998 as decimal(9,6)) / 999999999",
+    {{ false, -99999999899, 20, 17 },
+     { false, -99999999900, 20, 17 }}},
+  { "cast(-0.999999998 as decimal(9,6)) / 999999999",
+    {{ false, -99999900, 20, 17 },
+     { false, -100000000, 20, 17 }}},
+  { "cast(-0.999999998 as decimal(9,9)) / 999999999",
+    {{ false, -99999999899, 20, 20 },
+     { false, -99999999900, 20, 20 }}},
+  { "cast(-999999.998 as decimal(9,3)) / 999999999",
+    {{ false, -99999999899, 20, 14 },
+     { false, -99999999900, 20, 14 }}},
+  { "cast(-999.999998 as decimal(9,3)) / 999999999",
+    {{ false, -99999900, 20, 14 },
+     { false, -100000000, 20, 14 }}},
+  { "cast(-999.999998 as decimal(9,6)) / 999999999",
+    {{ false, -99999999899, 20, 17 },
+     { false, -99999999900, 20, 17 }}},
+  { "cast(-0.999999998 as decimal(9,6)) / 999999999",
+    {{ false, -99999900, 20, 17 },
+     { false, -100000000, 20, 17 }}},
+  { "cast(-0.999999998 as decimal(9,9)) / 999999999",
+    {{ false, -99999999899, 20, 20 },
+     { false, -99999999900, 20, 20 }}},
+  { "cast(999999.998 as decimal(9,3)) / -999999999",
+    {{ false, -99999999899, 20, 14 },
+     { false, -99999999900, 20, 14 }}},
+  { "cast(999.999998 as decimal(9,3)) / -999999999",
+    {{ false, -99999900, 20, 14 },
+     { false, -100000000, 20, 14 }}},
+  { "cast(999.999998 as decimal(9,6)) / -999999999",
+    {{ false, -99999999899, 20, 17 },
+     { false, -99999999900, 20, 17 }}},
+  { "cast(0.999999998 as decimal(9,6)) / -999999999",
+    {{ false, -99999900, 20, 17 },
+     { false, -100000000, 20, 17 }}},
+  { "cast(0.999999998 as decimal(9,9)) / -999999999",
+    {{ false, -99999999899, 20, 20 },
+     { false, -99999999900, 20, 20 }}},
+  { "17014118346046923173168730371588.410/17014118346046923173168730371588.410",
+    {{ false, 1000, 38, 3 },
+     { false, 1000000, 38, 6 }}},
+  { "17014118346046923173168730371588.410/17014118346046923173168730371588.409",
+    {{ false, 1000, 38, 3 },
+     { false, 1000000, 38, 6 }}},
+  { "17014118346046923173168730371588.410/34028236692093846346337460743176820000",
+    {{ false, 0, 38, 3 },
+     { false, 1, 38, 6 }}},
+  { "17014118346046923173168730371588.410/34028236692093846346337460743176820001",
+    {{ false, 0, 38, 3 },
+     { false, 0, 38, 6 }}},
+  { "17014118346046923173168730371588.410/51042355038140769519506191114765230000",
+    {{ false, 0, 38, 3 },
+     { false, 0, 38, 6 }}},
+  { "17014118346046923173168730371588.410/10208471007628153903901238222953046343",
+    {{ false, 0, 38, 3 },
+     { false, 2, 38, 6 }}},
+  { "170141183460469231731687303715884.10/34028236692093846346337460743176820000",
+    {{ false, 0, 38, 2 },
+     { false, 5, 38, 6 }}},
+  { "170141183460469231731687303715884.10/34028236692093846346337460743176820001",
+    {{ false, 0, 38, 2 },
+     { false, 5, 38, 6 }}},
+  { "170141183460469231731687303715884.10/51042355038140769519506191114765230000",
+    {{ false, 0, 38, 2 },
+     { false, 3, 38, 6 }}},
+  { "170141183460469231731687303715884.10/10208471007628153903901238222953046343",
+    {{ false, 0, 38, 2 },
+     { false, 17, 38, 6 }}},
+  { "1701411834604692317316873037158841.0/34028236692093846346337460743176820000",
+    {{ false, 0, 38, 1 },
+     { false, 50, 38, 6 }}},
+  { "1701411834604692317316873037158841.0/34028236692093846346337460743176820001",
+    {{ false, 0, 38, 1 },
+     { false, 50, 38, 6 }}},
+  { "1701411834604692317316873037158841.0/51042355038140769519506191114765229999",
+    {{ false, 0, 38, 1 },
+     { false, 33, 38, 6 }}},
+  { "1701411834604692317316873037158841.0/10208471007628153903901238222953046343",
+    {{ false, 0, 38, 1 },
+     { false, 167, 38, 6 }}},
+  { "17014118346046923173168730371588410/34028236692093846346337460743176820000",
+    {{ false, 0, 38, 0 },
+     { false, 500, 38, 6 }}},
+  { "17014118346046923173168730371588410/34028236692093846346337460743176820001",
+    {{ false, 0, 38, 0 },
+     { false, 500, 38, 6 }}},
+  { "17014118346046923173168730371588410/51042355038140769519506191114765229999",
+    {{ false, 0, 38, 0 },
+     { false, 333, 38, 6 }}},
+  { "17014118346046923173168730371588410/10208471007628153903901238222953046343",
+    {{ false, 0, 38, 0 },
+     { false, 1667, 38, 6 }}},
+  { "17014118346046923173168730371588410/3402823669209384634633746074317682000.0",
+    {{ false, 0, 38, 1 },
+     { false, 5000, 38, 6 }}},
+  { "17014118346046923173168730371588410/3402823669209384634633746074317682000.1",
+    {{ false, 0, 38, 1 },
+     { false, 5000, 38, 6 }}},
+  { "17014118346046923173168730371588410/5104235503814076951950619111476522999.9",
+    {{ false, 0, 38, 1 },
+     { false, 3333, 38, 6 }}},
+  { "17014118346046923173168730371588410/1020847100762815390390123822295304634.3",
+    {{ false, 0, 38, 1 },
+     { false, 16667, 38, 6 }}},
+  { "15014118346046923173168730371588.410/34028236692093846346337460743176820000",
+    {{ false, 0, 38, 3 },
+     { false, 0, 38, 6 }}},
+  { "150141183460469231731687303715884.10/34028236692093846346337460743176820000",
+    {{ false, 0, 38, 2 },
+     { false, 4, 38, 6 }}},
+  { "1501411834604692317316873037158841.0/34028236692093846346337460743176820000",
+    {{ false, 0, 38, 1 },
+     { false, 44, 38, 6 }}},
+  { "15014118346046923173168730371588410/34028236692093846346337460743176820000",
+    {{ false, 0, 38, 0 },
+     { false, 441, 38, 6 }}},
+  { "16014118346046923173168730371588.410/34028236692093846346337460743176820000",
+    {{ false, 0, 38, 3 },
+     { false, 0, 38, 6 }}},
+  { "160141183460469231731687303715884.10/34028236692093846346337460743176820000",
+    {{ false, 0, 38, 2 },
+     { false, 5, 38, 6 }}},
+  { "1601411834604692317316873037158841.0/34028236692093846346337460743176820000",
+    {{ false, 0, 38, 1 },
+     { false, 47, 38, 6 }}},
+  { "16014118346046923173168730371588410/34028236692093846346337460743176820000",
+    {{ false, 0, 38, 0 },
+     { false, 471, 38, 6 }}},
+  { "16014118346046923173168730371588410/3402823669209384634633746074317682000",
+    {{ false, 0, 38, 0 },
+     { false, 4706, 38, 6 }}},
+  { "18014118346046923173168730371588.410/34028236692093846346337460743176820000",
+    {{ false, 0, 38, 3 },
+     { false, 1, 38, 6 }}},
+  { "180141183460469231731687303715884.10/34028236692093846346337460743176820000",
+    {{ false, 0, 38, 2 },
+     { false, 5, 38, 6 }}},
+  { "1801411834604692317316873037158841.0/34028236692093846346337460743176820000",
+    {{ false, 0, 38, 1 },
+     { false, 53, 38, 6 }}},
+  { "18014118346046923173168730371588410/34028236692093846346337460743176820000",
+    {{ false, 0, 38, 0 },
+     { false, 529, 38, 6 }}},
+  { "18014118346046923173168730371588410/3402823669209384634633746074317682000",
+    {{ false, 0, 38, 0 },
+     { false, 5294, 38, 6 }}},
+  { "18014118346046923173168730371588410/340282366920938463463374607431768200",
+    {{ false, 0, 38, 0 },
+     { false, 52939, 38, 6 }}},
+  { "17014118346046923173168730371588.410/-17014118346046923173168730371588.410",
+    {{ false, -1000, 38, 3 },
+     { false, -1000000, 38, 6 }}},
+  { "17014118346046923173168730371588.410/-17014118346046923173168730371588.409",
+    {{ false, -1000, 38, 3 },
+     { false, -1000000, 38, 6 }}},
+  { "17014118346046923173168730371588.410/-34028236692093846346337460743176820000",
+    {{ false, 0, 38, 3 },
+     { false, -1, 38, 6 }}},
+  { "17014118346046923173168730371588.410/-34028236692093846346337460743176820001",
+    {{ false, 0, 38, 3 },
+     { false, 0, 38, 6 }}},
+  { "17014118346046923173168730371588.410/-51042355038140769519506191114765230000",
+    {{ false, 0, 38, 3 },
+     { false, 0, 38, 6 }}},
+  { "17014118346046923173168730371588.410/-10208471007628153903901238222953046343",
+    {{ false, 0, 38, 3 },
+     { false, -2, 38, 6 }}},
+  { "170141183460469231731687303715884.10/-34028236692093846346337460743176820000",
+    {{ false, 0, 38, 2 },
+     { false, -5, 38, 6 }}},
+  { "170141183460469231731687303715884.10/-34028236692093846346337460743176820001",
+    {{ false, 0, 38, 2 },
+     { false, -5, 38, 6 }}},
+  { "170141183460469231731687303715884.10/-51042355038140769519506191114765230000",
+    {{ false, 0, 38, 2 },
+     { false, -3, 38, 6 }}},
+  { "170141183460469231731687303715884.10/-10208471007628153903901238222953046343",
+    {{ false, 0, 38, 2 },
+     { false, -17, 38, 6 }}},
+  { "1701411834604692317316873037158841.0/-34028236692093846346337460743176820000",
+    {{ false, 0, 38, 1 },
+     { false, -50, 38, 6 }}},
+  { "1701411834604692317316873037158841.0/-34028236692093846346337460743176820001",
+    {{ false, 0, 38, 1 },
+     { false, -50, 38, 6 }}},
+  { "1701411834604692317316873037158841.0/-51042355038140769519506191114765229999",
+    {{ false, 0, 38, 1 },
+     { false, -33, 38, 6 }}},
+  { "1701411834604692317316873037158841.0/-10208471007628153903901238222953046343",
+    {{ false, 0, 38, 1 },
+     { false, -167, 38, 6 }}},
+  { "17014118346046923173168730371588410/-34028236692093846346337460743176820000",
+    {{ false, 0, 38, 0 },
+     { false, -500, 38, 6 }}},
+  { "17014118346046923173168730371588410/-34028236692093846346337460743176820001",
+    {{ false, 0, 38, 0 },
+     { false, -500, 38, 6 }}},
+  { "17014118346046923173168730371588410/-51042355038140769519506191114765229999",
+    {{ false, 0, 38, 0 },
+     { false, -333, 38, 6 }}},
+  { "17014118346046923173168730371588410/-10208471007628153903901238222953046343",
+    {{ false, 0, 38, 0 },
+     { false, -1667, 38, 6 }}},
+  { "17014118346046923173168730371588410/-3402823669209384634633746074317682000.0",
+    {{ false, 0, 38, 1 },
+     { false, -5000, 38, 6 }}},
+  { "17014118346046923173168730371588410/-3402823669209384634633746074317682000.1",
+    {{ false, 0, 38, 1 },
+     { false, -5000, 38, 6 }}},
+  { "17014118346046923173168730371588410/-5104235503814076951950619111476522999.9",
+    {{ false, 0, 38, 1 },
+     { false, -3333, 38, 6 }}},
+  { "17014118346046923173168730371588410/-1020847100762815390390123822295304634.3",
+    {{ false, 0, 38, 1 },
+     { false, -16667, 38, 6 }}},
+  { "15014118346046923173168730371588.410/-34028236692093846346337460743176820000",
+    {{ false, 0, 38, 3 },
+     { false, 0, 38, 6 }}},
+  { "150141183460469231731687303715884.10/-34028236692093846346337460743176820000",
+    {{ false, 0, 38, 2 },
+     { false, -4, 38, 6 }}},
+  { "1501411834604692317316873037158841.0/-34028236692093846346337460743176820000",
+    {{ false, 0, 38, 1 },
+     { false, -44, 38, 6 }}},
+  { "15014118346046923173168730371588410/-34028236692093846346337460743176820000",
+    {{ false, 0, 38, 0 },
+     { false, -441, 38, 6 }}},
+  { "16014118346046923173168730371588.410/-34028236692093846346337460743176820000",
+    {{ false, 0, 38, 3 },
+     { false, 0, 38, 6 }}},
+  { "160141183460469231731687303715884.10/-34028236692093846346337460743176820000",
+    {{ false, 0, 38, 2 },
+     { false, -5, 38, 6 }}},
+  { "1601411834604692317316873037158841.0/-34028236692093846346337460743176820000",
+    {{ false, 0, 38, 1 },
+     { false, -47, 38, 6 }}},
+  { "16014118346046923173168730371588410/-34028236692093846346337460743176820000",
+    {{ false, 0, 38, 0 },
+     { false, -471, 38, 6 }}},
+  { "16014118346046923173168730371588410/-3402823669209384634633746074317682000",
+    {{ false, 0, 38, 0 },
+     { false, -4706, 38, 6 }}},
+  { "18014118346046923173168730371588.410/-34028236692093846346337460743176820000",
+    {{ false, 0, 38, 3 },
+     { false, -1, 38, 6 }}},
+  { "180141183460469231731687303715884.10/-34028236692093846346337460743176820000",
+    {{ false, 0, 38, 2 },
+     { false, -5, 38, 6 }}},
+  { "1801411834604692317316873037158841.0/-34028236692093846346337460743176820000",
+    {{ false, 0, 38, 1 },
+     { false, -53, 38, 6 }}},
+  { "18014118346046923173168730371588410/-34028236692093846346337460743176820000",
+    {{ false, 0, 38, 0 },
+     { false, -529, 38, 6 }}},
+  { "18014118346046923173168730371588410/-3402823669209384634633746074317682000",
+    {{ false, 0, 38, 0 },
+     { false, -5294, 38, 6 }}},
+  { "18014118346046923173168730371588410/-340282366920938463463374607431768200",
+    {{ false, 0, 38, 0 },
+     { false, -52939, 38, 6 }}},
   // Test modulo operator
   { "cast(1.23 as decimal(8,2)) % cast(1 as decimal(10,3))", {{ false, 230, 9, 3 }}},
   { "cast(1 as decimal(38,0)) % cast(.2 as decimal(38,1))", {{ false, 0, 38, 1 }}},
@@ -1390,8 +1772,12 @@ DecimalTestCase decimal_cases[] = {
   { "cast(99999999999999999999999999999999999999 as decimal(38,0)) % "
     "cast(99999999999999999999999999999999999999 as decimal(38,0))",
     {{ false, 0, 38, 0 }}},
-  { "cast(998 as decimal(38,0)) % cast(0.999 as decimal(38,38))", {{ false, 0, 38, 38 }}},
-  { "cast(0.998 as decimal(38,38)) % cast(999 as decimal(38,0))", {{ false, 0, 38, 38 }}},
+  { "cast(998 as decimal(38,0)) % cast(0.999 as decimal(38,38))",
+    {{ true, 0, 38, 38 },   // IMPALA-4964 - this should not overflow
+     { true, 0, 38, 38 }}},
+  { "cast(0.998 as decimal(38,38)) % cast(999 as decimal(38,0))",
+    {{ true, 0, 38, 38 },   // IMPALA-4964 - this should not overflow
+     { true, 0, 38, 38 }}},
   { "cast(0.00000000000000000000000000000000000001 as decimal(38,38)) % "
     "cast(0.0000000000000000000000000000000000001 as decimal(38,38))",
     {{ false, 1, 38, 38 }}},
@@ -1435,7 +1821,235 @@ DecimalTestCase decimal_cases[] = {
   // The overload greatest(decimal(*,*)) is available and should be used.
   { "greatest(0, cast('99999.1111' as decimal(30,10)))",
     {{ false, 999991111000000, 30, 10 },
-     { false, 999991111000000, 30, 10 }}}
+     { false, 999991111000000, 30, 10 }}},
+  // Test AVG() with DECIMAL
+  { "avg(d) from (values((cast(100000000000000000000000000000000.00000 as DECIMAL(38,5)) "
+    "as d))) as t",
+    {{ false, static_cast<int128_t>(10000000ll) *
+       10000000000ll * 10000000000ll * 10000000000ll, 38, 5 },
+     { true, 0, 38, 6}}},
+  { "avg(d) from (values((cast(1234567890 as DECIMAL(10,0)) as d))) as t",
+    {{false, 1234567890, 10, 0},
+     {false, 1234567890000000, 16, 6}}},
+  { "avg(d) from (values((cast(1234567.89 as DECIMAL(10,2)) as d))) as t",
+    {{false, 123456789, 10, 2},
+     {false, 1234567890000, 14, 6}}},
+  { "avg(d) from (values((cast(10000000000000000000000000000000 as DECIMAL(32,0)) "
+    "as d))) as t",
+    {{false, static_cast<int128_t>(10) *
+      10000000000ll * 10000000000ll * 10000000000ll, 32, 0},
+     {false, static_cast<int128_t>(10000000) *
+      10000000000ll * 10000000000ll * 10000000000ll, 38, 6}}},
+  { "avg(d) from (values((cast(100000000000000000000000000000000 as DECIMAL(33,0)) "
+    "as d))) as t",
+    {{false, static_cast<int128_t>(100) *
+      10000000000ll * 10000000000ll * 10000000000ll, 33, 0},
+     {true, 0, 38, 6}}},
+  { "avg(d) from (values((cast(100000000000000000000000000000000.0 as DECIMAL(34,1)) "
+    "as d))) as t",
+    {{false, static_cast<int128_t>(1000) *
+      10000000000ll * 10000000000ll * 10000000000ll, 34, 1},
+     {true, 0, 38, 6}}},
+  { "avg(d) from (values((cast(100000000000000000000000000000000.00000 as DECIMAL(38,5)) "
+    "as d))) as t",
+    {{false, static_cast<int128_t>(10000000) *
+      10000000000ll * 10000000000ll * 10000000000ll, 38, 5},
+     {true, 0, 38, 6}}},
+  { "avg(d) from (values((cast(10000000000000000000000000000000.000000 as DECIMAL(38,6)) "
+    "as d))) as t",
+    {{false, static_cast<int128_t>(10000000) *
+      10000000000ll * 10000000000ll * 10000000000ll, 38, 6}}},
+  { "avg(d) from (values((cast(0.10000000000000000000000000000000000000 as DECIMAL(38,38)) "
+    "as d))) as t",
+    {{false, static_cast<int128_t>(10000000) *
+      10000000000ll * 10000000000ll * 10000000000ll, 38, 38}}},
+  // Test CAST DECIMAL -> INT
+  { "cast(cast(0.5999999 AS tinyint) AS decimal(10,6))",
+    {{ false, 0, 10, 6 },
+     { false, 1000000, 10, 6 }}},
+  { "cast(cast(99999999.4999999 AS int) AS decimal(10,2))",
+    {{ false, 9999999900, 10, 2 }}},
+  { "cast(cast(99999999.5999999 AS int) AS decimal(10,2))",
+    {{ false, 9999999900, 10, 2 },
+     { true, 0, 10, 2 }}},
+  { "cast(cast(10000.5999999 as int) as decimal(30,6))",
+    {{ false, 10000000000, 30, 6 },
+     { false, 10001000000, 30, 6 }}},
+  { "cast(cast(10000.5 AS int) AS decimal(6,1))",
+    {{ false, 100000, 6, 1 },
+     { false, 100010, 6, 1 }}},
+  { "cast(cast(-10000.5 AS int) AS decimal(6,1))",
+    {{ false, -100000, 6, 1 },
+     { false, -100010, 6, 1 }}},
+  { "cast(cast(9999.5 AS int) AS decimal(4,0))",
+    {{ false, 9999, 4, 0 },
+     { true, 0, 4, 0 }}},
+  { "cast(cast(-9999.5 AS int) AS decimal(4,0))",
+    {{ false, -9999, 4, 0 },
+     { true, 0, 4, 0 }}},
+  { "cast(cast(127.4999 AS tinyint) AS decimal(30,0))",
+    {{ false, 127, 30, 0 }}},
+  { "cast(cast(127.5 AS tinyint) AS decimal(30,0))",
+    {{ false, 127, 30, 0 },
+     { true, 0, 30, 0 }}},
+  { "cast(cast(128.0 AS tinyint) AS decimal(30,0))",
+    {{ false, -128, 30, 0 }, // BUG: JIRA: IMPALA-865
+     { true, 0, 30, 0 }}},
+  { "cast(cast(-128.4999 AS tinyint) AS decimal(30,0))",
+    {{ false, -128, 30, 0 }}},
+  { "cast(cast(-128.5 AS tinyint) AS decimal(30,0))",
+    {{ false, -128, 30, 0 },
+     { true, 0, 30, 0 }}},
+  { "cast(cast(-129.0 AS tinyint) AS decimal(30,0))",
+    {{ false, 127, 30, 0 }, // BUG: JIRA: IMPALA-865
+     { true, 0, 30, 0 }}},
+  { "cast(cast(32767.4999 AS smallint) AS decimal(30,0))",
+    {{ false, 32767, 30, 0 }}},
+  { "cast(cast(32767.5 AS smallint) AS decimal(30,0))",
+    {{ false, 32767, 30, 0 },
+     { true, 0, 30, 0 }}},
+  { "cast(cast(32768.0 AS smallint) AS decimal(30,0))",
+    {{ false, -32768, 30, 0 }, // BUG: JIRA: IMPALA-865
+     { true, 0, 30, 0 }}},
+  { "cast(cast(-32768.4999 AS smallint) AS decimal(30,0))",
+    {{ false, -32768, 30, 0 }}},
+  { "cast(cast(-32768.5 AS smallint) AS decimal(30,0))",
+    {{ false, -32768, 30, 0 },
+     { true, 0, 30, 0 }}},
+  { "cast(cast(-32769.0 AS smallint) AS decimal(30,0))",
+    {{ false, 32767, 30, 0 }, // BUG: JIRA: IMPALA-865
+     { true, 0, 30, 0 }}},
+  { "cast(cast(2147483647.4999 AS int) AS decimal(30,0))",
+    {{ false, 2147483647, 30, 0 }}},
+  { "cast(cast(2147483647.5 AS int) AS decimal(30,0))",
+    {{ false, 2147483647, 30, 0 },
+     { true, 0, 30, 0 }}},
+  { "cast(cast(2147483648.0 AS int) AS decimal(30,0))",
+    {{ false, -2147483648, 30, 0 }, // BUG: JIRA: IMPALA-865
+     { true, 0, 30, 0 }}},
+  { "cast(cast(-2147483648.4999 AS int) AS decimal(30,0))",
+    {{ false, -2147483648, 30, 0 }}},
+  { "cast(cast(-2147483648.5 AS int) AS decimal(30,0))",
+    {{ false, -2147483648, 30, 0 },
+     { true, 0, 30, 0 }}},
+  { "cast(cast(-2147483649.0 AS int) AS decimal(30,0))",
+    {{ false, 2147483647, 30, 0 }, // BUG: JIRA: IMPALA-865
+     { true, 0, 30, 0 }}},
+  { "cast(cast(9223372036854775807.4999 AS bigint) AS decimal(30,0))",
+    {{ false, 9223372036854775807, 30, 0 }}},
+  { "cast(cast(9223372036854775807.5 AS bigint) AS decimal(30,0))",
+    {{ false, 9223372036854775807, 30, 0 },
+     { true, 0, 30, 0 }}},
+  { "cast(cast(9223372036854775808.0 AS bigint) AS decimal(30,0))",
+    {{ false, -9223372036854775807 - 1, 30, 0 }, // BUG; also GCC workaround with -1
+     // error: integer constant is so large that it is unsigned
+     { true, 0, 30, 0 }}},
+  { "cast(cast(-9223372036854775808.4999 AS bigint) AS decimal(30,0))",
+    {{ false, -9223372036854775807 - 1, 30, 0 }}},
+  { "cast(cast(-9223372036854775808.5 AS bigint) AS decimal(30,0))",
+    {{ false, -9223372036854775807 - 1, 30, 0 },
+     { true, 0, 30, 0 }}},
+  { "cast(cast(-9223372036854775809.0 AS bigint) AS decimal(30,0))",
+    {{ false, 9223372036854775807, 30, 0 }, // BUG: JIRA: IMPALA-865
+     { true, 0, 30, 0 }}},
+  { "cast(cast(cast(pow(1, -38) as decimal(38,38)) as bigint) as decimal(18,10))",
+    {{ false, 0, 18, 10 },
+     { false, 10000000000, 18, 10 }}},
+  { "cast(cast(cast(-pow(1, -38) as decimal(38,38)) as bigint) as decimal(18,10))",
+    {{ false, 0, 18, 10 },
+     { false, -10000000000, 18, 10 }}},
+  // Test CAST FLOAT -> DECIMAL
+  { "cast(cast(power(10, 3) - power(10, -1) as float) as decimal(4,1))",
+    {{ false, 9999, 4, 1 }}},
+  { "cast(cast(power(10, 3) - power(10, -2) as float) as decimal(5,1))",
+    {{ false, 9999, 5, 1 },
+     { false, 10000, 5, 1 }}},
+  { "cast(cast(power(10, 3) - power(10, -2) as float) as decimal(4,1))",
+    {{ false, 9999, 4, 1 },
+     { true, 0, 4, 1 }}},
+  { "cast(cast(-power(10, 3) + power(10, -1) as float) as decimal(4,1))",
+    {{ false, -9999, 4, 1 }}},
+  { "cast(cast(-power(10, 3) + power(10, -2) as float) as decimal(5,1))",
+    {{ false, -9999, 5, 1 },
+     { false, -10000, 5, 1 }}},
+  { "cast(cast(-power(10, 3) + power(10, -2) as float) as decimal(4,1))",
+    {{ false, -9999, 4, 1 },
+     { true, 0, 4, 1 }}},
+  { "cast(cast(power(10, 3) - 0.45 as double) as decimal(4,1))",
+    {{ false, 9995, 4, 1 },
+     { false, 9996, 4, 1 }}},
+  { "cast(cast(power(10, 3) - 0.45 as double) as decimal(5,2))",
+    {{ false, 99955, 5, 2 }}},
+  { "cast(cast(power(10, 3) - 0.45 as double) as decimal(5,0))",
+    {{ false, 999, 5, 0 },
+     { false, 1000, 5, 0 }}},
+  { "cast(cast(power(10, 3) - 0.45 as double) as decimal(3,0))",
+    {{ false, 999, 3, 0 },
+     { true, 0, 3, 0 }}},
+  { "cast(cast(-power(10, 3) + 0.45 as double) as decimal(4,1))",
+    {{ false, -9995, 4, 1 },
+     { false, -9996, 4, 1 }}},
+  { "cast(cast(-power(10, 3) + 0.45 as double) as decimal(5,2))",
+    {{ false, -99955, 5, 2 }}},
+  { "cast(cast(-power(10, 3) + 0.45 as double) as decimal(5,0))",
+    {{ false, -999, 5, 0 },
+     { false, -1000, 5, 0 }}},
+  { "cast(cast(-power(10, 3) + 0.45 as double) as decimal(3,0))",
+    {{ false, -999, 3, 0 },
+     { true, 0, 3, 0 }}},
+  { "cast(cast(power(10, 3) - 0.5 as double) as decimal(4,1))",
+    {{ false, 9995, 4, 1 }}},
+  { "cast(cast(power(10, 3) - 0.5 as double) as decimal(5,2))",
+    {{ false, 99950, 5, 2 }}},
+  { "cast(cast(power(10, 3) - 0.5 as double) as decimal(5,0))",
+    {{ false, 999, 5, 0 },
+     { false, 1000, 5, 0 }}},
+  { "cast(cast(power(10, 3) - 0.5 as double) as decimal(3,0))",
+    {{ false, 999, 3, 0 },
+     { true, 0, 3, 0 }}},
+  { "cast(cast(-power(10, 3) + 0.5 as double) as decimal(4,1))",
+    {{ false, -9995, 4, 1 }}},
+  { "cast(cast(-power(10, 3) + 0.5 as double) as decimal(5,2))",
+    {{ false, -99950, 5, 2 }}},
+  { "cast(cast(-power(10, 3) + 0.5 as double) as decimal(5,0))",
+    {{ false, -999, 5, 0 },
+     { false, -1000, 5, 0 }}},
+  { "cast(cast(-power(10, 3) + 0.5 as double) as decimal(3,0))",
+    {{ false, -999, 3, 0 },
+     { true, 0, 3, 0 }}},
+  { "cast(cast(power(10, 3) - 0.55 as double) as decimal(4,1))",
+    {{ false, 9994, 4, 1 },
+     { false, 9995, 4, 1 }}},
+  { "cast(cast(power(10, 3) - 0.55 as double) as decimal(5,2))",
+    {{ false, 99945, 5, 2 }}},
+  { "cast(cast(power(10, 3) - 0.55 as double) as decimal(5,0))",
+    {{ false, 999, 5, 0 }}},
+  { "cast(cast(power(10, 3) - 0.55 as double) as decimal(3,0))",
+    {{ false, 999, 3, 0 }}},
+  { "cast(cast(-power(10, 3) + 0.55 as double) as decimal(4,1))",
+    {{ false, -9994, 4, 1 },
+     { false, -9995, 4, 1 }}},
+  { "cast(cast(-power(10, 3) + 0.55 as double) as decimal(5,2))",
+    {{ false, -99945, 5, 2 }}},
+  { "cast(cast(-power(10, 3) + 0.55 as double) as decimal(5,0))",
+    {{ false, -999, 5, 0 }}},
+  { "cast(cast(-power(10, 3) + 0.55 as double) as decimal(3,0))",
+    {{ false, -999, 3, 0 }}},
+  { "cast(power(2, 1023) * 100 as decimal(38,0))",
+    {{ true, 0, 38, 0 }}},
+  { "cast(power(2, 1023) * 100 as decimal(18,0))",
+    {{ true, 0, 18, 0 }}},
+  { "cast(power(2, 1023) * 100 as decimal(9,0))",
+    {{ true, 0, 9, 0 }}},
+  { "cast(0/0 as decimal(38,0))",
+    {{ true, 0, 38, 0 }}},
+  { "cast(0/0 as decimal(18,0))",
+    {{ true, 0, 18, 0 }}},
+  { "cast(0/0 as decimal(9,0))",
+    {{ true, 0, 9, 0 }}},
+  // 39 5's - legal double but will overflow in decimal
+  { "cast(555555555555555555555555555555555555555 as decimal(38,0))",
+    {{ true, 0, 38, 0 }}},
 };
 
 TEST_F(ExprTest, DecimalArithmeticExprs) {
@@ -1450,6 +2064,7 @@ TEST_F(ExprTest, DecimalArithmeticExprs) {
         TestDecimalResultType(c.expr, type);
         TestIsNull(c.expr, type);
       } else {
+        TestIsNotNull(c.expr, type);
         switch (type.GetByteSize()) {
           case 4:
             TestDecimalValue(c.expr, Decimal4Value(r.scaled_val), type);
@@ -3788,36 +4403,79 @@ TEST_F(ExprTest, UnaryOperators) {
   TestValue("- -1", TYPE_TINYINT, 1);
   TestValue("+-1", TYPE_TINYINT, -1);
   TestValue("++1", TYPE_TINYINT, 1);
+  TestValue("~1", TYPE_TINYINT, -2);
 
   TestValue("+cast(1. as float)", TYPE_FLOAT, 1.0f);
   TestValue("+cast(1.0 as float)", TYPE_FLOAT, 1.0f);
   TestValue("-cast(1.0 as float)", TYPE_DOUBLE, -1.0);
 
   TestValue("1 - - - 1", TYPE_SMALLINT, 0);
+
+  // IMPALA-4877: Verify that unary minus has high precedence and is integrated into
+  // literals.
+  TestValue("-1 & 8", TYPE_TINYINT, 8);
 }
 
-// TODO: I think a lot of these casts are not necessary and we should fix this
-TEST_F(ExprTest, TimestampFunctions) {
-  // Regression test for IMPALA-4209
-  TestStringValue("cast(from_utc_timestamp(cast(1301180400 as timestamp),"
-      "'Europe/Moscow') as string)", "2011-03-27 03:00:00");
-  TestStringValue("cast(from_utc_timestamp(cast(1301180399 as timestamp),"
-      "'Europe/Moscow') as string)", "2011-03-27 01:59:59");
-  TestStringValue("cast(from_utc_timestamp(cast(1288404000 as timestamp),"
-      "'Europe/Moscow') as string)", "2010-10-30 06:00:00");
-  TestStringValue("cast(from_utc_timestamp(cast(1288584000 as timestamp),"
-      "'Europe/Moscow') as string)", "2010-11-01 07:00:00");
-  TestStringValue("cast(from_utc_timestamp(cast(1301104740 as timestamp),"
-      "'Europe/Moscow') as string)", "2011-03-26 04:59:00");
-  TestStringValue("cast(from_utc_timestamp(cast(1301277600 as timestamp),"
-      "'Europe/Moscow') as string)", "2011-03-28 06:00:00");
-  TestStringValue("cast(from_utc_timestamp(cast(1324947600 as timestamp),"
-      "'Europe/Moscow') as string)", "2011-12-27 05:00:00");
-  TestStringValue("cast(from_utc_timestamp(cast(1325725200 as timestamp),"
-      "'Europe/Moscow') as string)", "2012-01-05 05:00:00");
-  TestStringValue("cast(from_utc_timestamp(cast(1333594800 as timestamp),"
-      "'Europe/Moscow') as string)", "2012-04-05 07:00:00");
+TEST_F(ExprTest, MoscowTimezoneConversion) {
+#pragma push_macro("UTC_TO_MSC")
+#pragma push_macro("MSC_TO_UTC")
+#define UTC_TO_MSC(X) ("cast(from_utc_timestamp('" X "', 'Europe/Moscow') as string)")
+#define MSC_TO_UTC(X) ("cast(to_utc_timestamp('" X "', 'Europe/Moscow') as string)")
 
+  // IMPALA-4209: Moscow time change in 2011.
+  // Last DST change before the transition.
+  TestStringValue(UTC_TO_MSC("2010-10-30 22:59:59"), "2010-10-31 02:59:59");
+  TestStringValue(UTC_TO_MSC("2010-10-30 23:00:00"), "2010-10-31 02:00:00");
+  TestStringValue(MSC_TO_UTC("2010-10-31 01:59:59"), "2010-10-30 21:59:59");
+  // Since 2am to 2:59:59.999...am MSC happens twice, the ambiguity gets resolved by
+  // returning null.
+  TestIsNull(MSC_TO_UTC("2010-10-31 02:00:00"), TYPE_STRING);
+  TestIsNull(MSC_TO_UTC("2010-10-31 02:59:59"), TYPE_STRING);
+  TestStringValue(MSC_TO_UTC("2010-10-31 03:00:00"), "2010-10-31 00:00:00");
+
+  // Moscow time transitions to UTC+4.
+  TestStringValue(UTC_TO_MSC("2011-03-26 22:59:59"), "2011-03-27 01:59:59");
+  TestStringValue(UTC_TO_MSC("2011-03-26 23:00:00"), "2011-03-27 03:00:00");
+  TestStringValue(MSC_TO_UTC("2011-03-27 01:59:59"), "2011-03-26 22:59:59");
+  // Since 2am to 2:59:59.999...am MSC happens twice, the ambiguity gets resolved by
+  // returning null.
+  TestIsNull(MSC_TO_UTC("2011-03-27 02:00:00"), TYPE_STRING);
+  TestIsNull(MSC_TO_UTC("2011-03-27 02:59:59"), TYPE_STRING);
+  TestStringValue(MSC_TO_UTC("2011-03-27 03:00:00"), "2011-03-26 23:00:00");
+
+  // No more DST after the transition.
+  TestStringValue(UTC_TO_MSC("2011-12-20 09:00:00"), "2011-12-20 13:00:00");
+  TestStringValue(UTC_TO_MSC("2012-06-20 09:00:00"), "2012-06-20 13:00:00");
+  TestStringValue(UTC_TO_MSC("2012-12-20 09:00:00"), "2012-12-20 13:00:00");
+  TestStringValue(MSC_TO_UTC("2011-12-20 13:00:00"), "2011-12-20 09:00:00");
+  TestStringValue(MSC_TO_UTC("2012-06-20 13:00:00"), "2012-06-20 09:00:00");
+  TestStringValue(MSC_TO_UTC("2012-12-20 13:00:00"), "2012-12-20 09:00:00");
+
+  // IMPALA-4546: Moscow time change in 2014.
+  // UTC+4 is changed to UTC+3
+  TestStringValue(UTC_TO_MSC("2014-10-25 21:59:59"), "2014-10-26 01:59:59");
+  TestStringValue(UTC_TO_MSC("2014-10-25 22:00:00"), "2014-10-26 01:00:00");
+  TestStringValue(UTC_TO_MSC("2014-10-25 23:00:00"), "2014-10-26 02:00:00");
+  TestStringValue(MSC_TO_UTC("2014-10-26 00:59:59"), "2014-10-25 20:59:59");
+  // Since 1am to 1:59:59.999...am MSC happens twice, the ambiguity gets resolved by
+  // returning null.
+  TestIsNull(MSC_TO_UTC("2014-10-26 01:00:00"), TYPE_STRING);
+  TestIsNull(MSC_TO_UTC("2014-10-26 01:59:59"), TYPE_STRING);
+  TestStringValue(MSC_TO_UTC("2014-10-26 02:00:00"), "2014-10-25 23:00:00");
+
+  // Still no DST after the transition.
+  TestStringValue(UTC_TO_MSC("2014-12-20 09:00:00"), "2014-12-20 12:00:00");
+  TestStringValue(UTC_TO_MSC("2015-06-20 09:00:00"), "2015-06-20 12:00:00");
+  TestStringValue(UTC_TO_MSC("2015-12-20 09:00:00"), "2015-12-20 12:00:00");
+  TestStringValue(MSC_TO_UTC("2014-12-20 12:00:00"), "2014-12-20 09:00:00");
+  TestStringValue(MSC_TO_UTC("2015-06-20 12:00:00"), "2015-06-20 09:00:00");
+  TestStringValue(MSC_TO_UTC("2015-12-20 12:00:00"), "2015-12-20 09:00:00");
+
+#pragma pop_macro("MSC_TO_UTC")
+#pragma pop_macro("UTC_TO_MSC")
+}
+
+TEST_F(ExprTest, TimestampFunctions) {
   // Regression for IMPALA-1105
   TestIsNull("cast(cast('NOTATIMESTAMP' as timestamp) as string)", TYPE_STRING);
 
