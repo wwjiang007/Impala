@@ -27,7 +27,6 @@
 #include <vector>
 #include <boost/scoped_ptr.hpp>
 
-#include <boost/unordered_map.hpp>
 #include <boost/unordered_set.hpp>
 
 #include <llvm/IR/DerivedTypes.h>
@@ -72,6 +71,7 @@ namespace llvm {
 
 namespace impala {
 
+class CodegenCallGraph;
 class CodegenSymbolEmitter;
 class ImpalaMCJITMemoryManager;
 class SubExprElimination;
@@ -82,8 +82,6 @@ class LlvmBuilder : public llvm::IRBuilder<> {
   using llvm::IRBuilder<>::IRBuilder;
 };
 
-/// Map of functions' names to their callee functions' names.
-typedef boost::unordered_map<std::string, boost::unordered_set<std::string>> FnRefsMap;
 
 /// LLVM code generator.  This is the top level object to generate jitted code.
 //
@@ -507,6 +505,11 @@ class LlvmCodeGen {
   llvm::Value* CodegenArrayAt(
       LlvmBuilder*, llvm::Value* array, int idx, const char* name = "");
 
+  /// Codegens IR to call the function corresponding to 'ir_type' with argument 'args'
+  /// and returns the value.
+  llvm::Value* CodegenCallFunction(LlvmBuilder* builder, IRFunction::Type ir_type,
+      llvm::ArrayRef<llvm::Value*> args, const char* name);
+
   /// If there are more than this number of expr trees (or functions that evaluate
   /// expressions), avoid inlining avoid inlining for the exprs exceeding this threshold.
   static const int CODEGEN_INLINE_EXPRS_THRESHOLD = 100;
@@ -520,13 +523,6 @@ class LlvmCodeGen {
   friend class ExprCodegenTest;
   friend class LlvmCodeGenTest;
   friend class SubExprElimination;
-
-  /// Returns true if the function 'fn' is defined in the Impalad native code.
-  static bool IsDefinedInImpalad(const std::string& fn);
-
-  /// Find all global variables and functions which reference the llvm::Value 'val'
-  /// and return them in 'users'.
-  static void FindGlobalUsers(llvm::User* val, std::vector<llvm::GlobalObject*>* users);
 
   /// Top level codegen object. 'module_id' is used for debugging when outputting the IR.
   LlvmCodeGen(RuntimeState* state, ObjectPool* pool, MemTracker* parent_mem_tracker,
@@ -643,15 +639,9 @@ class LlvmCodeGen {
   static std::string cpu_name_;
   static std::vector<std::string> cpu_attrs_;
 
-  /// A call graph for all IR functions in the main module. Used for determining
-  /// dependencies when materializing IR functions.
-  static FnRefsMap fn_refs_map_;
-
-  /// This set contains names of all functions which always need to be materialized.
-  /// They are referenced by global variables but NOT defined in the Impalad native
-  /// code (they may have been inlined by gcc). These functions are always materialized
-  /// when a module is loaded to ensure that LLVM can resolve references to them.
-  static boost::unordered_set<std::string> fns_to_always_materialize_;
+  /// A global shared call graph for all IR functions in the main module.
+  /// Used for determining dependencies when materializing IR functions.
+  static CodegenCallGraph shared_call_graph_;
 
   /// Pointer to the RuntimeState which owns this codegen object. Needed in
   /// InlineConstFnAttr() to access the query options.

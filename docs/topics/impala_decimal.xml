@@ -697,7 +697,7 @@ Expression '1' (type: INT) would need to be cast to DECIMAL(9,0) for column 'x'
 
       <li>
         Impala can query Avro, RCFile, or SequenceFile tables containing <codeph>DECIMAL</codeph> columns, created
-        by other Hadoop components, on CDH 5 only.
+        by other Hadoop components.
       </li>
 
       <li>
@@ -797,10 +797,6 @@ INSERT INTO t1 VALUES (5, 99.44, 123456), (300, 6.7, 999999999);
 SELECT x+y, ROUND(y,1), z/98.6 FROM t1;
 SELECT CAST(1000.5 AS DECIMAL);
 </codeblock>
-
-    <p conref="../shared/impala_common.xml#common/restrictions_blurb"/>
-
-    <p conref="../shared/impala_common.xml#common/decimal_no_stats"/>
 
 <!-- <p conref="../shared/impala_common.xml#common/partitioning_good"/> -->
 

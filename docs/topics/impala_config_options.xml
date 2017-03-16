@@ -83,8 +83,7 @@ under the License.
         might modify includes:
       </p>
 
-<!-- Note: Update the following example for each release with the associated lines from /etc/default/impala
-           from a non-CM-managed system. -->
+<!-- Note: Update the following example for each release with the associated lines from /etc/default/impala. -->
 
 <codeblock rev="ver">IMPALA_STATE_STORE_HOST=127.0.0.1
 IMPALA_STATE_STORE_PORT=24000
@@ -153,8 +152,8 @@ Starting Impala Catalog Server:                            [  OK  ]</codeblock>
         <li rev="1.2">
           <p>
             Catalog server address (including both the hostname and the port number). Update the
-            value of the <codeph>IMPALA_CATALOG_SERVICE_HOST</codeph> variable. Cloudera
-            recommends the catalog server be on the same host as the statestore. In that
+            value of the <codeph>IMPALA_CATALOG_SERVICE_HOST</codeph> variable. Where
+            practical, run the catalog server on the same host as the statestore. In that
             recommended configuration, the <cmdname>impalad</cmdname> daemon cannot refer to the
             catalog server using the loopback address. If the catalog service is hosted on a
             machine with an IP address of 192.168.0.27, add the following line:
@@ -262,7 +261,7 @@ Starting Impala Catalog Server:                            [  OK  ]</codeblock>
           </p>
         </li>
 
-<!-- Removing this reference now that the options are de-emphasized / desupported in CDH 5.5 / Impala 2.3 and up.
+<!-- Removing this reference now that the options are de-emphasized / desupported in Impala 2.3 and up.
         <li rev="1.2">
           <p>
           Options for resource management, in conjunction with the YARN component. These options include
@@ -287,7 +286,7 @@ Starting Impala Catalog Server:                            [  OK  ]</codeblock>
         </li>
       </ul>
 
-<!-- Removing this reference now that the options are de-emphasized / desupported in CDH 5.5 / Impala 2.3 and up.
+<!-- Removing this reference now that the options are de-emphasized / desupported in Impala 2.3 and up.
       <p conref="impala_resource_management.xml#rm_options/resource_management_impalad_options"/>
 -->
 
@@ -333,8 +332,8 @@ Starting Impala Catalog Server:                            [  OK  ]</codeblock>
           <li rev="1.2">
             <p>
               Catalog server address. Update the <codeph>IMPALA_CATALOG_SERVICE_HOST</codeph>
-              variable, including both the hostname and the port number in the value. Cloudera
-              recommends the catalog server be on the same host as the statestore. In that
+              variable, including both the hostname and the port number in the value. Where
+              practical, run the catalog server on the same host as the statestore. In that
               recommended configuration, the <cmdname>impalad</cmdname> daemon cannot refer to
               the catalog server using the loopback address. If the catalog service is hosted on
               a machine with an IP address of 192.168.0.27, add the following line:
@@ -433,7 +432,7 @@ Starting Impala Catalog Server:                            [  OK  ]</codeblock>
             <cmdname>impala-shell</cmdname>.
           </li>
 
-<!-- Removing this reference now that the options are de-emphasized / desupported in CDH 5.5 / Impala 2.3 and up.
+<!-- Removing this reference now that the options are de-emphasized / desupported in Impala 2.3 and up.
           <li rev="1.2">
             Options for resource management, in conjunction with the YARN component. These options
             include <codeph>-enable_rm</codeph> and <codeph>-cgroup_hierarchy_path</codeph>.
@@ -454,7 +453,7 @@ Starting Impala Catalog Server:                            [  OK  ]</codeblock>
           </li>
         </ul>
 
-<!-- Removing this reference now that the options are de-emphasized / desupported in CDH 5.5 / Impala 2.3 and up.
+<!-- Removing this reference now that the options are de-emphasized / desupported in Impala 2.3 and up.
         <p conref="impala_resource_management.xml#rm_options/resource_management_impalad_options"/>
 -->
 

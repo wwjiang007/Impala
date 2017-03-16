@@ -72,9 +72,6 @@ under the License.
 
       <p conref="../shared/impala_common.xml#common/rhel5_kerberos"/>
 
-<!-- This note adapted from the one at http://www.cloudera.com/content/cloudera-content/cloudera-docs/CDH4/latest/CDH4-Security-Guide/cdh4sg_topic_3_4.html.
-   Ideally should be conref'ed in both places. -->
-
       <note type="important">
         <p>
           If you plan to use Impala in your cluster, you must configure your KDC to allow tickets to be renewed,
@@ -148,9 +145,8 @@ under the License.
         </li>
 
         <li>
-          Editing <codeph>/etc/default/impala</codeph> <ph audience="hidden">(in cluster not managed by Cloudera Manager), or editing the
-          <uicontrol>Security</uicontrol> settings in the Cloudera Manager interface,</ph>to accommodate Kerberos
-          authentication.
+          Editing <codeph>/etc/default/impala</codeph>
+          to accommodate Kerberos authentication.
         </li>
       </ul>
     </conbody>
@@ -348,7 +344,7 @@ $ chown impala:impala impala-http.keytab</codeblock>
 
   </concept>
 
-  <concept id="auth_to_local" rev="IMPALA-2660 CDH-40241">
+  <concept id="auth_to_local" rev="IMPALA-2660">
     <title>Mapping Kerberos Principals to Short Names for Impala</title>
     <conbody>
       <p conref="../shared/impala_common.xml#common/auth_to_local_instructions"/>

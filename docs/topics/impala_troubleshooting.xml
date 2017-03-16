@@ -60,7 +60,7 @@ under the License.
       <ul>
         <li>
           If a query fails against both Impala and Hive, it is likely that there is a problem with your query or
-          other elements of your CDH environment:
+          other elements of your <keyword keyref="distro"/> environment:
           <ul>
             <li>
               Review the <xref href="impala_langref.xml#langref">Language Reference</xref> to ensure your query is
@@ -94,7 +94,7 @@ under the License.
     </conbody>
   </concept>
 
-  <concept id="trouble_io" rev="CDH-19201">
+  <concept id="trouble_io" rev="">
     <title>Troubleshooting I/O Capacity Problems</title>
     <conbody>
       <p>
@@ -374,15 +374,6 @@ MEM_LIMIT: 0
         </p>
 
         <p>
-          From Nong:
-        </p>
-
-        <p>
-          In a CM-managed cluster, search for "core" from the impala configuration page. You should see the "enable
-          core dump" config.
-        </p>
-
-        <p>
           From <xref href="impala_config_options.xml#config_options"/>:
         </p>
 
@@ -412,8 +403,7 @@ MEM_LIMIT: 0
 
 <codeblock>
 <![CDATA[
-Useful test from beta at Visa.
-SME: Jayant@
+Useful test for I/O throughput of hardware.
 
 Symptoms:
 * Queries running slow
