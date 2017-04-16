@@ -38,5 +38,6 @@ cd ..
 
 export CTEST_OUTPUT_ON_FAILURE=1
 export UBSAN_OPTIONS="print_stacktrace=1"
+UBSAN_OPTIONS="${UBSAN_OPTIONS} suppressions=${IMPALA_HOME}/bin/ubsan-suppressions.txt"
 export PATH="${IMPALA_TOOLCHAIN}/llvm-${IMPALA_LLVM_VERSION}/bin:${PATH}"
 make test ARGS="${BE_TEST_ARGS}"

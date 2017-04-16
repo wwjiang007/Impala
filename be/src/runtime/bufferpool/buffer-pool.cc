@@ -35,36 +35,10 @@ DEFINE_int32(concurrent_scratch_ios_per_device, 2,
 
 namespace impala {
 
-BufferPool::BufferHandle::BufferHandle() {
-  Reset();
-}
-
-BufferPool::BufferHandle::BufferHandle(BufferHandle&& src) {
-  Reset();
-  *this = std::move(src);
-}
-
-BufferPool::BufferHandle& BufferPool::BufferHandle::operator=(BufferHandle&& src) {
-  DCHECK(!is_open());
-  // Copy over all members then close src.
-  client_ = src.client_;
-  data_ = src.data_;
-  len_ = src.len_;
-  src.Reset();
-  return *this;
-}
-
-void BufferPool::BufferHandle::Open(
-    const ClientHandle* client, uint8_t* data, int64_t len) {
-  client_ = client;
+void BufferPool::BufferHandle::Open(uint8_t* data, int64_t len) {
+  client_ = nullptr;
   data_ = data;
   len_ = len;
-}
-
-void BufferPool::BufferHandle::Reset() {
-  client_ = NULL;
-  data_ = NULL;
-  len_ = -1;
 }
 
 BufferPool::PageHandle::PageHandle() {
@@ -153,12 +127,8 @@ Status BufferPool::CreatePage(ClientHandle* client, int64_t len, PageHandle* han
   BufferHandle buffer;
   // No changes have been made to state yet, so we can cleanly return on error.
   RETURN_IF_ERROR(AllocateBuffer(client, len, &buffer));
-
-  Page* page = new Page(client->impl_, len);
-  page->buffer = std::move(buffer);
+  Page* page = client->impl_->CreatePinnedPage(move(buffer));
   handle->Open(page, client);
-  page->pin_count++;
-  client->impl_->AddNewPinnedPage(page);
   return Status::OK();
 }
 
@@ -204,7 +174,7 @@ void BufferPool::Unpin(ClientHandle* client, PageHandle* handle) {
   reservation->ReleaseTo(page->len);
 
   if (--page->pin_count > 0) return;
-  client->impl_->MoveToDirtyUnpinned(reservation->GetUnusedReservation(), page);
+  client->impl_->MoveToDirtyUnpinned(page);
   COUNTER_ADD(client->impl_->counters().total_unpinned_bytes, handle->len());
   COUNTER_ADD(client->impl_->counters().peak_unpinned_bytes, handle->len());
 }
@@ -225,10 +195,13 @@ void BufferPool::ExtractBuffer(
 
 Status BufferPool::AllocateBuffer(
     ClientHandle* client, int64_t len, BufferHandle* handle) {
-  ReservationTracker* reservation = client->impl_->reservation();
-  RETURN_IF_ERROR(client->impl_->CleanPagesBeforeAllocation(reservation, len));
-  reservation->AllocateFrom(len);
-  return AllocateBufferInternal(client, len, handle);
+  RETURN_IF_ERROR(client->impl_->PrepareToAllocateBuffer(len));
+  Status status = AllocateBufferInternal(client, len, handle);
+  if (!status.ok()) {
+    // Allocation failed - update client's accounting to reflect the failure.
+    client->impl_->FreedBuffer(len);
+  }
+  return status;
 }
 
 Status BufferPool::AllocateBufferInternal(
@@ -245,28 +218,29 @@ Status BufferPool::AllocateBufferInternal(
     int64_t to_evict = len - delta;
     RETURN_IF_ERROR(EvictCleanPages(to_evict));
   }
-  uint8_t* data;
-  Status status = allocator_->Allocate(len, &data);
+  Status status = allocator_->Allocate(len, buffer);
   if (!status.ok()) {
     buffer_bytes_remaining_.Add(len);
     return status;
   }
-  DCHECK(data != NULL);
-  buffer->Open(client, data, len);
+  DCHECK(buffer->is_open());
+  buffer->client_ = client;
   return Status::OK();
 }
 
 void BufferPool::FreeBuffer(ClientHandle* client, BufferHandle* handle) {
   if (!handle->is_open()) return; // Should be idempotent.
   DCHECK_EQ(client, handle->client_);
-  client->impl_->reservation()->ReleaseTo(handle->len_);
+  int64_t len = handle->len_;
   FreeBufferInternal(handle);
+  client->impl_->FreedBuffer(len);
 }
 
 void BufferPool::FreeBufferInternal(BufferHandle* handle) {
   DCHECK(handle->is_open());
-  allocator_->Free(handle->data(), handle->len());
-  buffer_bytes_remaining_.Add(handle->len());
+  int64_t buffer_len = handle->len();
+  allocator_->Free(move(*handle));
+  buffer_bytes_remaining_.Add(buffer_len);
   handle->Reset();
 }
 
@@ -307,9 +281,7 @@ void BufferPool::AddCleanPage(const unique_lock<mutex>& client_lock, Page* page)
 bool BufferPool::RemoveCleanPage(const unique_lock<mutex>& client_lock, Page* page) {
   page->client->DCheckHoldsLock(client_lock);
   lock_guard<SpinLock> cpl(clean_pages_lock_);
-  bool found = clean_pages_.Contains(page);
-  if (found) clean_pages_.Remove(page);
-  return found;
+  return clean_pages_.Remove(page);
 }
 
 Status BufferPool::EvictCleanPages(int64_t bytes_to_evict) {
@@ -329,10 +301,7 @@ Status BufferPool::EvictCleanPages(int64_t bytes_to_evict) {
 
   // Free buffers after releasing all the locks. Do this regardless of success to avoid
   // leaking buffers.
-  for (BufferHandle& buffer : buffers) {
-    allocator_->Free(buffer.data(), buffer.len());
-    buffer.Reset();
-  }
+  for (BufferHandle& buffer : buffers) allocator_->Free(move(buffer));
   if (bytes_found < bytes_to_evict) {
     // The buffer pool should not be overcommitted so this should only happen if there
     // is an accounting error. Add any freed buffers back to 'buffer_bytes_remaining_'
@@ -376,8 +345,7 @@ BufferPool::Client::Client(BufferPool* pool, TmpFileMgr::FileGroup* file_group,
     file_group_(file_group),
     name_(name),
     num_pages_(0),
-    dirty_unpinned_bytes_(0),
-    in_flight_write_bytes_(0) {
+    buffers_allocated_bytes_(0) {
   reservation_.InitChildTracker(
       profile, parent_reservation, mem_tracker, reservation_limit);
   counters_.get_buffer_time = ADD_TIMER(profile, "BufferPoolGetBufferTime");
@@ -393,11 +361,19 @@ BufferPool::Client::Client(BufferPool* pool, TmpFileMgr::FileGroup* file_group,
       ADD_COUNTER(profile, "BufferPoolTotalUnpinnedBytes", TUnit::BYTES);
 }
 
-void BufferPool::Client::AddNewPinnedPage(Page* page) {
-  DCHECK_GT(page->pin_count, 0);
+BufferPool::Page* BufferPool::Client::CreatePinnedPage(BufferHandle&& buffer) {
+  Page* page = new Page(this, buffer.len());
+  page->buffer = move(buffer);
+  page->pin_count = 1;
+
   boost::lock_guard<boost::mutex> lock(lock_);
+  // The buffer is transferred to the page so will be accounted for in
+  // pinned_pages_.bytes() instead of buffers_allocated_bytes_.
+  buffers_allocated_bytes_ -= page->len;
   pinned_pages_.Enqueue(page);
   ++num_pages_;
+  DCHECK_CONSISTENCY();
+  return page;
 }
 
 void BufferPool::Client::DestroyPageInternal(
@@ -407,12 +383,8 @@ void BufferPool::Client::DestroyPageInternal(
   // Remove the page from the list that it is currently present in (if any).
   {
     unique_lock<mutex> cl(lock_);
-    if (pinned_pages_.Contains(page)) {
-      pinned_pages_.Remove(page);
-    } else if (dirty_unpinned_pages_.Contains(page)) {
-      dirty_unpinned_pages_.Remove(page);
-      dirty_unpinned_bytes_ -= page->len;
-    } else {
+    // First try to remove from the pinned or dirty unpinned lists.
+    if (!pinned_pages_.Remove(page) && !dirty_unpinned_pages_.Remove(page)) {
       // The page either has a write in flight, is clean, or is evicted.
       // Let the write complete, if in flight.
       WaitForWrite(&cl, page);
@@ -430,6 +402,7 @@ void BufferPool::Client::DestroyPageInternal(
   if (out_buffer != NULL) {
     DCHECK(page->buffer.is_open());
     *out_buffer = std::move(page->buffer);
+    buffers_allocated_bytes_ += out_buffer->len();
   } else if (page->buffer.is_open()) {
     pool_->FreeBufferInternal(&page->buffer);
   }
@@ -437,15 +410,15 @@ void BufferPool::Client::DestroyPageInternal(
   handle->Reset();
 }
 
-void BufferPool::Client::MoveToDirtyUnpinned(int64_t unused_reservation, Page* page) {
+void BufferPool::Client::MoveToDirtyUnpinned(Page* page) {
   // Only valid to unpin pages if spilling is enabled.
   DCHECK(spilling_enabled());
   DCHECK_EQ(0, page->pin_count);
   unique_lock<mutex> lock(lock_);
+  DCHECK_CONSISTENCY();
   DCHECK(pinned_pages_.Contains(page));
   pinned_pages_.Remove(page);
   dirty_unpinned_pages_.Enqueue(page);
-  dirty_unpinned_bytes_ += page->len;
 
   // Check if we should initiate writes for this (or another) dirty page.
   WriteDirtyPagesAsync();
@@ -454,6 +427,7 @@ void BufferPool::Client::MoveToDirtyUnpinned(int64_t unused_reservation, Page* p
 Status BufferPool::Client::MoveToPinned(ClientHandle* client, PageHandle* handle) {
   Page* page = handle->page_;
   unique_lock<mutex> cl(lock_);
+  DCHECK_CONSISTENCY();
   // Propagate any write errors that occurred for this client.
   RETURN_IF_ERROR(write_status_);
 
@@ -465,13 +439,15 @@ Status BufferPool::Client::MoveToPinned(ClientHandle* client, PageHandle* handle
     lock_guard<SpinLock> pl(page->buffer_lock);
     evicted = !page->buffer.is_open();
   }
-  if (evicted) return MoveEvictedToPinned(&cl, client, handle);
+  if (evicted) {
+    // We may need to clean some pages to allocate a buffer for the evicted page.
+    RETURN_IF_ERROR(CleanPages(&cl, page->len));
+    return MoveEvictedToPinned(&cl, client, handle);
+  }
 
-  if (dirty_unpinned_pages_.Contains(page)) {
+  if (dirty_unpinned_pages_.Remove(page)) {
     // No writes were initiated for the page - just move it back to the pinned state.
-    dirty_unpinned_pages_.Remove(page);
     pinned_pages_.Enqueue(page);
-    dirty_unpinned_bytes_ -= page->len;
     return Status::OK();
   }
   if (in_flight_write_pages_.Contains(page)) {
@@ -480,6 +456,10 @@ Status BufferPool::Client::MoveToPinned(ClientHandle* client, PageHandle* handle
     WaitForWrite(&cl, page);
     RETURN_IF_ERROR(write_status_); // The write may have set 'write_status_'.
   }
+
+  // At this point we need to either reclaim a clean page or allocate a new buffer.
+  // We may need to clean some pages to do so.
+  RETURN_IF_ERROR(CleanPages(&cl, page->len));
   if (pool_->RemoveCleanPage(cl, page)) {
     // The clean page still has an associated buffer. Just clean up the write, restore
     // the data, and move the page back to the pinned state.
@@ -500,8 +480,6 @@ Status BufferPool::Client::MoveEvictedToPinned(
     unique_lock<mutex>* client_lock, ClientHandle* client, PageHandle* handle) {
   Page* page = handle->page_;
   DCHECK(!page->buffer.is_open());
-  RETURN_IF_ERROR(CleanPagesBeforeAllocationLocked(
-      client_lock, client->impl_->reservation(), page->len));
 
   // Don't hold any locks while allocating or reading back the data. It is safe to modify
   // the page's buffer handle without holding any locks because no concurrent operations
@@ -519,35 +497,43 @@ Status BufferPool::Client::MoveEvictedToPinned(
   file_group_->DestroyWriteHandle(move(page->write_handle));
   client_lock->lock();
   pinned_pages_.Enqueue(page);
+  DCHECK_CONSISTENCY();
   return Status::OK();
 }
 
-Status BufferPool::Client::CleanPagesBeforeAllocation(
-    ReservationTracker* reservation, int64_t allocation_len) {
+Status BufferPool::Client::PrepareToAllocateBuffer(int64_t len) {
   unique_lock<mutex> lock(lock_);
-  return CleanPagesBeforeAllocationLocked(&lock, reservation, allocation_len);
+  // Clean enough pages to allow allocation to proceed without violating our eviction
+  // policy. This can fail, so only update the accounting once success is ensured.
+  RETURN_IF_ERROR(CleanPages(&lock, len));
+  reservation_.AllocateFrom(len);
+  buffers_allocated_bytes_ += len;
+  DCHECK_CONSISTENCY();
+  return Status::OK();
 }
 
-Status BufferPool::Client::CleanPagesBeforeAllocationLocked(
-    unique_lock<mutex>* client_lock, ReservationTracker* reservation,
-    int64_t allocation_len) {
+Status BufferPool::Client::CleanPages(unique_lock<mutex>* client_lock, int64_t len) {
   DCheckHoldsLock(*client_lock);
-  int64_t unused_reservation = reservation->GetUnusedReservation();
-  DCHECK_LE(allocation_len, unused_reservation);
-  int64_t unused_reservation_after_alloc = unused_reservation - allocation_len;
+  DCHECK_CONSISTENCY();
+  // Work out what we need to get bytes of dirty unpinned + in flight pages down to
+  // in order to satisfy the eviction policy.
+  int64_t target_dirty_bytes = reservation_.GetReservation() - buffers_allocated_bytes_
+      - pinned_pages_.bytes() - len;
   // Start enough writes to ensure that the loop condition below will eventually become
   // false (or a write error will be encountered).
-  int64_t min_in_flight_bytes = dirty_unpinned_bytes_ - unused_reservation_after_alloc;
-  WriteDirtyPagesAsync(max<int64_t>(0, min_in_flight_bytes - in_flight_write_bytes_));
+  int64_t min_bytes_to_write =
+      max<int64_t>(0, dirty_unpinned_pages_.bytes() - target_dirty_bytes);
+  WriteDirtyPagesAsync(min_bytes_to_write);
 
   // One of the writes we initiated, or an earlier in-flight write may have hit an error.
   RETURN_IF_ERROR(write_status_);
 
-  // Wait until enough writes have finished that the allocation plus dirty pages won't
-  // exceed our reservation. I.e. so that other clients can immediately get the allocated
+  // Wait until enough writes have finished so that we can make the allocation without
+  // violating the eviction policy. I.e. so that other clients can immediately get the
   // memory they're entitled to without waiting for this client's write to complete.
-  DCHECK_GE(in_flight_write_bytes_, min_in_flight_bytes);
-  while (dirty_unpinned_bytes_ > unused_reservation_after_alloc) {
+  DCHECK_GE(in_flight_write_pages_.bytes(), min_bytes_to_write);
+  while (dirty_unpinned_pages_.bytes() + in_flight_write_pages_.bytes()
+      > target_dirty_bytes) {
     SCOPED_TIMER(counters().write_wait_time);
     write_complete_cv_.Wait(*client_lock);
     RETURN_IF_ERROR(write_status_); // Check if error occurred while waiting.
@@ -557,19 +543,17 @@ Status BufferPool::Client::CleanPagesBeforeAllocationLocked(
 
 void BufferPool::Client::WriteDirtyPagesAsync(int64_t min_bytes_to_write) {
   DCHECK_GE(min_bytes_to_write, 0);
-  DCheckConsistency();
+  DCHECK_LE(min_bytes_to_write, dirty_unpinned_pages_.bytes());
   if (file_group_ == NULL) {
     // Spilling disabled - there should be no unpinned pages to write.
     DCHECK_EQ(0, min_bytes_to_write);
-    DCHECK_EQ(0, dirty_unpinned_bytes_);
+    DCHECK_EQ(0, dirty_unpinned_pages_.bytes());
     return;
   }
   // No point in starting writes if an error occurred because future operations for the
   // client will fail regardless.
   if (!write_status_.ok()) return;
 
-  const int64_t writeable_bytes = dirty_unpinned_bytes_ - in_flight_write_bytes_;
-  DCHECK_LE(min_bytes_to_write, writeable_bytes);
   // Compute the ideal amount of writes to start. We use a simple heuristic based on the
   // total number of writes. The FileGroup's allocation should spread the writes across
   // disks somewhat, but doesn't guarantee we're fully using all available disks. In
@@ -578,7 +562,7 @@ void BufferPool::Client::WriteDirtyPagesAsync(int64_t min_bytes_to_write) {
       * file_group_->tmp_file_mgr()->NumActiveTmpDevices();
 
   int64_t bytes_written = 0;
-  while (bytes_written < writeable_bytes
+  while (!dirty_unpinned_pages_.empty()
       && (bytes_written < min_bytes_to_write
              || in_flight_write_pages_.size() < target_writes)) {
     Page* page = dirty_unpinned_pages_.tail(); // LIFO.
@@ -606,7 +590,6 @@ void BufferPool::Client::WriteDirtyPagesAsync(int64_t min_bytes_to_write) {
     DCHECK_EQ(tmp, page);
     in_flight_write_pages_.Enqueue(page);
     bytes_written += page->len;
-    in_flight_write_bytes_ += page->len;
   }
 }
 
@@ -622,8 +605,6 @@ void BufferPool::Client::WriteCompleteCallback(Page* page, const Status& write_s
     // repurposed by other clients and 'write_status_' must be checked by this client
     // before reading back the bad data.
     pool_->AddCleanPage(cl, page);
-    dirty_unpinned_bytes_ -= page->len;
-    in_flight_write_bytes_ -= page->len;
     WriteDirtyPagesAsync(); // Start another asynchronous write if needed.
 
     // Notify before releasing lock to avoid race with Page and Client destruction.
@@ -643,10 +624,12 @@ void BufferPool::Client::WaitForWrite(unique_lock<mutex>* client_lock, Page* pag
 string BufferPool::Client::DebugString() {
   lock_guard<mutex> lock(lock_);
   stringstream ss;
-  ss << Substitute("<BufferPool::Client> $0 name: $1 write_status: $2 num_pages: $3 "
-                   "dirty_unpinned_bytes: $4 in_flight_write_bytes: $5 reservation: {$6}",
-      this, name_, write_status_.GetDetail(), num_pages_, dirty_unpinned_bytes_,
-      in_flight_write_bytes_, reservation_.DebugString());
+  ss << Substitute("<BufferPool::Client> $0 name: $1 write_status: $2 "
+                   "buffers allocated $3 num_pages: $4 pinned_bytes: $5 "
+                   "dirty_unpinned_bytes: $6 in_flight_write_bytes: $7 reservation: {$8}",
+      this, name_, write_status_.GetDetail(), buffers_allocated_bytes_, num_pages_,
+      pinned_pages_.bytes(), dirty_unpinned_pages_.bytes(),
+      in_flight_write_pages_.bytes(), reservation_.DebugString());
   ss << "\n  " << pinned_pages_.size() << " pinned pages: ";
   pinned_pages_.Iterate(bind<bool>(Page::DebugStringCallback, &ss, _1));
   ss << "\n  " << dirty_unpinned_pages_.size() << " dirty unpinned pages: ";

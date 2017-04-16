@@ -72,22 +72,22 @@ fi
 # moving to a different build of the toolchain, e.g. when a version is bumped or a
 # compile option is changed. The build id can be found in the output of the toolchain
 # build jobs, it is constructed from the build number and toolchain git hash prefix.
-export IMPALA_TOOLCHAIN_BUILD_ID=363-fdc99090f6
+export IMPALA_TOOLCHAIN_BUILD_ID=374-72f1e9bb85
 
 # Versions of toolchain dependencies.
 # -----------------------------------
 export IMPALA_AVRO_VERSION=1.7.4-p4
 export IMPALA_BINUTILS_VERSION=2.26.1
 export IMPALA_BOOST_VERSION=1.57.0-p1
-export IMPALA_BREAKPAD_VERSION=88e5b2c8806bac3f2c80d2fe80094be5bd371601
+export IMPALA_BREAKPAD_VERSION=88e5b2c8806bac3f2c80d2fe80094be5bd371601-p2
 export IMPALA_BZIP2_VERSION=1.0.6-p2
 export IMPALA_CMAKE_VERSION=3.2.3-p1
 export IMPALA_CRCUTIL_VERSION=440ba7babeff77ffad992df3a10c767f184e946e
 export IMPALA_CYRUS_SASL_VERSION=2.1.23
 export IMPALA_FLATBUFFERS_VERSION=1.6.0
 export IMPALA_GCC_VERSION=4.9.2
-export IMPALA_GFLAGS_VERSION=2.0
-export IMPALA_GLOG_VERSION=0.3.2-p2
+export IMPALA_GFLAGS_VERSION=2.2.0
+export IMPALA_GLOG_VERSION=0.3.4-p2
 export IMPALA_GPERFTOOLS_VERSION=2.5
 export IMPALA_GTEST_VERSION=1.6.0
 export IMPALA_LIBEV_VERSION=4.20
@@ -103,7 +103,7 @@ export IMPALA_PROTOBUF_VERSION=2.6.1
 export IMPALA_POSTGRES_JDBC_DRIVER_VERSION=9.0-801
 export IMPALA_RAPIDJSON_VERSION=0.11
 export IMPALA_RE2_VERSION=20130115-p1
-export IMPALA_SNAPPY_VERSION=1.1.3
+export IMPALA_SNAPPY_VERSION=1.1.4
 export IMPALA_SQUEASEL_VERSION=3.3
 # TPC utilities used for test/benchmark data generation.
 export IMPALA_TPC_DS_VERSION=2.1.0
@@ -121,10 +121,10 @@ if [[ $OSTYPE == "darwin"* ]]; then
 fi
 
 # Kudu version in the toolchain; provides libkudu_client.so and minicluster binaries.
-export IMPALA_KUDU_VERSION=2b0edbe
+export IMPALA_KUDU_VERSION=16dd6e4
 
 # Kudu version used to identify Java client jar from maven
-export KUDU_JAVA_VERSION=1.3.0-SNAPSHOT
+export KUDU_JAVA_VERSION=1.4.0-cdh5.12.0-SNAPSHOT
 
 # Versions of Hadoop ecosystem dependencies.
 # ------------------------------------------

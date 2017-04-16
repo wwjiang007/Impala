@@ -27,6 +27,7 @@ import org.apache.impala.analysis.BinaryPredicate;
 import org.apache.impala.analysis.BoolLiteral;
 import org.apache.impala.analysis.Expr;
 import org.apache.impala.analysis.InPredicate;
+import org.apache.impala.analysis.IsNullPredicate;
 import org.apache.impala.analysis.LiteralExpr;
 import org.apache.impala.analysis.NullLiteral;
 import org.apache.impala.analysis.NumericLiteral;
@@ -84,6 +85,9 @@ public class KuduScanNode extends ScanNode {
 
   private final KuduTable kuduTable_;
 
+  // True if this scan node should use the MT implementation in the backend.
+  private boolean useMtScanNode_;
+
   // Indexes for the set of hosts that will be used for the query.
   // From analyzer.getHostIndex().getIndex(address)
   private final Set<Integer> hostIndexSet_ = Sets.newHashSet();
@@ -133,6 +137,14 @@ public class KuduScanNode extends ScanNode {
       computeScanRangeLocations(analyzer, client, rpcTable);
     } catch (Exception e) {
       throw new ImpalaRuntimeException("Unable to initialize the Kudu scan node", e);
+    }
+
+    // Determine backend scan node implementation to use.
+    if (analyzer.getQueryOptions().isSetMt_dop() &&
+        analyzer.getQueryOptions().mt_dop > 0) {
+      useMtScanNode_ = true;
+    } else {
+      useMtScanNode_ = false;
     }
 
     computeStats(analyzer);
@@ -293,6 +305,7 @@ public class KuduScanNode extends ScanNode {
   protected void toThrift(TPlanNode node) {
     node.node_type = TPlanNodeType.KUDU_SCAN_NODE;
     node.kudu_scan_node = new TKuduScanNode(desc_.getId().asInt());
+    node.kudu_scan_node.setUse_mt_scan_node(useMtScanNode_);
   }
 
   /**
@@ -310,7 +323,8 @@ public class KuduScanNode extends ScanNode {
     while (it.hasNext()) {
       Expr predicate = it.next();
       if (tryConvertBinaryKuduPredicate(analyzer, rpcTable, predicate) ||
-          tryConvertInListKuduPredicate(analyzer, rpcTable, predicate)) {
+          tryConvertInListKuduPredicate(analyzer, rpcTable, predicate) ||
+          tryConvertIsNullKuduPredicate(analyzer, rpcTable, predicate)) {
         it.remove();
       }
     }
@@ -420,6 +434,35 @@ public class KuduScanNode extends ScanNode {
     ColumnSchema column = table.getSchema().getColumn(colName);
     kuduPredicates_.add(KuduPredicate.newInListPredicate(column, values));
     kuduConjuncts_.add(predicate);
+    return true;
+  }
+
+  /**
+   * If IS NULL/IS NOT NULL 'expr' can be converted to a KuduPredicate,
+   * returns true and updates kuduPredicates_ and kuduConjuncts_.
+   */
+  private boolean tryConvertIsNullKuduPredicate(Analyzer analyzer,
+      org.apache.kudu.client.KuduTable table, Expr expr) {
+    if (!(expr instanceof IsNullPredicate)) return false;
+    IsNullPredicate predicate = (IsNullPredicate) expr;
+
+    // Do not convert if expression is more than a SlotRef
+    // This is true even for casts, as certain casts can take a non-NULL
+    // value and produce a NULL. For example, CAST('test' as tinyint)
+    // is NULL.
+    if (!(predicate.getChild(0) instanceof SlotRef)) return false;
+    SlotRef ref = (SlotRef) predicate.getChild(0);
+
+    String colName = ref.getDesc().getColumn().getName();
+    ColumnSchema column = table.getSchema().getColumn(colName);
+    KuduPredicate kuduPredicate = null;
+    if (predicate.isNotNull()) {
+      kuduPredicate = KuduPredicate.newIsNotNullPredicate(column);
+    } else {
+      kuduPredicate = KuduPredicate.newIsNullPredicate(column);
+    }
+    kuduConjuncts_.add(predicate);
+    kuduPredicates_.add(kuduPredicate);
     return true;
   }
 

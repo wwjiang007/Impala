@@ -254,6 +254,10 @@ struct THBaseScanNode {
 
 struct TKuduScanNode {
   1: required Types.TTupleId tuple_id
+
+  // Indicates whether the MT scan node implementation should be used.
+  // If this is true, then the MT_DOP query option must be > 0.
+  2: optional bool use_mt_scan_node
 }
 
 struct TEqJoinCondition {
@@ -441,6 +445,8 @@ struct TUnionNode {
   2: required list<list<Exprs.TExpr>> result_expr_lists
   // Separate list of expr lists coming from a constant select stmts.
   3: required list<list<Exprs.TExpr>> const_expr_lists
+  // Index of the first child that needs to be materialized.
+  4: required i64 first_materialized_child_idx
 }
 
 struct TExchangeNode {
