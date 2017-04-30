@@ -19,6 +19,7 @@ package org.apache.impala.planner;
 
 import org.apache.impala.catalog.Catalog;
 import org.apache.impala.catalog.Db;
+import org.apache.impala.catalog.Type;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.RuntimeEnv;
 import org.apache.impala.testutil.TestUtils;
@@ -32,6 +33,7 @@ import org.junit.Assume;
 import org.junit.Test;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
 
 // All planner tests, except for S3 specific tests should go here.
 public class PlannerTest extends PlannerTestBase {
@@ -368,5 +370,22 @@ public class PlannerTest extends PlannerTestBase {
     if (request.query_options.isSetMt_dop()) actualMtDop = request.query_options.mt_dop;
     // Check that the effective MT_DOP is as expected.
     Assert.assertEquals(actualMtDop, expectedMtDop);
+  }
+
+  @Test
+  public void testResourceRequirements() {
+    // Tests the resource requirement computation from the planner.
+    TQueryOptions options = defaultQueryOptions();
+    options.setExplain_level(TExplainLevel.EXTENDED);
+    options.setNum_scanner_threads(1); // Required so that output doesn't vary by machine
+    runPlannerTestFile("resource-requirements", options, false);
+  }
+
+  @Test
+  public void testSortExprMaterialization() {
+    addTestFunction("TestFn", Lists.newArrayList(Type.DOUBLE), false);
+    TQueryOptions options = defaultQueryOptions();
+    options.setExplain_level(TExplainLevel.EXTENDED);
+    runPlannerTestFile("sort-expr-materialization", options);
   }
 }

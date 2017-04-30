@@ -28,6 +28,7 @@ from tests.common.environ import IMPALAD_BUILD, USING_OLD_AGGS_JOINS
 from tests.util.filesystem_utils import (
     IS_ISILON,
     IS_LOCAL,
+    IS_HDFS,
     IS_S3,
     SECONDARY_FILESYSTEM)
 
@@ -60,6 +61,7 @@ class SkipIf:
   kudu_not_supported = pytest.mark.skipif(os.environ["KUDU_IS_SUPPORTED"] == "false",
       reason="Kudu is not supported")
   not_s3 = pytest.mark.skipif(not IS_S3, reason="S3 Filesystem needed")
+  not_hdfs = pytest.mark.skipif(not IS_HDFS, reason="HDFS Filesystem needed")
   no_secondary_fs = pytest.mark.skipif(not SECONDARY_FILESYSTEM,
       reason="Secondary filesystem needed")
 
@@ -112,6 +114,11 @@ class SkipIfLocal:
       reason="Tests rely on HDFS qualified paths")
   root_path = pytest.mark.skipif(IS_LOCAL,
       reason="Tests rely on the root directory")
+
+class SkipIfNotHdfsMinicluster:
+  # These ones are skipped when not running against a local HDFS mini-cluster.
+  plans = pytest.mark.skipif(not IS_HDFS or pytest.config.option.testing_remote_cluster,
+      reason="Test assumes plans from local HDFS mini-cluster")
 
 class SkipIfBuildType:
   not_dev_build = pytest.mark.skipif(not IMPALAD_BUILD.is_dev(),

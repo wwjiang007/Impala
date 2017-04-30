@@ -90,6 +90,7 @@ class Status {
 
   // Return a MEM_LIMIT_EXCEEDED error status.
   static Status MemLimitExceeded();
+  static Status MemLimitExceeded(const std::string& details);
 
   static const Status CANCELLED;
   static const Status DEPRECATED_RPC;
@@ -250,6 +251,9 @@ class Status {
 
   // A non-inline function for freeing status' message.
   void FreeMessage() noexcept;
+
+  /// A non-inline function for unwrapping a TStatus object.
+  void FromThrift(const TStatus& status);
 
   /// Status uses a naked pointer to ensure the size of an instance on the stack is only
   /// the sizeof(ErrorMsg*). Every Status owns its ErrorMsg instance.

@@ -187,6 +187,17 @@ public class SortNode extends PlanNode {
       }
       output.append("\n");
     }
+
+    if (detailLevel.ordinal() >= TExplainLevel.EXTENDED.ordinal()
+        && info_.getMaterializedOrderingExprs().size() > 0) {
+      output.append(detailPrefix + "materialized: ");
+      for (int i = 0; i < info_.getMaterializedOrderingExprs().size(); ++i) {
+        if (i > 0) output.append(", ");
+        output.append(info_.getMaterializedOrderingExprs().get(i).toSql());
+      }
+      output.append("\n");
+    }
+
     return output.toString();
   }
 
@@ -205,10 +216,12 @@ public class SortNode extends PlanNode {
   }
 
   @Override
-  public void computeCosts(TQueryOptions queryOptions) {
+  public void computeResourceProfile(TQueryOptions queryOptions) {
     Preconditions.checkState(hasValidStats());
     if (useTopN_) {
-      perHostMemCost_ = (long) Math.ceil((cardinality_ + offset_) * avgRowSize_);
+      long perInstanceMemEstimate =
+              (long) Math.ceil((cardinality_ + offset_) * avgRowSize_);
+      resourceProfile_ = new ResourceProfile(perInstanceMemEstimate, 0);
       return;
     }
 
@@ -233,7 +246,15 @@ public class SortNode extends PlanNode {
     // doubles the block size when there are var-len columns present.
     if (hasVarLenSlots) blockSize *= 2;
     double numInputBlocks = Math.ceil(fullInputSize / blockSize);
-    perHostMemCost_ = blockSize * (long) Math.ceil(Math.sqrt(numInputBlocks));
+    long perInstanceMemEstimate = blockSize * (long) Math.ceil(Math.sqrt(numInputBlocks));
+
+    // Must be kept in sync with min_buffers_required in Sorter in be.
+    long perInstanceMinReservation = 3 * SPILLABLE_BUFFER_BYTES;
+    if (info_.getSortTupleDescriptor().hasVarLenSlots()) {
+      perInstanceMinReservation *= 2;
+    }
+    resourceProfile_ =
+        new ResourceProfile(perInstanceMemEstimate, perInstanceMinReservation);
   }
 
   private static String getDisplayName(boolean isTopN, boolean isMergeOnly) {

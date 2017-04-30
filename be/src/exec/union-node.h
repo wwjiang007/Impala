@@ -21,6 +21,7 @@
 
 #include <boost/scoped_ptr.hpp>
 
+#include "codegen/impala-ir.h"
 #include "exec/exec-node.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
@@ -46,6 +47,7 @@ class UnionNode : public ExecNode {
 
   virtual Status Init(const TPlanNode& tnode, RuntimeState* state);
   virtual Status Prepare(RuntimeState* state);
+  virtual void Codegen(RuntimeState* state);
   virtual Status Open(RuntimeState* state);
   virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos);
   virtual Status Reset(RuntimeState* state);
@@ -83,6 +85,13 @@ class UnionNode : public ExecNode {
   /// Index of current row in child_row_batch_.
   int child_row_idx_;
 
+  typedef void (*UnionMaterializeBatchFn)(UnionNode*, RowBatch*, uint8_t**);
+  /// Vector of pointers to codegen'ed MaterializeBatch functions. The vector contains one
+  /// function for each child. The size of the vector should be equal to the number of
+  /// children. If a child is passthrough, there should be a NULL for that child. If
+  /// Codegen is disabled, there should be a NULL for every child.
+  std::vector<UnionMaterializeBatchFn> codegend_union_materialize_batch_fns_;
+
   /// Saved from the last to GetNext() on the current child.
   bool child_eos_;
 
@@ -96,6 +105,9 @@ class UnionNode : public ExecNode {
   /// END: Members that must be Reset()
   /////////////////////////////////////////
 
+  /// The following GetNext* functions don't apply the limit. It must be enforced by the
+  /// caller.
+
   /// GetNext() for the passthrough case. We pass 'row_batch' directly into the GetNext()
   /// call on the child.
   Status GetNextPassThrough(RuntimeState* state, RowBatch* row_batch);
@@ -107,31 +119,36 @@ class UnionNode : public ExecNode {
   /// GetNext() for the constant expression case.
   Status GetNextConst(RuntimeState* state, RowBatch* row_batch);
 
+  /// Evaluates exprs for the current child and materializes the results into 'tuple_buf',
+  /// which is attached to 'dst_batch'. Runs until 'dst_batch' is at capacity, or all rows
+  /// have been consumed from the current child batch. Updates 'child_row_idx_'.
+  void MaterializeBatch(RowBatch* dst_batch, uint8_t** tuple_buf);
+
   /// Evaluates 'exprs' over 'row', materializes the results in 'tuple_buf'.
   /// and appends the new tuple to 'dst_batch'. Increments 'num_rows_returned_'.
-  inline void MaterializeExprs(const std::vector<ExprContext*>& exprs,
+  void MaterializeExprs(const std::vector<ExprContext*>& exprs,
       TupleRow* row, uint8_t* tuple_buf, RowBatch* dst_batch);
 
   /// Returns true if the child at 'child_idx' can be passed through.
-  inline bool IsChildPassthrough(int child_idx) const {
+  bool IsChildPassthrough(int child_idx) const {
     DCHECK_LT(child_idx, children_.size());
     return child_idx < first_materialized_child_idx_;
   }
 
   /// Returns true if there are still rows to be returned from passthrough children.
-  inline bool HasMorePassthrough() const {
+  bool HasMorePassthrough() const {
     return child_idx_ < first_materialized_child_idx_;
   }
 
   /// Returns true if there are still rows to be returned from children that need
   /// materialization.
-  inline bool HasMoreMaterialized() const {
+  bool HasMoreMaterialized() const {
     return first_materialized_child_idx_ != children_.size() &&
         child_idx_ < children_.size();
   }
 
   /// Returns true if there are still rows to be returned from constant expressions.
-  inline bool HasMoreConst(const RuntimeState* state) const {
+  bool HasMoreConst(const RuntimeState* state) const {
     return state->instance_ctx().per_fragment_instance_idx == 0 &&
         const_expr_list_idx_ < const_expr_lists_.size();
   }

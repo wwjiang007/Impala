@@ -25,7 +25,8 @@
 /// =============
 /// The lock acquisition order is:
 /// 1. Client::lock_
-/// 2. BufferPool::clean_pages_lock_
+/// 2. FreeBufferArena::lock_. If multiple arena locks are acquired, must be acquired in
+///    ascending order.
 /// 3. Page::lock
 ///
 /// If a reference to a Page is acquired through a page list, the Page* reference only
@@ -44,7 +45,7 @@
 ///     a dirty unpinned page. The page is in Client::write_in_flight_pages_. For
 ///     accounting purposes this is considered a dirty page.
 /// * Unpinned - Clean: When the write has completed but the page was not evicted. The
-///     page is in BufferPool::clean_pages_.
+///     page is in a clean pages list in a BufferAllocator arena.
 /// * Unpinned - Evicted: After a clean page's buffer has been reclaimed. The page is
 ///     not in any list.
 ///
@@ -236,6 +237,10 @@ class BufferPool::Client {
   /// not be held.
   void WaitForWrite(boost::unique_lock<boost::mutex>* client_lock, Page* page);
 
+  /// Test helper: wait for all in-flight writes to complete.
+  /// 'lock_' must not be held by the caller.
+  void WaitForAllWrites();
+
   /// Asserts that 'client_lock' is holding 'lock_'.
   void DCheckHoldsLock(const boost::unique_lock<boost::mutex>& client_lock) {
     DCHECK(client_lock.mutex() == &lock_ && client_lock.owns_lock());
@@ -244,6 +249,7 @@ class BufferPool::Client {
   ReservationTracker* reservation() { return &reservation_; }
   const BufferPoolClientCounters& counters() const { return counters_; }
   bool spilling_enabled() const { return file_group_ != NULL; }
+  void set_debug_write_delay_ms(int val) { debug_write_delay_ms_ = val; }
 
   std::string DebugString();
 
@@ -303,6 +309,9 @@ class BufferPool::Client {
   /// The RuntimeProfile counters for this client, owned by the client's RuntimeProfile.
   /// All non-NULL.
   BufferPoolClientCounters counters_;
+
+  /// Debug option to delay write completion.
+  int debug_write_delay_ms_;
 
   /// Lock to protect the below member variables;
   boost::mutex lock_;

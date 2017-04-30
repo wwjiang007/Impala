@@ -26,7 +26,6 @@
 #include <gutil/strings/join.h>
 #include <gutil/strings/substitute.h>
 
-#include "gutil/bits.h"
 #include "runtime/runtime-state.h"
 #include "runtime/tmp-file-mgr-internal.h"
 #include "util/bit-util.h"
@@ -271,11 +270,7 @@ Status TmpFileMgr::FileGroup::CreateFiles() {
   }
   DCHECK_EQ(tmp_files_.size(), files_allocated);
   if (tmp_files_.size() == 0) {
-    // TODO: IMPALA-4697: the merged errors do not show up in the query error log,
-    // so we must point users to the impalad error log.
-    Status err_status(
-        "Could not create files in any configured scratch directories (--scratch_dirs). "
-        "See logs for previous errors that may have caused this.");
+    Status err_status(TErrorCode::SCRATCH_ALLOCATION_FAILED);
     for (Status& err : scratch_errors_) err_status.MergeStatus(err);
     return err_status;
   }
@@ -303,7 +298,7 @@ Status TmpFileMgr::FileGroup::AllocateSpace(
     int64_t num_bytes, File** tmp_file, int64_t* file_offset) {
   lock_guard<SpinLock> lock(lock_);
   int64_t scratch_range_bytes = max<int64_t>(1L, BitUtil::RoundUpToPowerOfTwo(num_bytes));
-  int free_ranges_idx = Bits::Log2Ceiling64(scratch_range_bytes);
+  int free_ranges_idx = BitUtil::Log2Ceiling64(scratch_range_bytes);
   if (!free_ranges_[free_ranges_idx].empty()) {
     *tmp_file = free_ranges_[free_ranges_idx].back().first;
     *file_offset = free_ranges_[free_ranges_idx].back().second;
@@ -346,7 +341,7 @@ Status TmpFileMgr::FileGroup::AllocateSpace(
 void TmpFileMgr::FileGroup::RecycleFileRange(unique_ptr<WriteHandle> handle) {
   int64_t scratch_range_bytes =
       max<int64_t>(1L, BitUtil::RoundUpToPowerOfTwo(handle->len()));
-  int free_ranges_idx = Bits::Log2Ceiling64(scratch_range_bytes);
+  int free_ranges_idx = BitUtil::Log2Ceiling64(scratch_range_bytes);
   lock_guard<SpinLock> lock(lock_);
   free_ranges_[free_ranges_idx].emplace_back(
       handle->file_, handle->write_range_->offset());
@@ -376,6 +371,7 @@ Status TmpFileMgr::FileGroup::Read(WriteHandle* handle, MemRange buffer) {
   DCHECK(handle->write_range_ != nullptr);
   DCHECK(!handle->is_cancelled_);
   DCHECK_EQ(buffer.len(), handle->len());
+  Status status;
 
   // Don't grab 'lock_' in this method - it is not necessary because we don't touch
   // any members that it protects and could block other threads for the duration of
@@ -388,32 +384,42 @@ Status TmpFileMgr::FileGroup::Read(WriteHandle* handle, MemRange buffer) {
   scan_range->Reset(nullptr, handle->write_range_->file(), handle->write_range_->len(),
       handle->write_range_->offset(), handle->write_range_->disk_id(), false,
       DiskIoMgr::BufferOpts::ReadInto(buffer.data(), buffer.len()));
-  DiskIoMgr::BufferDescriptor* io_mgr_buffer;
+  DiskIoMgr::BufferDescriptor* io_mgr_buffer = nullptr;
   {
     SCOPED_TIMER(disk_read_timer_);
     read_counter_->Add(1);
     bytes_read_counter_->Add(buffer.len());
-    RETURN_IF_ERROR(io_mgr_->Read(io_ctx_, scan_range, &io_mgr_buffer));
+    status = io_mgr_->Read(io_ctx_, scan_range, &io_mgr_buffer);
+    if (!status.ok()) goto exit;
   }
 
   if (FLAGS_disk_spill_encryption) {
-    RETURN_IF_ERROR(handle->CheckHashAndDecrypt(buffer));
+    status = handle->CheckHashAndDecrypt(buffer);
+    if (!status.ok()) goto exit;
   }
 
-  DCHECK_EQ(io_mgr_buffer->buffer(), buffer.data());
-  DCHECK_EQ(io_mgr_buffer->len(), buffer.len());
   DCHECK(io_mgr_buffer->eosr());
-  io_mgr_buffer->Return();
-  return Status::OK();
+  DCHECK_LE(io_mgr_buffer->len(), buffer.len());
+  if (io_mgr_buffer->len() < buffer.len()) {
+    // The read was truncated - this is an error.
+    status = Status(TErrorCode::SCRATCH_READ_TRUNCATED, buffer.len(),
+        handle->write_range_->file(), handle->write_range_->offset(),
+        io_mgr_buffer->len());
+    goto exit;
+  }
+  DCHECK_EQ(io_mgr_buffer->buffer(), buffer.data());
+
+exit:
+  // Always return the buffer before exiting to avoid leaking it.
+  if (io_mgr_buffer != nullptr) io_mgr_buffer->Return();
+  return status;
 }
 
-Status TmpFileMgr::FileGroup::CancelWriteAndRestoreData(
+Status TmpFileMgr::FileGroup::RestoreData(
     unique_ptr<WriteHandle> handle, MemRange buffer) {
   DCHECK_EQ(handle->write_range_->data(), buffer.data());
   DCHECK_EQ(handle->len(), buffer.len());
-  handle->Cancel();
-
-  handle->WaitForWrite();
+  DCHECK(!handle->write_in_flight_);
   // Decrypt after the write is finished, so that we don't accidentally write decrypted
   // data to disk.
   Status status;
