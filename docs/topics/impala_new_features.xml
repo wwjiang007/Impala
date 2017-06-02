@@ -46,6 +46,37 @@ under the License.
 
   </conbody>
 
+<!-- All 2.9.x new features go under here -->
+
+  <concept rev="2.9.0" id="new_features_290">
+
+    <title>New Features in <keyword keyref="impala29_full"/></title>
+
+    <conbody>
+
+      <p>
+        For the full list of issues closed in this release, including the issues
+        marked as <q>new features</q>, see the
+        <xref keyref="changelog_29">changelog for <keyword keyref="impala29"/></xref>.
+      </p>
+
+      <p>
+        The following are some of the most significant new features in this release:
+      </p>
+
+      <ul id="feature_list">
+        <li>
+          <p rev="IMPALA-4729">
+            A new function, <codeph>replace()</codeph>, which is faster than
+            <codeph>regexp_replace()</codeph> for simple string substitutions.
+            See <xref keyref="string_functions"/> for details.
+          </p>
+        </li>
+      </ul>
+
+    </conbody>
+  </concept>
+
 <!-- All 2.8.x new features go under here -->
 
   <concept rev="2.8.0" id="new_features_280">
@@ -131,14 +162,6 @@ under the License.
                 partition key columns, and each partition is only written
                 by a single host, reducing the amount of memory needed to buffer
                 Parquet data while the data blocks are being constructed.
-              </p>
-            </li>
-            <li>
-              <p rev="IMPALA-4163">
-                A new hint, <codeph>SORTBY(<varname>cols</varname>)</codeph>,
-                allows Impala <codeph>INSERT</codeph> operations on a Parquet table
-                to produce optimized output files with better compressibility
-                and a more compact range of min/max values within each data file.
               </p>
             </li>
             <li>

@@ -48,8 +48,7 @@ public class CreateTableStmt extends StatementBase {
 
   @VisibleForTesting
   final static String KUDU_STORAGE_HANDLER_ERROR_MESSAGE = "Kudu tables must be"
-      + " specified using 'STORED AS KUDU' without using the storage handler table"
-      + " property.";
+      + " specified using 'STORED AS KUDU'.";
 
   // Table parameters specified in a CREATE TABLE statement
   private final TableDef tableDef_;
@@ -91,6 +90,7 @@ public class CreateTableStmt extends StatementBase {
   public List<KuduPartitionParam> getKuduPartitionParams() {
     return tableDef_.getKuduPartitionParams();
   }
+  public List<String> getSortColumns() { return tableDef_.getSortColumns(); }
   public String getComment() { return tableDef_.getComment(); }
   Map<String, String> getTblProperties() { return tableDef_.getTblProperties(); }
   private HdfsCachingOp getCachingOp() { return tableDef_.getCachingOp(); }
@@ -144,6 +144,7 @@ public class CreateTableStmt extends StatementBase {
     if (getRowFormat() != null) params.setRow_format(getRowFormat().toThrift());
     params.setFile_format(getFileFormat());
     params.setIf_not_exists(getIfNotExists());
+    params.setSort_columns(getSortColumns());
     params.setTable_properties(getTblProperties());
     params.setSerde_properties(getSerdeProperties());
     for (KuduPartitionParam d: getKuduPartitionParams()) {
@@ -209,8 +210,11 @@ public class CreateTableStmt extends StatementBase {
    * Kudu tables.
    */
   private void analyzeKuduTableProperties(Analyzer analyzer) throws AnalysisException {
-    if (getTblProperties().containsKey(KuduTable.KEY_STORAGE_HANDLER)) {
-      throw new AnalysisException(KUDU_STORAGE_HANDLER_ERROR_MESSAGE);
+    // Only the Kudu storage handler may be specified for Kudu tables.
+    String handler = getTblProperties().get(KuduTable.KEY_STORAGE_HANDLER);
+    if (handler != null && !handler.equals(KuduTable.KUDU_STORAGE_HANDLER)) {
+      throw new AnalysisException("Invalid storage handler specified for Kudu table: " +
+          handler);
     }
     getTblProperties().put(KuduTable.KEY_STORAGE_HANDLER, KuduTable.KUDU_STORAGE_HANDLER);
 
@@ -226,8 +230,7 @@ public class CreateTableStmt extends StatementBase {
     }
 
     // TODO: Find out what is creating a directory in HDFS and stop doing that. Kudu
-    //       tables shouldn't have HDFS dirs.
-    //       https://issues.cloudera.org/browse/IMPALA-3570
+    //       tables shouldn't have HDFS dirs: IMPALA-3570
     AnalysisUtils.throwIfNotNull(getCachingOp(),
         "A Kudu table cannot be cached in HDFS.");
     AnalysisUtils.throwIfNotNull(getLocation(), "LOCATION cannot be specified for a " +

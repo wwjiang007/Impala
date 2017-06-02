@@ -82,25 +82,12 @@ const int UNEXPECTED_REMOTE_BYTES_WARN_THRESHOLD = 64 * 1024 * 1024;
 HdfsScanNodeBase::HdfsScanNodeBase(ObjectPool* pool, const TPlanNode& tnode,
                            const DescriptorTbl& descs)
     : ScanNode(pool, tnode, descs),
-      runtime_state_(NULL),
       min_max_tuple_id_(tnode.hdfs_scan_node.__isset.min_max_tuple_id ?
           tnode.hdfs_scan_node.min_max_tuple_id : -1),
-      min_max_tuple_desc_(nullptr),
       skip_header_line_count_(tnode.hdfs_scan_node.__isset.skip_header_line_count ?
           tnode.hdfs_scan_node.skip_header_line_count : 0),
       tuple_id_(tnode.hdfs_scan_node.tuple_id),
-      reader_context_(NULL),
-      tuple_desc_(NULL),
-      hdfs_table_(NULL),
-      initial_ranges_issued_(false),
-      counters_running_(false),
-      max_compressed_text_file_length_(NULL),
-      disks_accessed_bitmap_(TUnit::UNIT, 0),
-      bytes_read_local_(NULL),
-      bytes_read_short_circuit_(NULL),
-      bytes_read_dn_cache_(NULL),
-      num_remote_ranges_(NULL),
-      unexpected_remote_bytes_(NULL) {
+      disks_accessed_bitmap_(TUnit::UNIT, 0){
 }
 
 HdfsScanNodeBase::~HdfsScanNodeBase() {
@@ -310,7 +297,7 @@ Status HdfsScanNodeBase::Prepare(RuntimeState* state) {
   ImpaladMetrics::NUM_RANGES_MISSING_VOLUME_ID->Increment(num_ranges_missing_volume_id);
 
   // Add per volume stats to the runtime profile
-  PerVolumnStats per_volume_stats;
+  PerVolumeStats per_volume_stats;
   stringstream str;
   UpdateHdfsSplitStats(*scan_range_params_, &per_volume_stats);
   PrintHdfsSplitStats(per_volume_stats, &str);
@@ -439,6 +426,10 @@ Status HdfsScanNodeBase::Open(RuntimeState* state) {
       TUnit::UNIT);
   unexpected_remote_bytes_ = ADD_COUNTER(runtime_profile(), "BytesReadRemoteUnexpected",
       TUnit::BYTES);
+  cached_file_handles_hit_count_ = ADD_COUNTER(runtime_profile(),
+      "CachedFileHandlesHitCount", TUnit::UNIT);
+  cached_file_handles_miss_count_ = ADD_COUNTER(runtime_profile(),
+      "CachedFileHandlesMissCount", TUnit::UNIT);
 
   max_compressed_text_file_length_ = runtime_profile()->AddHighWaterMarkCounter(
       "MaxCompressedTextFileLength", TUnit::BYTES);
@@ -678,7 +669,7 @@ Status HdfsScanNodeBase::CreateAndOpenScanner(HdfsPartitionDescriptor* partition
           partition->file_format()));
   }
   DCHECK(scanner->get() != NULL);
-  Status status = ExecDebugAction(TExecNodePhase::PREPARE_SCANNER, runtime_state_);
+  Status status = ScanNodeDebugAction(TExecNodePhase::PREPARE_SCANNER);
   if (status.ok()) {
     status = scanner->get()->Open(context);
     if (!status.ok()) {
@@ -806,7 +797,7 @@ void HdfsScanNodeBase::ComputeSlotMaterializationOrder(vector<int>* order) const
 
 void HdfsScanNodeBase::UpdateHdfsSplitStats(
     const vector<TScanRangeParams>& scan_range_params_list,
-    PerVolumnStats* per_volume_stats) {
+    PerVolumeStats* per_volume_stats) {
   pair<int, int64_t> init_value(0, 0);
   for (const TScanRangeParams& scan_range_params: scan_range_params_list) {
     const TScanRange& scan_range = scan_range_params.scan_range;
@@ -819,9 +810,9 @@ void HdfsScanNodeBase::UpdateHdfsSplitStats(
   }
 }
 
-void HdfsScanNodeBase::PrintHdfsSplitStats(const PerVolumnStats& per_volume_stats,
+void HdfsScanNodeBase::PrintHdfsSplitStats(const PerVolumeStats& per_volume_stats,
     stringstream* ss) {
-  for (PerVolumnStats::const_iterator i = per_volume_stats.begin();
+  for (PerVolumeStats::const_iterator i = per_volume_stats.begin();
        i != per_volume_stats.end(); ++i) {
      (*ss) << i->first << ":" << i->second.first << "/"
          << PrettyPrinter::Print(i->second.second, TUnit::BYTES) << " ";
@@ -882,6 +873,10 @@ void HdfsScanNodeBase::StopAndFinalizeCounters() {
         runtime_state_->io_mgr()->num_remote_ranges(reader_context_)));
     unexpected_remote_bytes_->Set(
         runtime_state_->io_mgr()->unexpected_remote_bytes(reader_context_));
+    cached_file_handles_hit_count_->Set(
+        runtime_state_->io_mgr()->cached_file_handles_hit_count(reader_context_));
+    cached_file_handles_miss_count_->Set(
+        runtime_state_->io_mgr()->cached_file_handles_miss_count(reader_context_));
 
     if (unexpected_remote_bytes_->value() >= UNEXPECTED_REMOTE_BYTES_WARN_THRESHOLD) {
       runtime_state_->LogError(ErrorMsg(TErrorCode::GENERAL, Substitute(
@@ -902,6 +897,6 @@ void HdfsScanNodeBase::StopAndFinalizeCounters() {
   }
 }
 
-Status HdfsScanNodeBase::TriggerDebugAction() {
-  return ExecDebugAction(TExecNodePhase::GETNEXT, runtime_state_);
+Status HdfsScanNodeBase::ScanNodeDebugAction(TExecNodePhase::type phase) {
+  return ExecDebugAction(phase, runtime_state_);
 }

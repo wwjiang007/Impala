@@ -19,6 +19,7 @@ package org.apache.impala.catalog;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
@@ -150,6 +151,14 @@ public class KuduTable extends Table {
     return ImmutableList.copyOf(partitionBy_);
   }
 
+  public Set<String> getPartitionColumnNames() {
+    Set<String> ret = new HashSet<String>();
+    for (KuduPartitionParam partitionParam : partitionBy_) {
+      ret.addAll(partitionParam.getColumnNames());
+    }
+    return ret;
+  }
+
   /**
    * Returns the range-based partitioning of this table if it exists, null otherwise.
    */
@@ -192,7 +201,7 @@ public class KuduTable extends Table {
     kuduMasters_ = msTable_.getParameters().get(KuduTable.KEY_MASTER_HOSTS);
     Preconditions.checkNotNull(kuduMasters_);
     org.apache.kudu.client.KuduTable kuduTable = null;
-    numRows_ = getRowCount(msTable_.getParameters());
+    setTableStats(msTable_);
 
     // Connect to Kudu to retrieve table metadata
     try (KuduClient kuduClient = KuduUtil.createKuduClient(getKuduMasterHosts())) {

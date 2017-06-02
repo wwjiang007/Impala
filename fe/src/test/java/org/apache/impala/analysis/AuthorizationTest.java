@@ -30,10 +30,10 @@ import java.util.UUID;
 
 import org.apache.hadoop.conf.Configuration;
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_SECURITY_AUTH_TO_LOCAL;
-import org.apache.hive.service.cli.thrift.TGetColumnsReq;
-import org.apache.hive.service.cli.thrift.TGetSchemasReq;
-import org.apache.hive.service.cli.thrift.TGetTablesReq;
 import org.apache.sentry.provider.common.ResourceAuthorizationProvider;
+import org.apache.hive.service.rpc.thrift.TGetColumnsReq;
+import org.apache.hive.service.rpc.thrift.TGetSchemasReq;
+import org.apache.hive.service.rpc.thrift.TGetTablesReq;
 import org.apache.sentry.provider.file.LocalGroupResourceAuthorizationProvider;
 import org.junit.After;
 import org.junit.AfterClass;
@@ -1722,10 +1722,11 @@ public class AuthorizationTest {
     }
 
     // Get all tables of tpcds
+    final int numTpcdsTables = 24;
     req.get_tables_req.setSchemaName("tpcds");
     req.get_tables_req.setTableName("%");
     resp = fe_.execHiveServer2MetadataOp(req);
-    assertEquals(11, resp.rows.size());
+    assertEquals(numTpcdsTables, resp.rows.size());
   }
 
   @Test

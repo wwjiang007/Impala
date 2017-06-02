@@ -16,6 +16,7 @@
 # under the License.
 
 from tests.common.impala_test_suite import ImpalaTestSuite
+from tests.common.skip import SkipIfS3, SkipIfADLS, SkipIfIsilon, SkipIfLocal
 
 class TestObservability(ImpalaTestSuite):
   @classmethod
@@ -50,3 +51,45 @@ class TestObservability(ImpalaTestSuite):
     assert result.exec_summary[5]['operator'] == '04:EXCHANGE'
     assert result.exec_summary[5]['num_rows'] == 25
     assert result.exec_summary[5]['est_num_rows'] == 25
+
+  @SkipIfS3.hbase
+  @SkipIfLocal.hbase
+  @SkipIfIsilon.hbase
+  @SkipIfADLS.hbase
+  def test_scan_summary(self):
+    """IMPALA-4499: Checks that the exec summary for scans show the table name."""
+    # HDFS table
+    query = "select count(*) from functional.alltypestiny"
+    result = self.execute_query(query)
+    scan_idx = len(result.exec_summary) - 1
+    assert result.exec_summary[scan_idx]['operator'] == '00:SCAN HDFS'
+    assert result.exec_summary[scan_idx]['detail'] == 'functional.alltypestiny'
+
+    # KUDU table
+    query = "select count(*) from functional_kudu.alltypestiny"
+    result = self.execute_query(query)
+    scan_idx = len(result.exec_summary) - 1
+    assert result.exec_summary[scan_idx]['operator'] == '00:SCAN KUDU'
+    assert result.exec_summary[scan_idx]['detail'] == 'functional_kudu.alltypestiny'
+
+    # HBASE table
+    query = "select count(*) from functional_hbase.alltypestiny"
+    result = self.execute_query(query)
+    scan_idx = len(result.exec_summary) - 1
+    assert result.exec_summary[scan_idx]['operator'] == '00:SCAN HBASE'
+    assert result.exec_summary[scan_idx]['detail'] == 'functional_hbase.alltypestiny'
+
+  def test_get_profile(self):
+    """Tests that the query profile shows expected query states."""
+    query = "select count(*) from functional.alltypes"
+    handle = self.execute_query_async(query, dict())
+    profile = self.client.get_runtime_profile(handle)
+    # If ExecuteStatement() has completed but the results haven't been fetched yet, the
+    # query must have at least reached RUNNING.
+    assert "Query State: RUNNING" in profile or \
+      "Query State: FINISHED" in profile, profile
+
+    results = self.client.fetch(query, handle)
+    profile = self.client.get_runtime_profile(handle)
+    # After fetching the results, the query must be in state FINISHED.
+    assert "Query State: FINISHED" in profile, profile

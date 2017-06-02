@@ -900,8 +900,7 @@ class QueryRunner(object):
             op_handle_to_query_id(cursor._last_operation.handle), e)
     caught_msg = str(caught_exception).lower().strip()
 
-    # Exceeding a mem limit may result in the message "cancelled".
-    # https://issues.cloudera.org/browse/IMPALA-2234
+    # Exceeding a mem limit may result in the message "cancelled". See IMPALA-2234
     if "memory limit exceeded" in caught_msg or \
        "repartitioning did not reduce the size of a spilled partition" in caught_msg or \
        caught_msg == "cancelled":
@@ -1650,6 +1649,7 @@ def main():
   cli_options.add_logging_options(parser)
   cli_options.add_cluster_options(parser)
   cli_options.add_kerberos_options(parser)
+  cli_options.add_ssl_options(parser)
   parser.add_argument(
       "--runtime-info-path",
       default=os.path.join(gettempdir(), "{cm_host}_query_runtime_info.json"),
@@ -1825,7 +1825,6 @@ def main():
             query_option=query_option, value=value))
 
   cluster = cli_options.create_cluster(args)
-  cluster.is_kerberized = args.use_kerberos
   impala = cluster.impala
   if impala.find_stopped_impalads():
     impala.restart()

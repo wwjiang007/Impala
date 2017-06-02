@@ -26,6 +26,7 @@
 /// needed for scoped_ptr to work on ObjectPool
 #include "common/object-pool.h"
 #include "exec/data-sink.h"
+#include "exec/hdfs-table-writer.h"
 #include "runtime/descriptors.h"
 
 namespace impala {
@@ -34,7 +35,6 @@ class Expr;
 class TupleDescriptor;
 class TupleRow;
 class RuntimeState;
-class HdfsTableWriter;
 class MemTracker;
 
 /// Records the temporary and final Hdfs file name, the opened temporary Hdfs file, and
@@ -152,7 +152,7 @@ class HdfsTableSink : public DataSink {
   virtual void Close(RuntimeState* state);
 
   int skip_header_line_count() const { return skip_header_line_count_; }
-  const vector<int32_t>& sort_by_columns() const { return sort_by_columns_; }
+  const vector<int32_t>& sort_columns() const { return sort_columns_; }
   const HdfsTableDescriptor& TableDesc() { return *table_desc_; }
 
   RuntimeProfile::Counter* rows_inserted_counter() { return rows_inserted_counter_; }
@@ -276,9 +276,9 @@ class HdfsTableSink : public DataSink {
   bool input_is_clustered_;
 
   // Stores the indices into the list of non-clustering columns of the target table that
-  // are mentioned in the 'sortby()' hint. This is used in the backend to populate the
-  // RowGroup::sorting_columns list in parquet files.
-  const std::vector<int32_t>& sort_by_columns_;
+  // are stored in the 'sort.columns' table property. This is used in the backend to
+  // populate the RowGroup::sorting_columns list in parquet files.
+  const std::vector<int32_t>& sort_columns_;
 
   /// Stores the current partition during clustered inserts across subsequent row batches.
   /// Only set if 'input_is_clustered_' is true.

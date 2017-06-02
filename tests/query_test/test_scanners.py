@@ -32,7 +32,12 @@ from subprocess import check_call
 
 from testdata.common import widetable
 from tests.common.impala_test_suite import ImpalaTestSuite, LOG
-from tests.common.skip import SkipIfS3, SkipIfIsilon, SkipIfOldAggsJoins, SkipIfLocal
+from tests.common.skip import (
+    SkipIfS3,
+    SkipIfADLS,
+    SkipIfIsilon,
+    SkipIfOldAggsJoins,
+    SkipIfLocal)
 from tests.common.test_dimensions import create_single_exec_option_dimension
 from tests.common.test_result_verifier import (
     parse_column_types,
@@ -122,7 +127,7 @@ class TestUnmatchedSchema(ImpalaTestSuite):
     cls.ImpalaTestMatrix.add_dimension(create_single_exec_option_dimension())
     # Avro has a more advanced schema evolution process which is covered in more depth
     # in the test_avro_schema_evolution test suite.
-    cls.ImpalaTestMatrix.add_constraint(\
+    cls.ImpalaTestMatrix.add_constraint(
         lambda v: v.get_value('table_format').file_format != 'avro')
 
   def _create_test_table(self, vector):
@@ -335,6 +340,7 @@ class TestParquet(ImpalaTestSuite):
                        vector, unique_database)
 
   @SkipIfS3.hdfs_block_size
+  @SkipIfADLS.hdfs_block_size
   @SkipIfIsilon.hdfs_block_size
   @SkipIfLocal.multiple_impalad
   def test_misaligned_parquet_row_groups(self, vector):
@@ -390,6 +396,7 @@ class TestParquet(ImpalaTestSuite):
     assert total == num_scanners_with_no_reads
 
   @SkipIfS3.hdfs_block_size
+  @SkipIfADLS.hdfs_block_size
   @SkipIfIsilon.hdfs_block_size
   @SkipIfLocal.multiple_impalad
   def test_multiple_blocks(self, vector):
@@ -403,6 +410,7 @@ class TestParquet(ImpalaTestSuite):
     self._multiple_blocks_helper(table_name, 40000, ranges_per_node=2)
 
   @SkipIfS3.hdfs_block_size
+  @SkipIfADLS.hdfs_block_size
   @SkipIfIsilon.hdfs_block_size
   @SkipIfLocal.multiple_impalad
   def test_multiple_blocks_one_row_group(self, vector):
@@ -574,8 +582,8 @@ class TestTextScanRangeLengths(ImpalaTestSuite):
     super(TestTextScanRangeLengths, cls).add_test_dimensions()
     cls.ImpalaTestMatrix.add_dimension(
         ImpalaTestDimension('max_scan_range_length', *MAX_SCAN_RANGE_LENGTHS))
-    cls.ImpalaTestMatrix.add_constraint(lambda v:\
-        v.get_value('table_format').file_format == 'text' and\
+    cls.ImpalaTestMatrix.add_constraint(lambda v:
+        v.get_value('table_format').file_format == 'text' and
         v.get_value('table_format').compression_codec == 'none')
 
   def test_text_scanner(self, vector):
@@ -605,8 +613,8 @@ class TestTextSplitDelimiters(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestTextSplitDelimiters, cls).add_test_dimensions()
-    cls.ImpalaTestMatrix.add_constraint(lambda v:\
-        v.get_value('table_format').file_format == 'text' and\
+    cls.ImpalaTestMatrix.add_constraint(lambda v:
+        v.get_value('table_format').file_format == 'text' and
         v.get_value('table_format').compression_codec == 'none')
 
   def test_text_split_delimiters(self, vector, unique_database):
@@ -682,15 +690,18 @@ class TestTextScanRangeLengths(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestTextScanRangeLengths, cls).add_test_dimensions()
-    cls.ImpalaTestMatrix.add_constraint(
-      lambda v: v.get_value('table_format').file_format == 'text')
+    cls.ImpalaTestMatrix.add_constraint(lambda v:
+        v.get_value('table_format').file_format == 'text' and
+        v.get_value('table_format').compression_codec in ['none', 'gzip'])
 
   def test_text_scanner_with_header(self, vector, unique_database):
-    self.run_test_case('QueryTest/hdfs-text-scan-with-header', vector, unique_database)
+    self.run_test_case('QueryTest/hdfs-text-scan-with-header', vector,
+                       test_file_vars={'$UNIQUE_DB': unique_database})
 
 
 # Missing Coverage: No coverage for truncated files errors or scans.
 @SkipIfS3.hive
+@SkipIfADLS.hive
 @SkipIfIsilon.hive
 @SkipIfLocal.hive
 class TestScanTruncatedFiles(ImpalaTestSuite):
@@ -708,8 +719,8 @@ class TestScanTruncatedFiles(ImpalaTestSuite):
     # strategy.
     # TODO: Test other file formats
     if cls.exploration_strategy() == 'exhaustive':
-      cls.ImpalaTestMatrix.add_constraint(lambda v:\
-          v.get_value('table_format').file_format == 'text' and\
+      cls.ImpalaTestMatrix.add_constraint(lambda v:
+          v.get_value('table_format').file_format == 'text' and
           v.get_value('table_format').compression_codec == 'none')
     else:
       cls.ImpalaTestMatrix.add_constraint(lambda v: False)

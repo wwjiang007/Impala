@@ -27,10 +27,12 @@ import org.apache.impala.analysis.Expr;
 import org.apache.impala.analysis.InsertStmt;
 import org.apache.impala.analysis.JoinOperator;
 import org.apache.impala.analysis.QueryStmt;
+import org.apache.impala.catalog.KuduTable;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.planner.JoinNode.DistributionMode;
 import org.apache.impala.planner.RuntimeFilterGenerator.RuntimeFilter;
+import org.apache.impala.util.KuduUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -201,15 +203,19 @@ public class DistributedPlanner {
     // Ignore constants for the sake of partitioning.
     Expr.removeConstants(partitionExprs);
 
-    // Do nothing if the input fragment is already appropriately partitioned.
+    // Do nothing if the input fragment is already appropriately partitioned. TODO: handle
+    // Kudu tables here (IMPALA-5254).
     DataPartition inputPartition = inputFragment.getDataPartition();
-    if (!partitionExprs.isEmpty() &&
-        analyzer.equivSets(inputPartition.getPartitionExprs(), partitionExprs)) {
+    if (!partitionExprs.isEmpty()
+        && analyzer.equivSets(inputPartition.getPartitionExprs(), partitionExprs)
+        && !(insertStmt.getTargetTable() instanceof KuduTable)) {
       return inputFragment;
     }
 
-    // Make a cost-based decision only if no user hint was supplied.
-    if (!insertStmt.hasShuffleHint()) {
+    // Make a cost-based decision only if no user hint was supplied and this is not a Kudu
+    // table. TODO: consider making a cost based decision for Kudu tables.
+    if (!insertStmt.hasShuffleHint()
+        && !(insertStmt.getTargetTable() instanceof KuduTable)) {
       // If the existing partition exprs are a subset of the table partition exprs, check
       // if it is distributed across all nodes. If so, don't repartition.
       if (Expr.isSubset(inputPartition.getPartitionExprs(), partitionExprs)) {
@@ -238,6 +244,9 @@ public class DistributedPlanner {
     DataPartition partition;
     if (partitionExprs.isEmpty()) {
       partition = DataPartition.UNPARTITIONED;
+    } else if (insertStmt.getTargetTable() instanceof KuduTable) {
+      partition = DataPartition.kuduPartitioned(
+          KuduUtil.createPartitionExpr(insertStmt, ctx_.getRootAnalyzer()));
     } else {
       partition = DataPartition.hashPartitioned(partitionExprs);
     }
@@ -446,7 +455,8 @@ public class DistributedPlanner {
     // repartition: both left- and rightChildFragment are partitioned on the
     // join exprs, and a hash table is built with the rightChildFragment's output.
     PlanNode lhsTree = leftChildFragment.getPlanRoot();
-    long partitionCost = Long.MAX_VALUE;
+    // Subtract 1 here so that if stats are missing we default to partitioned.
+    long partitionCost = Long.MAX_VALUE - 1;
     List<Expr> lhsJoinExprs = Lists.newArrayList();
     List<Expr> rhsJoinExprs = Lists.newArrayList();
     for (Expr joinConjunct: node.getEqJoinConjuncts()) {

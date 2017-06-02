@@ -22,8 +22,10 @@
 #include <boost/algorithm/string.hpp>
 #include <gflags/gflags.h>
 #include <gutil/strings/substitute.h>
+#include <kudu/client/client.h>
 
 #include "common/logging.h"
+#include "exec/kudu-util.h"
 #include "gen-cpp/CatalogService.h"
 #include "gen-cpp/ImpalaInternalService.h"
 #include "runtime/backend-client.h"
@@ -64,6 +66,7 @@
 #include "common/names.h"
 
 using boost::algorithm::is_any_of;
+using boost::algorithm::join;
 using boost::algorithm::split;
 using boost::algorithm::to_lower;
 using boost::algorithm::token_compress_on;
@@ -105,6 +108,7 @@ DEFINE_int32(resource_broker_cnxn_retry_interval_ms, 3000, "Deprecated");
 DEFINE_int32(resource_broker_send_timeout, 0, "Deprecated");
 DEFINE_int32(resource_broker_recv_timeout, 0, "Deprecated");
 
+// TODO-MT: rename or retire
 DEFINE_int32(coordinator_rpc_threads, 12, "(Advanced) Number of threads available to "
     "start fragments on remote Impala daemons.");
 
@@ -125,6 +129,10 @@ DEFINE_int32(catalog_client_rpc_timeout_ms, 0, "(Advanced) The underlying TSocke
 const static string DEFAULT_FS = "fs.defaultFS";
 
 namespace impala {
+
+struct ExecEnv::KuduClientPtr {
+  kudu::client::sp::shared_ptr<kudu::client::KuduClient> kudu_client;
+};
 
 ExecEnv* ExecEnv::exec_env_ = nullptr;
 
@@ -150,7 +158,7 @@ ExecEnv::ExecEnv()
     tmp_file_mgr_(new TmpFileMgr),
     request_pool_service_(new RequestPoolService(metrics_.get())),
     frontend_(new Frontend()),
-    fragment_exec_thread_pool_(new CallableThreadPool("coordinator-fragment-rpc",
+    exec_rpc_thread_pool_(new CallableThreadPool("exec-rpc-pool",
         "worker", FLAGS_coordinator_rpc_threads, numeric_limits<int32_t>::max())),
     async_rpc_pool_(new CallableThreadPool("rpc-pool", "async-rpc-sender", 8, 10000)),
     query_exec_mgr_(new QueryExecMgr()),
@@ -215,7 +223,7 @@ ExecEnv::ExecEnv(const string& hostname, int backend_port, int subscriber_port,
         CreateHdfsOpThreadPool("hdfs-worker-pool", FLAGS_num_hdfs_worker_threads, 1024)),
     tmp_file_mgr_(new TmpFileMgr),
     frontend_(new Frontend()),
-    fragment_exec_thread_pool_(new CallableThreadPool("coordinator-fragment-rpc",
+    exec_rpc_thread_pool_(new CallableThreadPool("exec-rpc-pool",
         "worker", FLAGS_coordinator_rpc_threads, numeric_limits<int32_t>::max())),
     async_rpc_pool_(new CallableThreadPool("rpc-pool", "async-rpc-sender", 8, 10000)),
     query_exec_mgr_(new QueryExecMgr()),
@@ -314,6 +322,14 @@ Status ExecEnv::StartServices() {
   // Limit of -1 means no memory limit.
   mem_tracker_.reset(new MemTracker(
       AggregateMemoryMetric::TOTAL_USED, bytes_limit > 0 ? bytes_limit : -1, "Process"));
+  // Aggressive decommit is required so that unused pages in the TCMalloc page heap are
+  // not backed by physical pages and do not contribute towards memory consumption.
+  size_t aggressive_decommit_enabled = 0;
+  MallocExtension::instance()->GetNumericProperty(
+      "tcmalloc.aggressive_memory_decommit", &aggressive_decommit_enabled);
+  if (!aggressive_decommit_enabled) {
+    return Status("TCMalloc aggressive decommit is required but is disabled.");
+  }
 #else
   // tcmalloc metrics aren't defined in ASAN builds, just use the default behavior to
   // track process memory usage (sum of all children trackers).
@@ -335,19 +351,6 @@ Status ExecEnv::StartServices() {
 
   mem_tracker_->AddGcFunction(
       [this](int64_t bytes_to_free) { disk_io_mgr_->GcIoBuffers(bytes_to_free); });
-
-  // TODO: IMPALA-3200: register BufferPool::ReleaseMemory() as GC function.
-
-#ifndef ADDRESS_SANITIZER
-  // Since tcmalloc does not free unused memory, we may exceed the process mem limit even
-  // if Impala is not actually using that much memory. Add a callback to free any unused
-  // memory if we hit the process limit. TCMalloc GC must run last, because other GC
-  // functions may have released memory to TCMalloc, and TCMalloc may have cached it
-  // instead of releasing it to the system.
-  mem_tracker_->AddGcFunction([](int64_t bytes_to_free) {
-    MallocExtension::instance()->ReleaseToSystem(bytes_to_free);
-  });
-#endif
 
   // Start services in order to ensure that dependencies between them are met
   if (enable_webserver_) {
@@ -388,5 +391,23 @@ void ExecEnv::InitBufferPool(int64_t min_page_size, int64_t capacity) {
   buffer_pool_.reset(new BufferPool(min_page_size, capacity));
   buffer_reservation_.reset(new ReservationTracker());
   buffer_reservation_->InitRootTracker(nullptr, capacity);
+}
+
+Status ExecEnv::GetKuduClient(
+    const vector<string>& master_addresses, kudu::client::KuduClient** client) {
+  string master_addr_concat = join(master_addresses, ",");
+  lock_guard<SpinLock> l(kudu_client_map_lock_);
+  auto kudu_client_map_it = kudu_client_map_.find(master_addr_concat);
+  if (kudu_client_map_it == kudu_client_map_.end()) {
+    // KuduClient doesn't exist, create it
+    KuduClientPtr* kudu_client_ptr = new KuduClientPtr;
+    RETURN_IF_ERROR(CreateKuduClient(master_addresses, &kudu_client_ptr->kudu_client));
+    kudu_client_map_[master_addr_concat].reset(kudu_client_ptr);
+    *client = kudu_client_ptr->kudu_client.get();
+  } else {
+    // Return existing KuduClient
+    *client = kudu_client_map_it->second->kudu_client.get();
+  }
+  return Status::OK();
 }
 }

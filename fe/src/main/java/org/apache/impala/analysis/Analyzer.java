@@ -60,7 +60,12 @@ import org.apache.impala.common.RuntimeEnv;
 import org.apache.impala.planner.PlanNode;
 import org.apache.impala.rewrite.BetweenToCompoundRule;
 import org.apache.impala.rewrite.ExprRewriter;
+import org.apache.impala.rewrite.ExprRewriteRule;
+import org.apache.impala.rewrite.ExtractCommonConjunctRule;
 import org.apache.impala.rewrite.FoldConstantsRule;
+import org.apache.impala.rewrite.NormalizeBinaryPredicatesRule;
+import org.apache.impala.rewrite.NormalizeExprsRule;
+import org.apache.impala.rewrite.SimplifyConditionalsRule;
 import org.apache.impala.service.FeSupport;
 import org.apache.impala.thrift.TAccessEvent;
 import org.apache.impala.thrift.TCatalogObjectType;
@@ -269,6 +274,11 @@ public class Analyzer {
     public final LinkedHashMap<String, Integer> warnings =
         new LinkedHashMap<String, Integer>();
 
+    // Tracks whether the warnings have been retrieved from this analyzer. If set to true,
+    // adding new warnings will result in an error. This helps to make sure that no
+    // warnings are added which will not be displayed.
+    public boolean warningsRetrieved = false;
+
     public final IdGenerator<EquivalenceClassId> equivClassIdGenerator =
         EquivalenceClassId.createGenerator();
 
@@ -298,9 +308,12 @@ public class Analyzer {
     // TODO: Investigate what to do with other catalog objects.
     private final HashMap<TableName, Table> referencedTables_ = Maps.newHashMap();
 
-    // Expr rewriter for foldinc constants.
+    // Expr rewriter for folding constants.
     private final ExprRewriter constantFolder_ =
         new ExprRewriter(FoldConstantsRule.INSTANCE);
+
+    // Expr rewriter for normalizing and rewriting expressions.
+    private final ExprRewriter exprRewriter_;
 
     public GlobalState(ImpaladCatalog catalog, TQueryCtx queryCtx,
         AuthorizationConfig authzConfig) {
@@ -308,6 +321,22 @@ public class Analyzer {
       this.queryCtx = queryCtx;
       this.authzConfig = authzConfig;
       this.lineageGraph = new ColumnLineageGraph();
+      List<ExprRewriteRule> rules = Lists.newArrayList();
+      // BetweenPredicates must be rewritten to be executable. Other non-essential
+      // expr rewrites can be disabled via a query option. When rewrites are enabled
+      // BetweenPredicates should be rewritten first to help trigger other rules.
+      rules.add(BetweenToCompoundRule.INSTANCE);
+      // Binary predicates must be rewritten to a canonical form for both Kudu predicate
+      // pushdown and Parquet row group pruning based on min/max statistics.
+      rules.add(NormalizeBinaryPredicatesRule.INSTANCE);
+      if (queryCtx.getClient_request().getQuery_options().enable_expr_rewrites) {
+        rules.add(FoldConstantsRule.INSTANCE);
+        rules.add(NormalizeExprsRule.INSTANCE);
+        rules.add(ExtractCommonConjunctRule.INSTANCE);
+        // Relies on FoldConstantsRule and NormalizeExprsRule.
+        rules.add(SimplifyConditionalsRule.INSTANCE);
+      }
+      exprRewriter_ = new ExprRewriter(rules);
     }
   };
 
@@ -424,8 +453,10 @@ public class Analyzer {
 
   /**
    * Returns a list of each warning logged, indicating if it was logged more than once.
+   * After this function has been called, no warning may be added to the Analyzer anymore.
    */
   public List<String> getWarnings() {
+    globalState_.warningsRetrieved = true;
     List<String> result = new ArrayList<String>();
     for (Map.Entry<String, Integer> e : globalState_.warnings.entrySet()) {
       String error = e.getKey();
@@ -657,6 +688,7 @@ public class Analyzer {
 
   public TableRef getTableRef(TupleId tid) { return tableRefMap_.get(tid); }
   public ExprRewriter getConstantFolder() { return globalState_.constantFolder_; }
+  public ExprRewriter getExprRewriter() { return globalState_.exprRewriter_; }
 
   /**
    * Given a "table alias"."column alias", return the SlotDescriptor
@@ -1051,7 +1083,7 @@ public class Analyzer {
           conjunct = rewriter.rewrite(conjunct, this);
           // analyze this conjunct here: we know it can't contain references to select list
           // aliases and having it analyzed is needed for the following EvalPredicate() call
-          conjunct.analyze(this);;
+          conjunct.analyze(this);
         }
         if (!FeSupport.EvalPredicate(conjunct, globalState_.queryCtx)) {
           if (fromHavingClause) {
@@ -2474,9 +2506,11 @@ public class Analyzer {
   public Map<String, View> getLocalViews() { return localViews_; }
 
   /**
-   * Add a warning that will be displayed to the user. Ignores null messages.
+   * Add a warning that will be displayed to the user. Ignores null messages. Once
+   * getWarnings() has been called, no warning may be added to the Analyzer anymore.
    */
   public void addWarning(String msg) {
+    Preconditions.checkState(!globalState_.warningsRetrieved);
     if (msg == null) return;
     Integer count = globalState_.warnings.get(msg);
     if (count == null) count = 0;

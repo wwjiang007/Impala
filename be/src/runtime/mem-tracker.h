@@ -195,13 +195,8 @@ class MemTracker {
       return;
     }
 
-    if (UNLIKELY(released_memory_since_gc_.Add(bytes) > GC_RELEASE_SIZE)) {
-      GcTcmalloc();
-    }
-
     if (consumption_metric_ != NULL) {
-      DCHECK(parent_ == NULL);
-      consumption_->Set(consumption_metric_->value());
+      RefreshConsumptionFromMetric();
       return;
     }
     for (std::vector<MemTracker*>::iterator tracker = all_trackers_.begin();
@@ -258,9 +253,13 @@ class MemTracker {
     return result;
   }
 
-  /// Refresh the value of consumption_. Only valid to call if consumption_metric_ is not
-  /// null.
-  void RefreshConsumptionFromMetric();
+  /// Refresh the memory consumption value from the consumption metric. Only valid to
+  /// call if this tracker has a consumption metric.
+  void RefreshConsumptionFromMetric() {
+    DCHECK(consumption_metric_ != nullptr);
+    DCHECK(parent_ == nullptr);
+    consumption_->Set(consumption_metric_->value());
+  }
 
   int64_t limit() const { return limit_; }
   bool has_limit() const { return limit_ >= 0; }
@@ -311,9 +310,11 @@ class MemTracker {
   void RegisterMetrics(MetricGroup* metrics, const std::string& prefix);
 
   /// Logs the usage of this tracker and all of its children (recursively).
+  /// If 'logged_consumption' is non-NULL, sets the consumption value logged.
   /// TODO: once all memory is accounted in ReservationTracker hierarchy, move
   /// reporting there.
-  std::string LogUsage(const std::string& prefix = "") const;
+  std::string LogUsage(
+      const std::string& prefix = "", int64_t* logged_consumption = nullptr) const;
 
   /// Log the memory usage when memory limit is exceeded and return a status object with
   /// details of the allocation which caused the limit to be exceeded.
@@ -334,12 +335,6 @@ class MemTracker {
   /// gc_lock. Updates metrics if initialized.
   bool GcMemory(int64_t max_consumption);
 
-  /// Called when the total release memory is larger than GC_RELEASE_SIZE.
-  /// TcMalloc holds onto released memory and very slowly (if ever) releases it back to
-  /// the OS. This is problematic since it is memory we are not constantly tracking which
-  /// can cause us to go way over mem limits.
-  void GcTcmalloc();
-
   /// Walks the MemTracker hierarchy and populates all_trackers_ and
   /// limit_trackers_
   void Init();
@@ -347,19 +342,10 @@ class MemTracker {
   /// Adds tracker to child_trackers_
   void AddChildTracker(MemTracker* tracker);
 
+  /// Log consumption of all the trackers provided. Returns the sum of consumption in
+  /// 'logged_consumption'.
   static std::string LogUsage(const std::string& prefix,
-      const std::list<MemTracker*>& trackers);
-
-  /// Size, in bytes, that is considered a large value for Release() (or Consume() with
-  /// a negative value). If tcmalloc is used, this can trigger it to GC.
-  /// A higher value will make us call into tcmalloc less often (and therefore more
-  /// efficient). A lower value will mean our memory overhead is lower.
-  /// TODO: this is a stopgap.
-  static const int64_t GC_RELEASE_SIZE = 128 * 1024L * 1024L;
-
-  /// Total amount of memory from calls to Release() since the last GC. If this
-  /// is greater than GC_RELEASE_SIZE, this will trigger a tcmalloc gc.
-  static AtomicInt64 released_memory_since_gc_;
+      const std::list<MemTracker*>& trackers, int64_t* logged_consumption);
 
   /// Lock to protect GcMemory(). This prevents many GCs from occurring at once.
   boost::mutex gc_lock_;
@@ -446,7 +432,7 @@ class PoolMemTrackerRegistry {
   /// All per-request pool MemTracker objects. It is assumed that request pools will live
   /// for the entire duration of the process lifetime so MemTrackers are never removed
   /// from this map. Protected by 'pool_to_mem_trackers_lock_'
-  typedef boost::unordered_map<std::string, MemTracker*> PoolTrackersMap;
+  typedef boost::unordered_map<std::string, std::unique_ptr<MemTracker>> PoolTrackersMap;
   PoolTrackersMap pool_to_mem_trackers_;
   /// IMPALA-3068: Use SpinLock instead of boost::mutex so that the lock won't
   /// automatically destroy itself as part of process teardown, which could cause races.

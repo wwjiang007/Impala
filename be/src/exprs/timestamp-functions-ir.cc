@@ -25,6 +25,7 @@
 
 #include "exprs/anyval-util.h"
 #include "runtime/string-value.inline.h"
+#include "runtime/timestamp-value.inline.h"
 #include "runtime/timestamp-parse-util.h"
 #include "runtime/timestamp-value.h"
 #include "udf/udf.h"
@@ -77,8 +78,8 @@ StringVal TimestampFunctions::StringValFromTimestamp(FunctionContext* context,
 template <class TIME>
 StringVal TimestampFunctions::FromUnix(FunctionContext* context, const TIME& intp) {
   if (intp.is_null) return StringVal::null();
-  TimestampValue t(intp.val);
-  return AnyValUtil::FromString(context, lexical_cast<string>(t));
+  return AnyValUtil::FromString(context,
+      TimestampValue::FromUnixTime(intp.val).ToString());
 }
 
 template <class TIME>
@@ -90,7 +91,7 @@ StringVal TimestampFunctions::FromUnix(FunctionContext* context, const TIME& int
   }
   if (intp.is_null) return StringVal::null();
 
-  TimestampValue t(intp.val);
+  const TimestampValue& t = TimestampValue::FromUnixTime(intp.val);
   return StringValFromTimestamp(context, t, fmt);
 }
 
@@ -119,10 +120,27 @@ BigIntVal TimestampFunctions::Unix(FunctionContext* context) {
   }
 }
 
+BigIntVal TimestampFunctions::UtcToUnixMicros(FunctionContext* context,
+    const TimestampVal& ts_val) {
+  if (ts_val.is_null) return BigIntVal::null();
+  const TimestampValue& tv = TimestampValue::FromTimestampVal(ts_val);
+  int64_t result;
+  return (tv.UtcToUnixTimeMicros(&result)) ? BigIntVal(result) : BigIntVal::null();
+}
+
+TimestampVal TimestampFunctions::TimestampFromUnixMicros(FunctionContext* context,
+    const BigIntVal& unix_time_micros) {
+  if (unix_time_micros.is_null) return TimestampVal::null();
+  TimestampValue tv = TimestampValue::FromUnixTimeMicros(unix_time_micros.val);
+  TimestampVal result;
+  tv.ToTimestampVal(&result);
+  return result;
+}
+
 TimestampVal TimestampFunctions::ToTimestamp(FunctionContext* context,
     const BigIntVal& bigint_val) {
   if (bigint_val.is_null) return TimestampVal::null();
-  TimestampValue tv(bigint_val.val);
+  const TimestampValue& tv = TimestampValue::FromUnixTime(bigint_val.val);
   TimestampVal tv_val;
   tv.ToTimestampVal(&tv_val);
   return tv_val;
@@ -144,7 +162,7 @@ TimestampVal TimestampFunctions::ToTimestamp(FunctionContext* context,
        return TimestampVal::null();
      }
   }
-  TimestampValue tv = TimestampValue(
+  const TimestampValue& tv = TimestampValue::Parse(
       reinterpret_cast<const char*>(date.ptr), date.len, *dt_ctx);
   TimestampVal tv_val;
   tv.ToTimestampVal(&tv_val);
@@ -154,7 +172,7 @@ TimestampVal TimestampFunctions::ToTimestamp(FunctionContext* context,
 StringVal TimestampFunctions::FromTimestamp(FunctionContext* context,
     const TimestampVal& date, const StringVal& fmt) {
   if (date.is_null) return StringVal::null();
-  TimestampValue tv = TimestampValue::FromTimestampVal(date);
+  const TimestampValue& tv = TimestampValue::FromTimestampVal(date);
   if (!tv.HasDate()) return StringVal::null();
   return StringValFromTimestamp(context, tv, fmt);
 }
@@ -162,7 +180,8 @@ StringVal TimestampFunctions::FromTimestamp(FunctionContext* context,
 BigIntVal TimestampFunctions::UnixFromString(FunctionContext* context,
     const StringVal& sv) {
   if (sv.is_null) return BigIntVal::null();
-  TimestampValue tv(reinterpret_cast<const char *>(sv.ptr), sv.len);
+  const TimestampValue& tv = TimestampValue::Parse(
+      reinterpret_cast<const char *>(sv.ptr), sv.len);
   time_t result;
   return (tv.ToUnixTime(&result)) ? BigIntVal(result) : BigIntVal::null();
 }

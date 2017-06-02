@@ -371,6 +371,7 @@ message(STATUS "Breakpad library: " ${BREAKPAD_STATIC_LIB})
 # compile these subdirs using their own CMakeLists.txt
 add_subdirectory(common/function-registry)
 add_subdirectory(common/thrift)
+add_subdirectory(common/fbs)
 add_subdirectory(be)
 add_subdirectory(fe)
 add_subdirectory(ext-data-source)
@@ -387,7 +388,7 @@ add_custom_target(cscope ALL
 
 if (DEFINED ENV{IMPALA_LZO} AND EXISTS $ENV{IMPALA_LZO})
   add_custom_target(impala-lzo ALL DEPENDS thrift-deps
-    COMMAND $ENV{IMPALA_LZO}/build.sh DEBUG ${CMAKE_SOURCE_DIR}
+    COMMAND $ENV{IMPALA_LZO}/build.sh ${CMAKE_BUILD_TYPE} ${CMAKE_SOURCE_DIR}
     $ENV{IMPALA_TOOLCHAIN}
   )
 endif()
