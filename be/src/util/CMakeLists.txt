@@ -34,6 +34,7 @@ add_library(Util
   bloom-filter.cc
   coding-util.cc
   codec.cc
+  common-metrics.cc
   compress.cc
   cpu-info.cc
   decimal-util.cc
@@ -69,6 +70,7 @@ add_library(Util
   redactor.cc
   runtime-profile.cc
   simple-logger.cc
+  string-parser.cc
   symbols-util.cc
   static-asserts.cc
   summary-util.cc

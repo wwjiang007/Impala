@@ -29,10 +29,14 @@
 
 namespace impala {
 
+class MemPool;
 class ObjectPool;
 class RowBatch;
 class RuntimeProfile;
+class RuntimeState;
 class RowDescriptor;
+class ScalarExpr;
+class ScalarExprEvaluator;
 class TDataSink;
 class TPlanExecRequest;
 class TPlanExecParams;
@@ -50,19 +54,20 @@ class TInsertStats;
 /// Close() is called to release any resources before destroying the sink.
 class DataSink {
  public:
-  DataSink(const RowDescriptor& row_desc);
+  DataSink(const RowDescriptor* row_desc);
   virtual ~DataSink();
 
   /// Return the name to use in profiles, etc.
   virtual std::string GetName() = 0;
 
   /// Setup. Call before Send(), Open(), or Close() during the prepare phase of the query
-  /// fragment. Creates a MemTracker (in obj_pool) for the sink that is a child of
-  /// 'parent_mem_tracker'. Subclasses must call DataSink::Prepare().
+  /// fragment. Creates a MemTracker for the sink that is a child of 'parent_mem_tracker'.
+  /// Also creates a MemTracker and MemPool for the output (and partitioning) expr and
+  /// initializes their evaluators. Subclasses must call DataSink::Prepare().
   virtual Status Prepare(RuntimeState* state, MemTracker* parent_mem_tracker);
 
-  /// Call before Send() to open the sink.
-  virtual Status Open(RuntimeState* state) = 0;
+  /// Call before Send() to open the sink and initialize output expression evaluators.
+  virtual Status Open(RuntimeState* state);
 
   /// Send a row batch into this sink. Send() may modify 'batch' by acquiring its state.
   virtual Status Send(RuntimeState* state, RowBatch* batch) = 0;
@@ -79,10 +84,9 @@ class DataSink {
 
   /// Creates a new data sink, allocated in pool and returned through *sink, from
   /// thrift_sink.
-  static Status Create(ObjectPool* pool,
-    const TPlanFragmentCtx& fragment_ctx,
-    const TPlanFragmentInstanceCtx& fragment_instance_ctx,
-    const RowDescriptor& row_desc, DataSink** sink);
+  static Status Create(const TPlanFragmentCtx& fragment_ctx,
+      const TPlanFragmentInstanceCtx& fragment_instance_ctx,
+      const RowDescriptor* row_desc, RuntimeState* state, DataSink** sink);
 
   /// Merges one update to the DML stats for a partition. dst_stats will have the
   /// combined stats of src_stats and dst_stats after this method returns.
@@ -95,14 +99,19 @@ class DataSink {
 
   MemTracker* mem_tracker() const { return mem_tracker_.get(); }
   RuntimeProfile* profile() const { return profile_; }
+  MemPool* expr_mem_pool() const { return expr_mem_pool_.get(); }
+  const std::vector<ScalarExprEvaluator*>& output_expr_evals() const {
+    return output_expr_evals_;
+  }
 
  protected:
   /// Set to true after Close() has been called. Subclasses should check and set this in
   /// Close().
   bool closed_;
 
-  /// The row descriptor for the rows consumed by the sink. Not owned.
-  const RowDescriptor& row_desc_;
+  /// The row descriptor for the rows consumed by the sink. Owned by root exec node of
+  /// plan tree, which feeds into this sink.
+  const RowDescriptor* row_desc_;
 
   /// The runtime profile for this DataSink. Initialized in Prepare(). Not owned.
   RuntimeProfile* profile_;
@@ -112,7 +121,18 @@ class DataSink {
 
   /// A child of 'mem_tracker_' that tracks expr allocations. Initialized in Prepare().
   boost::scoped_ptr<MemTracker> expr_mem_tracker_;
-};
 
+  /// MemPool for backing data structures in expressions and their evaluators.
+  boost::scoped_ptr<MemPool> expr_mem_pool_;
+
+  /// Output expressions to convert row batches onto output values.
+  /// Not used in some sub-classes.
+  std::vector<ScalarExpr*> output_exprs_;
+  std::vector<ScalarExprEvaluator*> output_expr_evals_;
+
+  /// Initialize the expressions in the data sink and return error status on failure.
+  virtual Status Init(const std::vector<TExpr>& thrift_output_exprs,
+      const TDataSink& tsink, RuntimeState* state);
+};
 } // namespace impala
 #endif

@@ -78,6 +78,7 @@ THRIFT_ENUM_OUTPUT_FN(TDdlType);
 THRIFT_ENUM_OUTPUT_FN(TCatalogOpType);
 THRIFT_ENUM_OUTPUT_FN(THdfsFileFormat);
 THRIFT_ENUM_OUTPUT_FN(THdfsCompression);
+THRIFT_ENUM_OUTPUT_FN(TReplicaPreference);
 THRIFT_ENUM_OUTPUT_FN(TSessionType);
 THRIFT_ENUM_OUTPUT_FN(TStmtType);
 THRIFT_ENUM_OUTPUT_FN(QueryState);
@@ -91,6 +92,7 @@ THRIFT_ENUM_OUTPUT_FN(TImpalaQueryOptions);
 THRIFT_ENUM_PRINT_FN(TCatalogObjectType);
 THRIFT_ENUM_PRINT_FN(TDdlType);
 THRIFT_ENUM_PRINT_FN(TCatalogOpType);
+THRIFT_ENUM_PRINT_FN(TReplicaPreference);
 THRIFT_ENUM_PRINT_FN(TSessionType);
 THRIFT_ENUM_PRINT_FN(TStmtType);
 THRIFT_ENUM_PRINT_FN(QueryState);
@@ -224,7 +226,7 @@ string PrintRow(TupleRow* row, const RowDescriptor& d) {
 string PrintBatch(RowBatch* batch) {
   stringstream out;
   for (int i = 0; i < batch->num_rows(); ++i) {
-    out << PrintRow(batch->GetRow(i), batch->row_desc()) << "\n";
+    out << PrintRow(batch->GetRow(i), *batch->row_desc()) << "\n";
   }
   return out.str();
 }

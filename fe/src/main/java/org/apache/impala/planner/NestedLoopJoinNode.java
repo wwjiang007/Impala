@@ -20,9 +20,6 @@ package org.apache.impala.planner;
 import java.util.Collections;
 import java.util.List;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.BinaryPredicate;
 import org.apache.impala.analysis.Expr;
@@ -77,7 +74,7 @@ public class NestedLoopJoinNode extends JoinNode {
   }
 
   @Override
-  public void computeResourceProfile(TQueryOptions queryOptions) {
+  public void computeNodeResourceProfile(TQueryOptions queryOptions) {
     long perInstanceMemEstimate;
     if (getChild(1).getCardinality() == -1 || getChild(1).getAvgRowSize() == -1
         || numNodes_ == 0) {
@@ -86,7 +83,7 @@ public class NestedLoopJoinNode extends JoinNode {
       perInstanceMemEstimate =
           (long) Math.ceil(getChild(1).cardinality_ * getChild(1).avgRowSize_);
     }
-    resourceProfile_ = new ResourceProfile(perInstanceMemEstimate, 0);
+    nodeResourceProfile_ = ResourceProfile.noReservation(perInstanceMemEstimate);
   }
 
   @Override

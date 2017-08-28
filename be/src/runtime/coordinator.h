@@ -18,20 +18,21 @@
 #ifndef IMPALA_RUNTIME_COORDINATOR_H
 #define IMPALA_RUNTIME_COORDINATOR_H
 
-#include <vector>
 #include <string>
-#include <boost/scoped_ptr.hpp>
+#include <vector>
 #include <boost/accumulators/accumulators.hpp>
-#include <boost/accumulators/statistics/stats.hpp>
-#include <boost/accumulators/statistics/min.hpp>
+#include <boost/accumulators/statistics/max.hpp>
 #include <boost/accumulators/statistics/mean.hpp>
 #include <boost/accumulators/statistics/median.hpp>
-#include <boost/accumulators/statistics/max.hpp>
+#include <boost/accumulators/statistics/min.hpp>
+#include <boost/accumulators/statistics/stats.hpp>
 #include <boost/accumulators/statistics/variance.hpp>
+#include <boost/scoped_ptr.hpp>
+#include <boost/thread/condition_variable.hpp>
+#include <boost/thread/mutex.hpp>
 #include <boost/unordered_map.hpp>
 #include <boost/unordered_set.hpp>
-#include <boost/thread/mutex.hpp>
-#include <boost/thread/condition_variable.hpp>
+#include <rapidjson/document.h>
 
 #include "common/global-types.h"
 #include "common/hdfs.h"
@@ -40,31 +41,18 @@
 #include "gen-cpp/Types_types.h"
 #include "runtime/runtime-state.h" // for PartitionStatusMap; TODO: disentangle
 #include "scheduling/query-schedule.h"
-#include "util/histogram-metric.h"
 #include "util/progress-updater.h"
-#include "util/runtime-profile.h"
 
 namespace impala {
 
 class CountingBarrier;
-class DataStreamMgr;
-class DataSink;
-class RowBatch;
-class RowDescriptor;
 class ObjectPool;
 class RuntimeState;
-class Expr;
-class ExprContext;
-class ExecEnv;
 class TUpdateCatalogRequest;
-class TQueryExecRequest;
 class TReportExecStatusParams;
-class TRowBatch;
 class TPlanExecRequest;
 class TRuntimeProfileTree;
 class RuntimeProfile;
-class TablePrinter;
-class TPlanFragment;
 class QueryResultSet;
 class MemTracker;
 class PlanRootSink;
@@ -199,6 +187,10 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
   /// filter to fragment instances.
   void UpdateFilter(const TUpdateFilterParams& params);
 
+  /// Adds to 'document' a serialized array of all backends in a member named
+  /// 'backend_states'.
+  void BackendsToJson(rapidjson::Document* document);
+
  private:
   class BackendState;
   struct FilterTarget;
@@ -262,8 +254,9 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
   TRuntimeFilterMode::type filter_mode_;
 
   /// Tracks the memory consumed by runtime filters during aggregation. Child of
-  /// the query mem tracker in 'query_state_' and set in Exec().
-  std::unique_ptr<MemTracker> filter_mem_tracker_;
+  /// the query mem tracker in 'query_state_' and set in Exec(). Stored in
+  /// query_state_->obj_pool() so it has same lifetime as other MemTrackers.
+  MemTracker* filter_mem_tracker_ = nullptr;
 
   /// Object pool owned by the coordinator.
   boost::scoped_ptr<ObjectPool> obj_pool_;

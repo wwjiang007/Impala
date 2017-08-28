@@ -22,9 +22,20 @@
 #include "common/status.h"
 #include "udf/udf.h"
 
-using namespace impala_udf;
-
 namespace impala {
+
+using impala_udf::FunctionContext;
+using impala_udf::AnyVal;
+using impala_udf::BooleanVal;
+using impala_udf::TinyIntVal;
+using impala_udf::SmallIntVal;
+using impala_udf::IntVal;
+using impala_udf::BigIntVal;
+using impala_udf::FloatVal;
+using impala_udf::DoubleVal;
+using impala_udf::TimestampVal;
+using impala_udf::StringVal;
+using impala_udf::DecimalVal;
 
 class Expr;
 class OpcodeRegistry;
@@ -102,8 +113,8 @@ class TimestampFunctions {
   static StringVal FromUnix(FunctionContext* context, const TIME& unix_time,
       const StringVal& fmt);
 
-  /// Return a timestamp from a unix time in microseconds.
-  static TimestampVal TimestampFromUnixMicros(FunctionContext* context,
+  /// Return a timestamp in UTC from a unix time in microseconds.
+  static TimestampVal UnixMicrosToUtcTimestamp(FunctionContext* context,
       const BigIntVal& unix_time_micros);
 
   /// Convert a timestamp to or from a particular timezone based time.
@@ -129,6 +140,7 @@ class TimestampFunctions {
 
   /// Date/time functions.
   static TimestampVal Now(FunctionContext* context);
+  static TimestampVal UtcTimestamp(FunctionContext* context);
   static StringVal ToDate(FunctionContext* context, const TimestampVal& ts_val);
   static IntVal DateDiff(FunctionContext* context, const TimestampVal& ts_val1,
       const TimestampVal& ts_val2);
@@ -198,6 +210,15 @@ class TimestampFunctions {
       bool is_add_months_keep_last_day>
   static TimestampVal AddSub(FunctionContext* context, const TimestampVal& timestamp,
       const AnyIntVal& num_interval_units);
+
+  /// Return the last date in the month of a specified input date.
+  /// The TIMESTAMP argument requires a date component,
+  /// it may or may not have a time component.
+  /// The function will return a NULL TimestampVal when:
+  ///   1) The TIMESTAMP argument is missing a date component.
+  ///   2) The TIMESTAMP argument is outside of the supported range:
+  ///         between 1400-01-31 00:00:00 and 9999-12-31 23:59:59
+  static TimestampVal LastDay(FunctionContext* context, const TimestampVal& ts);
 
   /// Helper function to check date/time format strings.
   /// TODO: eventually return format converted from Java to Boost.

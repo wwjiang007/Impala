@@ -101,6 +101,9 @@ void ImpalaHttpHandler::RegisterHandlers(Webserver* webserver) {
   webserver->RegisterUrlCallback("/query_memory", "query_memory.tmpl",
       MakeCallback(this, &ImpalaHttpHandler::QueryMemoryHandler), false);
 
+  webserver->RegisterUrlCallback("/query_backends", "query_backends.tmpl",
+      MakeCallback(this, &ImpalaHttpHandler::QueryBackendsHandler), false);
+
   webserver->RegisterUrlCallback("/cancel_query", "common-pre.tmpl",
       MakeCallback(this, &ImpalaHttpHandler::CancelQueryHandler), false);
 
@@ -204,7 +207,7 @@ void ImpalaHttpHandler::QueryProfileHandler(const Webserver::ArgumentMap& args,
   }
 
   stringstream ss;
-  Status status = server_->GetRuntimeProfileStr(unique_id, false, &ss);
+  Status status = server_->GetRuntimeProfileStr(unique_id, "", false, &ss);
   if (!status.ok()) {
     Value error(status.GetDetail().c_str(), document->GetAllocator());
     document->AddMember("error", error, document->GetAllocator());
@@ -225,7 +228,7 @@ void ImpalaHttpHandler::QueryProfileEncodedHandler(const Webserver::ArgumentMap&
   if (!status.ok()) {
     ss << status.GetDetail();
   } else {
-    Status status = server_->GetRuntimeProfileStr(unique_id, true, &ss);
+    Status status = server_->GetRuntimeProfileStr(unique_id, "", true, &ss);
     if (!status.ok()) {
       ss.str(Substitute("Could not obtain runtime profile: $0", status.GetDetail()));
     }
@@ -261,7 +264,7 @@ void ImpalaHttpHandler::QueryMemoryHandler(const Webserver::ArgumentMap& args,
   string mem_usage_text;
   // Only in-flight queries have a MemTracker to get usage from.
   if (qs.get() != nullptr) {
-    mem_usage_text = qs->query_mem_tracker()->LogUsage();
+    mem_usage_text = qs->query_mem_tracker()->LogUsage(MemTracker::UNLIMITED_DEPTH);
   } else {
     mem_usage_text =
         "The query is finished, current memory consumption is not available.";
@@ -547,11 +550,12 @@ void ImpalaHttpHandler::CatalogObjectsHandler(const Webserver::ArgumentMap& args
 
     // Get the object type and name from the topic entry key
     TCatalogObject request;
-    TCatalogObjectFromObjectName(object_type, object_name_arg->second, &request);
-
-    // Get the object and dump its contents.
     TCatalogObject result;
-    Status status = server_->exec_env_->frontend()->GetCatalogObject(request, &result);
+    Status status = TCatalogObjectFromObjectName(object_type, object_name_arg->second, &request);
+    if (status.ok()) {
+      // Get the object and dump its contents.
+      status = server_->exec_env_->frontend()->GetCatalogObject(request, &result);
+    }
     if (status.ok()) {
       Value debug_string(ThriftDebugString(result).c_str(), document->GetAllocator());
       document->AddMember("thrift_string", debug_string, document->GetAllocator());
@@ -688,6 +692,25 @@ void PlanToJson(const vector<TPlanFragment>& fragments, const TExecSummary& summ
   value->AddMember("plan_nodes", nodes, document->GetAllocator());
 }
 
+}
+
+void ImpalaHttpHandler::QueryBackendsHandler(
+    const Webserver::ArgumentMap& args, Document* document) {
+  TUniqueId query_id;
+  Status status = ParseIdFromArguments(args, &query_id, "query_id");
+  Value query_id_val(PrintId(query_id).c_str(), document->GetAllocator());
+  document->AddMember("query_id", query_id_val, document->GetAllocator());
+  if (!status.ok()) {
+    // Redact the error message, it may contain part or all of the query.
+    Value json_error(RedactCopy(status.GetDetail()).c_str(), document->GetAllocator());
+    document->AddMember("error", json_error, document->GetAllocator());
+    return;
+  }
+
+  shared_ptr<ClientRequestState> request_state = server_->GetClientRequestState(query_id);
+  if (request_state.get() == nullptr || request_state->coord() == nullptr) return;
+
+  request_state->coord()->BackendsToJson(document);
 }
 
 void ImpalaHttpHandler::QuerySummaryHandler(bool include_json_plan, bool include_summary,

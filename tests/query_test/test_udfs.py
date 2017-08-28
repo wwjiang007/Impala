@@ -109,6 +109,11 @@ create aggregate function {database}.agg_string_intermediate(decimal(20,10), big
 returns decimal(20,0) intermediate string location '{location}'
 init_fn='AggStringIntermediateInit' update_fn='AggStringIntermediateUpdate'
 merge_fn='AggStringIntermediateMerge' finalize_fn='AggStringIntermediateFinalize';
+
+create aggregate function {database}.char_intermediate_sum(int) returns int
+intermediate char(10) LOCATION '{location}' update_fn='AggCharIntermediateUpdate'
+init_fn='AggCharIntermediateInit' merge_fn='AggCharIntermediateMerge'
+serialize_fn='AggCharIntermediateSerialize' finalize_fn='AggCharIntermediateFinalize';
 """
 
   # Create test UDF functions in {database} from library {location}
@@ -261,6 +266,7 @@ class TestUdfExecution(TestUdfBase):
     super(TestUdfExecution, cls).add_test_dimensions()
     cls.ImpalaTestMatrix.add_dimension(
         create_exec_option_dimension_from_dict({"disable_codegen" : [False, True],
+          "disable_codegen_rows_threshold" : [0],
           "exec_single_node_rows_threshold" : [0,100],
           "enable_expr_rewrites" : [False, True]}))
     # There is no reason to run these tests using all dimensions.

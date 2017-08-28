@@ -57,6 +57,11 @@ enum TParquetArrayResolution {
   TWO_LEVEL_THEN_THREE_LEVEL
 }
 
+enum TJoinDistributionMode {
+  BROADCAST,
+  SHUFFLE
+}
+
 // Query options that correspond to ImpalaService.ImpalaQueryOptions, with their
 // respective defaults. Query options can be set in the following ways:
 //
@@ -125,7 +130,7 @@ struct TQueryOptions {
   26: optional i32 query_timeout_s = 0
 
   // test hook to cap max memory for spilling operators (to force them to spill).
-  27: optional i64 max_block_mgr_memory
+  27: optional i64 buffer_pool_limit
 
   // If true, transforms all count(distinct) aggregations into NDV()
   28: optional bool appx_count_distinct = 0
@@ -241,6 +246,33 @@ struct TQueryOptions {
   // processing. This includes skipping data based on the statistics and computing query
   // results like "select min()".
   55: optional bool parquet_read_statistics = true
+
+  // Join distribution mode that is used when the join inputs have an unknown
+  // cardinality, e.g., because of missing table statistics.
+  56: optional TJoinDistributionMode default_join_distribution_mode =
+    TJoinDistributionMode.BROADCAST
+
+  // If the number of rows processed per node is below the threshold codegen will be
+  // automatically disabled by the planner.
+  57: optional i32 disable_codegen_rows_threshold = 50000
+
+  // The default spillable buffer size in bytes, which may be overridden by the planner.
+  // Defaults to 2MB.
+  58: optional i64 default_spillable_buffer_size = 2097152;
+
+  // The minimum spillable buffer to use. The planner will not choose a size smaller than
+  // this. Defaults to 64KB.
+  59: optional i64 min_spillable_buffer_size = 65536;
+
+  // The maximum size of row that the query will reserve memory to process. Processing
+  // rows larger than this may result in a query failure. Defaults to 512KB, e.g.
+  // enough for a row with 15 32KB strings or many smaller columns.
+  //
+  // Different operators handle this option in different ways. E.g. some simply increase
+  // the size of all their buffers to fit this row size, whereas others may use more
+  // sophisticated strategies - e.g. reserving a small number of buffers large enough to
+  // fit maximum-sized rows.
+  60: optional i64 max_row_size = 524288;
 }
 
 // Impala currently has two types of sessions: Beeswax and HiveServer2
@@ -288,9 +320,13 @@ struct TClientRequest {
 // Debug options: perform some action in a particular phase of a particular node
 // TODO: find a better name
 struct TDebugOptions {
+  // The plan node that this action should be applied to. If -1 it is applied to all plan
+  // nodes.
   1: optional Types.TPlanNodeId node_id
   2: optional PlanNodes.TExecNodePhase phase
   3: optional PlanNodes.TDebugAction action
+  // Optional parameter that goes along with the action.
+  4: optional string action_param
 }
 
 // Context of this query, including the client request, session state and
@@ -308,7 +344,7 @@ struct TQueryCtx {
   // Session state including user.
   3: required TSessionState session
 
-  // String containing a timestamp set as the query submission time.
+  // String containing a timestamp (in local timezone) set as the query submission time.
   4: required string now_string
 
   // Process ID of the impalad to which the user is connected.
@@ -357,6 +393,10 @@ struct TQueryCtx {
   // The pool to which this request has been submitted. Used to update pool statistics
   // for admission control.
   16: optional string request_pool
+
+  // String containing a timestamp (in UTC) set as the query submission time. It
+  // represents the same point in time as now_string
+  17: required string utc_timestamp_string
 }
 
 // Specification of one output destination of a plan fragment
@@ -444,11 +484,25 @@ struct TExecQueryFInstancesParams {
   3: optional TQueryCtx query_ctx
 
   // required in V1
-  4: list<TPlanFragmentCtx> fragment_ctxs
+  4: optional list<TPlanFragmentCtx> fragment_ctxs
 
   // the order corresponds to the order of fragments in fragment_ctxs
   // required in V1
-  5: list<TPlanFragmentInstanceCtx> fragment_instance_ctxs
+  5: optional list<TPlanFragmentInstanceCtx> fragment_instance_ctxs
+
+  // The minimum query-wide buffer reservation size (in bytes) required for the backend
+  // executing the instances in fragment_instance_ctxs. This is the peak minimum
+  // reservation that may be required by the concurrently-executing operators at any
+  // point in query execution. It may be less than the initial reservation total claims
+  // (below) if execution of some operators never overlaps, which allows reuse of
+  // reservations. required in V1
+  6: optional i64 min_reservation_bytes
+
+  // Total of the initial buffer reservations that we expect to be claimed on this
+  // backend for all fragment instances in fragment_instance_ctxs. I.e. the sum over all
+  // operators in all fragment instances that execute on this backend. This is used for
+  // an optimization in InitialReservation. Measured in bytes. required in V1
+  7: optional i64 initial_reservation_total_claims
 }
 
 struct TExecQueryFInstancesResult {

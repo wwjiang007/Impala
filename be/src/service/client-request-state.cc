@@ -20,8 +20,6 @@
 #include <limits>
 #include <gutil/strings/substitute.h>
 
-#include "exprs/expr-context.h"
-#include "exprs/expr.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
@@ -59,7 +57,6 @@ namespace impala {
 // Keys into the info string map of the runtime profile referring to specific
 // items used by CM for monitoring purposes.
 static const string PER_HOST_MEM_KEY = "Estimated Per-Host Mem";
-static const string PER_HOST_MEMORY_RESERVATION_KEY = "Per-Host Memory Reservation";
 static const string TABLES_MISSING_STATS_KEY = "Tables Missing Stats";
 static const string TABLES_WITH_CORRUPT_STATS_KEY = "Tables With Corrupt Table Stats";
 static const string TABLES_WITH_MISSING_DISK_IDS_KEY = "Tables With Missing Disk Ids";
@@ -83,6 +80,7 @@ ClientRequestState::ClientRequestState(
     is_cancelled_(false),
     eos_(false),
     query_state_(beeswax::QueryState::CREATED),
+    user_has_profile_access_(true),
     current_batch_(NULL),
     current_batch_row_(0),
     num_rows_fetched_(0),
@@ -148,8 +146,10 @@ Status ClientRequestState::Exec(TExecRequest* exec_request) {
 
   profile_.AddChild(&server_profile_);
   summary_profile_.AddInfoString("Query Type", PrintTStmtType(stmt_type()));
-  summary_profile_.AddInfoString("Query Options (non default)",
+  summary_profile_.AddInfoString("Query Options (set by configuration)",
       DebugQueryOptions(query_ctx_.client_request.query_options));
+  summary_profile_.AddInfoString("Query Options (set by configuration and planner)",
+      DebugQueryOptions(exec_request_.query_options));
 
   switch (exec_request->stmt_type) {
     case TStmtType::QUERY:
@@ -400,11 +400,6 @@ Status ClientRequestState::ExecQueryOrDmlRequest(
     ss << query_exec_request.per_host_mem_estimate;
     summary_profile_.AddInfoString(PER_HOST_MEM_KEY, ss.str());
   }
-  if (query_exec_request.__isset.per_host_min_reservation) {
-    stringstream ss;
-    ss << query_exec_request.per_host_min_reservation;
-    summary_profile_.AddInfoString(PER_HOST_MEMORY_RESERVATION_KEY, ss.str());
-  }
   if (!query_exec_request.query_ctx.__isset.parent_query_id &&
       query_exec_request.query_ctx.__isset.tables_missing_stats &&
       !query_exec_request.query_ctx.tables_missing_stats.empty()) {
@@ -634,7 +629,7 @@ void ClientRequestState::Wait() {
     } else {
       query_events()->MarkEvent("Request finished");
     }
-    (void) UpdateQueryStatus(status);
+    discard_result(UpdateQueryStatus(status));
   }
   if (status.ok()) {
     UpdateNonErrorQueryState(beeswax::QueryState::FINISHED);
@@ -688,7 +683,7 @@ Status ClientRequestState::FetchRows(const int32_t max_rows,
   MarkActive();
 
   // ImpalaServer::FetchInternal has already taken our lock_
-  (void) UpdateQueryStatus(FetchRowsInternal(max_rows, fetched_rows));
+  discard_result(UpdateQueryStatus(FetchRowsInternal(max_rows, fetched_rows)));
 
   MarkInactive();
   return query_status_;
@@ -744,7 +739,7 @@ Status ClientRequestState::FetchRowsInternal(const int32_t max_rows,
     // max_rows <= 0 means no limit
     while ((num_rows < max_rows || max_rows <= 0)
         && num_rows_fetched_ < all_rows.size()) {
-      fetched_rows->AddOneRow(all_rows[num_rows_fetched_]);
+      RETURN_IF_ERROR(fetched_rows->AddOneRow(all_rows[num_rows_fetched_]));
       ++num_rows_fetched_;
       ++num_rows;
     }
@@ -874,7 +869,7 @@ Status ClientRequestState::Cancel(bool check_inflight, const Status* cause) {
     bool already_done = eos_ || query_state_ == beeswax::QueryState::EXCEPTION;
     if (!already_done && cause != NULL) {
       DCHECK(!cause->ok());
-      (void) UpdateQueryStatus(*cause);
+      discard_result(UpdateQueryStatus(*cause));
       query_events_->MarkEvent("Cancelled");
       DCHECK_EQ(query_state_, beeswax::QueryState::EXCEPTION);
     }
@@ -932,8 +927,8 @@ Status ClientRequestState::UpdateCatalog() {
 
       VLOG_QUERY << "Executing FinalizeDml() using CatalogService";
       TUpdateCatalogResponse resp;
-      RETURN_IF_ERROR(
-          client.DoRpc(&CatalogServiceClient::UpdateCatalog, catalog_update, &resp));
+      RETURN_IF_ERROR(client.DoRpc(&CatalogServiceClientWrapper::UpdateCatalog,
+          catalog_update, &resp));
 
       Status status(resp.result.status);
       if (!status.ok()) LOG(ERROR) << "ERROR Finalizing DML: " << status.GetDetail();
@@ -1083,4 +1078,5 @@ void ClientRequestState::UpdateQueryState(
   query_state_ = query_state;
   summary_profile_.AddInfoString("Query State", PrintQueryState(query_state_));
 }
+
 }

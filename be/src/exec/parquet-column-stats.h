@@ -62,7 +62,7 @@ class ColumnStatsBase {
   /// the minimum or maximum value.
   enum class StatsField { MIN, MAX };
 
-  ColumnStatsBase() : has_values_(false) {}
+  ColumnStatsBase() : has_min_max_values_(false), null_count_(0) {}
   virtual ~ColumnStatsBase() {}
 
   /// Decodes the parquet::Statistics from 'col_chunk' and writes the value selected by
@@ -81,7 +81,9 @@ class ColumnStatsBase {
   /// data types (e.g. StringValue) need to be copied at the end of processing a row
   /// batch, since the batch memory will be released. Overwrite this method in derived
   /// classes to provide the functionality.
-  virtual void MaterializeStringValuesToInternalBuffers() {}
+  virtual Status MaterializeStringValuesToInternalBuffers() WARN_UNUSED_RESULT {
+    return Status::OK();
+  }
 
   /// Returns the number of bytes needed to encode the current statistics into a
   /// parquet::Statistics object.
@@ -91,17 +93,22 @@ class ColumnStatsBase {
   virtual void EncodeToThrift(parquet::Statistics* out) const = 0;
 
   /// Resets the state of this object.
-  void Reset() { has_values_ = false; }
+  void Reset();
 
-  bool has_values() const { return has_values_; }
+  /// Update the statistics by incrementing the null_count. It is called each time a null
+  /// value is appended to the column or the statistics are merged.
+  void IncrementNullCount(int64_t count) { null_count_ += count; }
 
  protected:
   // Copies the memory of 'value' into 'buffer' and make 'value' point to 'buffer'.
   // 'buffer' is reset before making the copy.
-  static void CopyToBuffer(StringBuffer* buffer, StringValue* value);
+  static Status CopyToBuffer(StringBuffer* buffer, StringValue* value) WARN_UNUSED_RESULT;
 
-  /// Stores whether the current object has been initialized with a set of values.
-  bool has_values_;
+  /// Stores whether the min and max values of the current object have been initialized.
+  bool has_min_max_values_;
+
+  // Number of null values since the last call to Reset().
+  int64_t null_count_;
 
  private:
   /// Returns true if we support reading statistics stored in the fields 'min_value' and
@@ -149,20 +156,26 @@ class ColumnStats : public ColumnStatsBase {
       min_buffer_(mem_pool),
       max_buffer_(mem_pool) {}
 
-  /// Updates the statistics based on the value 'v'. If necessary, initializes the
-  /// statistics. It may keep a reference to 'v' until
+  /// Updates the statistics based on the values min_value and max_value. If necessary,
+  /// initializes the statistics. It may keep a reference to either value until
   /// MaterializeStringValuesToInternalBuffers() gets called.
-  void Update(const T& v);
+  void Update(const T& min_value, const T& max_value);
+
+  /// Wrapper to call the Update function which takes in the min_value and max_value.
+  void Update(const T& v) { Update(v, v); }
 
   virtual void Merge(const ColumnStatsBase& other) override;
-  virtual void MaterializeStringValuesToInternalBuffers() override {}
+  virtual Status MaterializeStringValuesToInternalBuffers() override {
+    return Status::OK();
+  }
 
   virtual int64_t BytesNeeded() const override;
   virtual void EncodeToThrift(parquet::Statistics* out) const override;
 
  protected:
-  /// Encodes a single value using parquet's plain encoding and stores it into the
-  /// binary string 'out'. String values are stored without additional encoding.
+  /// Encodes a single value using parquet's plain encoding and stores it into the binary
+  /// string 'out'. String values are stored without additional encoding. 'bytes_needed'
+  /// must be positive.
   static void EncodePlainValue(const T& v, int64_t bytes_needed, std::string* out);
 
   /// Decodes the plain encoded stats value from 'buffer' and writes the result into the

@@ -38,6 +38,7 @@ using boost::gregorian::max_date_time;
 using boost::gregorian::min_date_time;
 using boost::posix_time::not_a_date_time;
 using boost::posix_time::ptime;
+using boost::posix_time::time_duration;
 using namespace impala_udf;
 using namespace strings;
 
@@ -128,10 +129,10 @@ BigIntVal TimestampFunctions::UtcToUnixMicros(FunctionContext* context,
   return (tv.UtcToUnixTimeMicros(&result)) ? BigIntVal(result) : BigIntVal::null();
 }
 
-TimestampVal TimestampFunctions::TimestampFromUnixMicros(FunctionContext* context,
+TimestampVal TimestampFunctions::UnixMicrosToUtcTimestamp(FunctionContext* context,
     const BigIntVal& unix_time_micros) {
   if (unix_time_micros.is_null) return TimestampVal::null();
-  TimestampValue tv = TimestampValue::FromUnixTimeMicros(unix_time_micros.val);
+  TimestampValue tv = TimestampValue::UtcFromUnixTimeMicros(unix_time_micros.val);
   TimestampVal result;
   tv.ToTimestampVal(&result);
   return result;
@@ -300,6 +301,13 @@ TimestampVal TimestampFunctions::Now(FunctionContext* context) {
   const TimestampValue* now = context->impl()->state()->now();
   TimestampVal return_val;
   now->ToTimestampVal(&return_val);
+  return return_val;
+}
+
+TimestampVal TimestampFunctions::UtcTimestamp(FunctionContext* context) {
+  const TimestampValue* utc_timestamp = context->impl()->state()->utc_timestamp();
+  TimestampVal return_val;
+  utc_timestamp->ToTimestampVal(&return_val);
   return return_val;
 }
 
@@ -562,6 +570,17 @@ TimestampVal TimestampFunctions::NextDay(FunctionContext* context,
 
   IntVal delta(delta_days);
   return AddSub<true, IntVal, Days, false>(context, date, delta);
+}
+
+TimestampVal TimestampFunctions::LastDay(FunctionContext* context,
+    const TimestampVal& ts) {
+  if (ts.is_null) return TimestampVal::null();
+  const TimestampValue& timestamp =  TimestampValue::FromTimestampVal(ts);
+  if (!timestamp.HasDate()) return TimestampVal::null();
+  TimestampValue tsv(timestamp.date().end_of_month(), time_duration(0,0,0,0));
+  TimestampVal rt_date;
+  tsv.ToTimestampVal(&rt_date);
+  return rt_date;
 }
 
 IntVal TimestampFunctions::IntMonthsBetween(FunctionContext* context,

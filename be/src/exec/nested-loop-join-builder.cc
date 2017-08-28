@@ -27,7 +27,7 @@
 
 using namespace impala;
 
-NljBuilder::NljBuilder(const RowDescriptor& row_desc, RuntimeState* state)
+NljBuilder::NljBuilder(const RowDescriptor* row_desc, RuntimeState* state)
   : DataSink(row_desc), build_batch_cache_(row_desc, state->batch_size()) {}
 
 Status NljBuilder::Prepare(RuntimeState* state, MemTracker* parent_mem_tracker) {
@@ -45,8 +45,7 @@ Status NljBuilder::Send(RuntimeState* state, RowBatch* batch) {
   build_batch->AcquireState(batch);
 
   AddBuildBatch(build_batch);
-  if (build_batch->needs_deep_copy() || build_batch->num_blocks() > 0
-      || build_batch->num_buffers() > 0) {
+  if (build_batch->needs_deep_copy() || build_batch->num_buffers() > 0) {
     // This batch and earlier batches may refer to resources passed from the child
     // that aren't owned by the row batch itself. Deep copying ensures that the row
     // batches are backed by memory owned by this node that is safe to hold on to.
@@ -105,4 +104,3 @@ Status NljBuilder::DeepCopyBuildBatches(RuntimeState* state) {
   input_build_batches_.Reset();
   return Status::OK();
 }
-

@@ -206,9 +206,7 @@ error_codes = (
 
   ("UDF_MEM_LIMIT_EXCEEDED", 64, "$0's allocations exceeded memory limits."),
 
-  ("BTS_BLOCK_OVERFLOW", 65, "Cannot process row that is bigger than the IO size "
-   "(row_size=$0, null_indicators_size=$1). To run this query, increase the IO size "
-   "(--read_size option)."),
+  ("UNUSED_65", 65, "No longer in use."),
 
   ("COMPRESSED_FILE_MULTIPLE_BLOCKS", 66,
    "For better performance, snappy-, gzip-, and bzip-compressed files "
@@ -240,11 +238,9 @@ error_codes = (
 
   ("PARTITIONED_HASH_JOIN_REPARTITION_FAILS", 76, "Cannot perform hash join at node with "
    "id $0. Repartitioning did not reduce the size of a spilled partition. Repartitioning "
-   "level $1. Number of rows $2."),
+   "level $1. Number of rows $2:\\n$3\\n$4"),
 
-  ("PARTITIONED_AGG_REPARTITION_FAILS", 77,  "Cannot perform aggregation at node with "
-   "id $0. Repartitioning did not reduce the size of a spilled partition. Repartitioning "
-   "level $1. Number of rows $2."),
+  ("UNUSED_77", 77,  "Not in use."),
 
   ("AVRO_TRUNCATED_BLOCK", 78, "File '$0' is corrupt: truncated data block at offset $1"),
 
@@ -319,6 +315,21 @@ error_codes = (
   ("KUDU_TIMESTAMP_OUT_OF_RANGE", 103,
    "Kudu table '$0' column '$1' contains an out of range timestamp. "
    "The valid date range is 1400-01-01..9999-12-31."),
+
+  ("MAX_ROW_SIZE", 104, "Row of size $0 could not be materialized in plan node with "
+    "id $1. Increase the max_row_size query option (currently $2) to process larger rows."),
+
+  ("IR_VERIFY_FAILED", 105,
+   "Failed to verify generated IR function $0, see log for more details."),
+
+  ("MINIMUM_RESERVATION_UNAVAILABLE", 106, "Failed to get minimum memory reservation of "
+     "$0 on daemon $1:$2 for query $3 because it would exceed an applicable query, "
+     "request pool or process memory limit. Memory usage:\\n$4"),
+
+  ("ADMISSION_REJECTED", 107, "Rejected query from pool $0: $1"),
+
+  ("ADMISSION_TIMED_OUT", 108, "Admission for query exceeded timeout $0ms in pool $1. "
+     "Queued reason: $2"),
 )
 
 import sys

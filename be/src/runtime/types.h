@@ -50,12 +50,9 @@ enum PrimitiveType {
   TYPE_DATETIME,    // Not implemented
   TYPE_BINARY,      // Not implemented
   TYPE_DECIMAL,
-
-  /// This is minimally supported currently. It can't be returned to the user or
-  /// parsed from scan nodes. It can be returned from exprs and must be consumable
-  /// by exprs.
   TYPE_CHAR,
   TYPE_VARCHAR,
+  TYPE_FIXED_UDA_INTERMEDIATE,
 
   TYPE_STRUCT,
   TYPE_ARRAY,
@@ -72,11 +69,10 @@ std::string TypeToOdbcString(PrimitiveType t);
 // TODO for 2.3: rename to TypeDescriptor
 struct ColumnType {
   PrimitiveType type;
-  /// Only set if type == TYPE_CHAR or type == TYPE_VARCHAR
+  /// Only set if type one of TYPE_CHAR, TYPE_VARCHAR, TYPE_FIXED_UDA_INTERMEDIATE.
   int len;
   static const int MAX_VARCHAR_LENGTH = (1 << 16) - 1; // 65535
   static const int MAX_CHAR_LENGTH = (1 << 8) - 1; // 255
-  static const int MAX_CHAR_INLINE_LENGTH = (1 << 7); // 128
 
   /// Only set if type == TYPE_DECIMAL
   int precision, scale;
@@ -107,6 +103,7 @@ struct ColumnType {
     DCHECK_NE(type, TYPE_STRUCT);
     DCHECK_NE(type, TYPE_ARRAY);
     DCHECK_NE(type, TYPE_MAP);
+    DCHECK_NE(type, TYPE_FIXED_UDA_INTERMEDIATE);
   }
 
   static ColumnType CreateCharType(int len) {
@@ -123,6 +120,14 @@ struct ColumnType {
     DCHECK_LE(len, MAX_VARCHAR_LENGTH);
     ColumnType ret;
     ret.type = TYPE_VARCHAR;
+    ret.len = len;
+    return ret;
+  }
+
+  static ColumnType CreateFixedUdaIntermediateType(int len) {
+    DCHECK_GE(len, 1);
+    ColumnType ret;
+    ret.type = TYPE_FIXED_UDA_INTERMEDIATE;
     ret.len = len;
     return ret;
   }
@@ -164,7 +169,7 @@ struct ColumnType {
   bool operator==(const ColumnType& o) const {
     if (type != o.type) return false;
     if (children != o.children) return false;
-    if (type == TYPE_CHAR) return len == o.len;
+    if (type == TYPE_CHAR || type == TYPE_FIXED_UDA_INTERMEDIATE) return len == o.len;
     if (type == TYPE_DECIMAL) return precision == o.precision && scale == o.scale;
     return true;
   }
@@ -199,8 +204,7 @@ struct ColumnType {
   inline bool IsTimestampType() const { return type == TYPE_TIMESTAMP; }
 
   inline bool IsVarLenStringType() const {
-    return type == TYPE_STRING || type == TYPE_VARCHAR
-        || (type == TYPE_CHAR && len > MAX_CHAR_INLINE_LENGTH);
+    return type == TYPE_STRING || type == TYPE_VARCHAR;
   }
 
   inline bool IsComplexType() const {
@@ -224,7 +228,7 @@ struct ColumnType {
       case TYPE_VARCHAR:
         return 0;
       case TYPE_CHAR:
-        if (IsVarLenStringType()) return 0;
+      case TYPE_FIXED_UDA_INTERMEDIATE:
         return len;
       case TYPE_NULL:
       case TYPE_BOOLEAN:
@@ -258,7 +262,7 @@ struct ColumnType {
       case TYPE_VARCHAR:
         return 16;
       case TYPE_CHAR:
-        if (IsVarLenStringType()) return 16;
+      case TYPE_FIXED_UDA_INTERMEDIATE:
         return len;
       case TYPE_ARRAY:
       case TYPE_MAP:

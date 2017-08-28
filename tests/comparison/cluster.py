@@ -60,6 +60,10 @@ DEFAULT_HIVE_PASSWORD = 'hive'
 
 DEFAULT_TIMEOUT = 300
 
+CM_CLEAR_PORT = 7180
+CM_TLS_PORT = 7183
+
+
 class Cluster(object):
   """This is a base class for clusters. Cluster classes provide various methods for
      interacting with a cluster. Ideally the various cluster implementations provide
@@ -74,6 +78,7 @@ class Cluster(object):
     self.hadoop_user_name = getuser()
     self.use_kerberos = False
     self.use_ssl = False
+    self.ca_cert = None
 
     self._hdfs = None
     self._yarn = None
@@ -231,16 +236,25 @@ class MiniHiveCluster(MiniCluster):
   def _get_other_conf_dir(self):
     return os.environ["HIVE_CONF_DIR"]
 
+
 class CmCluster(Cluster):
 
-  def __init__(self, host_name, port=7180, user="admin", password="admin",
-      cluster_name=None, ssh_user=None, ssh_port=None, ssh_key_file=None):
+  def __init__(self, host_name, port=None, user="admin", password="admin",
+               cluster_name=None, ssh_user=None, ssh_port=None, ssh_key_file=None,
+               use_tls=False):
     # Initialize strptime() to workaround https://bugs.python.org/issue7980. Apparently
     # something in the CM API uses strptime().
     strptime("2015", "%Y")
 
     Cluster.__init__(self)
-    self.cm = CmApiResource(host_name, server_port=port, username=user, password=password)
+    # IMPALA-5455: If the caller doesn't specify port, default it based on use_tls
+    if port is None:
+      if use_tls:
+        port = CM_TLS_PORT
+      else:
+        port = CM_CLEAR_PORT
+    self.cm = CmApiResource(host_name, server_port=port, username=user, password=password,
+                            use_tls=use_tls)
     clusters = self.cm.get_all_clusters()
     if not clusters:
       raise Exception("No clusters found in CM at %s" % host_name)
@@ -478,9 +492,15 @@ class Hive(Service):
     return self._warehouse_dir
 
   def connect(self, db_name=None):
-    conn = HiveConnection(host_name=self.hs2_host_name, port=self.hs2_port,
-        user_name=self.cluster.hadoop_user_name, db_name=db_name,
-        use_kerberos=self.cluster.use_kerberos, use_ssl=self.cluster.use_ssl)
+    conn = HiveConnection(
+        host_name=self.hs2_host_name,
+        port=self.hs2_port,
+        user_name=self.cluster.hadoop_user_name,
+        db_name=db_name,
+        use_kerberos=self.cluster.use_kerberos,
+        use_ssl=self.cluster.use_ssl,
+        ca_cert=self.cluster.ca_cert,
+    )
     conn.cluster = self.cluster
     return conn
 
@@ -512,9 +532,15 @@ class Impala(Service):
   def connect(self, db_name=None, impalad=None):
     if not impalad:
       impalad = choice(self.impalads)
-    conn = ImpalaConnection(host_name=impalad.host_name, port=impalad.hs2_port,
-        user_name=self.cluster.hadoop_user_name, db_name=db_name,
-        use_kerberos=self.cluster.use_kerberos, use_ssl=self.cluster.use_ssl)
+    conn = ImpalaConnection(
+        host_name=impalad.host_name,
+        port=impalad.hs2_port,
+        user_name=self.cluster.hadoop_user_name,
+        db_name=db_name,
+        use_kerberos=self.cluster.use_kerberos,
+        use_ssl=self.cluster.use_ssl,
+        ca_cert=self.cluster.ca_cert,
+    )
     conn.cluster = self.cluster
     return conn
 
@@ -536,6 +562,9 @@ class Impala(Service):
 
   def cancel_queries(self):
     self.for_each_impalad(lambda i: i.cancel_queries())
+
+  def get_version_info(self):
+    return self.for_each_impalad(lambda i: i.get_version_info(), as_dict=True)
 
   def queries_are_running(self):
     return any(self.for_each_impalad(lambda i: i.queries_are_running()))
@@ -650,6 +679,11 @@ class Impalad(object):
       # TODO: Handle losing the race
       raise e
 
+  def get_version_info(self):
+    with self.cluster.impala.cursor(impalad=self) as cursor:
+      cursor.execute("SELECT version()")
+      return ''.join(cursor.fetchone()).strip()
+
   def shell(self, cmd, timeout_secs=DEFAULT_TIMEOUT):
     return self.cluster.shell(cmd, self.host_name, timeout_secs=timeout_secs)
 
@@ -761,9 +795,9 @@ class Impalad(object):
         port=self.web_ui_port,
         url=relative_url)
     try:
-      # verify=False is needed because of self-signed certifiates
-      # TODO: support a CA bundle that users could point to instead
-      resp = requests.get(url, params=params, timeout=timeout_secs, verify=False)
+      verify_ca = self.cluster.ca_cert if self.cluster.ca_cert is not None else False
+      resp = requests.get(url, params=params, timeout=timeout_secs,
+                          verify=verify_ca)
     except requests.exceptions.Timeout as e:
       raise Timeout(underlying_exception=e)
     resp.raise_for_status()

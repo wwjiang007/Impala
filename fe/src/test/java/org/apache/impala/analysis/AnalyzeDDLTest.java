@@ -478,7 +478,7 @@ public class AnalyzeDDLTest extends FrontendTestBase {
 
     // Cannot ALTER TABLE CHANGE COLUMN on an HBase table.
     AnalysisError("alter table functional_hbase.alltypes CHANGE COLUMN int_col i int",
-        "ALTER TABLE CHANGE COLUMN not currently supported on HBase tables.");
+        "ALTER TABLE CHANGE/ALTER COLUMN not currently supported on HBase tables.");
   }
 
   @Test
@@ -1129,6 +1129,35 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "ALTER VIEW not allowed on a table: functional.alltypes");
   }
 
+  @Test
+  public void TestAlterTableAlterColumn() throws AnalysisException {
+    AnalyzesOk("alter table functional_kudu.alltypes alter int_col set default 0");
+    AnalyzesOk("alter table functional_kudu.alltypes alter int_col set " +
+        "compression LZ4 encoding RLE");
+    AnalyzesOk("alter table functional.alltypes alter int_col set comment 'a'");
+    AnalyzesOk("alter table functional_kudu.alltypes alter int_col drop default");
+
+    AnalysisError("alter table functional_kudu.alltypes alter id set default 0",
+        "Cannot set default value for primary key column 'id'");
+    AnalysisError("alter table functional_kudu.alltypes alter id drop default",
+        "Cannot drop default value for primary key column 'id'");
+    AnalysisError("alter table functional_kudu.alltypes alter int_col set default 'a'",
+        "Default value 'a' (type: STRING) is not compatible with column 'int_col' " +
+        "(type: INT)");
+    AnalysisError("alter table functional_kudu.alltypes alter int_col set " +
+        "encoding rle compression error", "Unsupported compression algorithm 'ERROR'");
+    AnalysisError("alter table functional_kudu.alltypes alter int_col set primary key",
+        "Altering a column to be a primary key is not supported.");
+    AnalysisError("alter table functional_kudu.alltypes alter int_col set not null",
+        "Altering the nullability of a column is not supported.");
+    AnalysisError("alter table functional_kudu.alltypes alter int_col set comment 'a'",
+        "Kudu does not support column comments.");
+    AnalysisError("alter table functional.alltypes alter int_col set compression lz4",
+        "Unsupported column options for non-Kudu table: 'int_col INT COMPRESSION LZ4'");
+    AnalysisError("alter table functional.alltypes alter int_col drop default",
+        "Unsupported column option for non-Kudu table: DROP DEFAULT");
+  }
+
   void checkComputeStatsStmt(String stmt) throws AnalysisException {
     ParseNode parseNode = AnalyzesOk(stmt);
     assertTrue(parseNode instanceof ComputeStatsStmt);
@@ -1406,6 +1435,8 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         + "'/test-warehouse/schemas/zipcode_incomes.parquet'");
     AnalyzesOk("create table if not exists newtbl_DNE like parquet "
         + "'/test-warehouse/schemas/decimal.parquet'");
+    AnalyzesOk("create table if not exists newtbl_DNE like parquet'"
+        + " /test-warehouse/schemas/enum/enum.parquet'");
 
     // check we error in the same situations as standard create table
     AnalysisError("create table functional.zipcode_incomes like parquet "
@@ -1556,6 +1587,13 @@ public class AnalyzeDDLTest extends FrontendTestBase {
         "partition value = 30) stored as kudu as select id, bool_col, tinyint_col, " +
         "smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, " +
         "string_col from functional.alltypestiny");
+    // Creating unpartitioned table results in a warning.
+    AnalyzesOk("create table t primary key(id) stored as kudu as select id, bool_col " +
+        "from functional.alltypestiny",
+        "Unpartitioned Kudu tables are inefficient for large data sizes.");
+    // IMPALA-5796: CTAS into a Kudu table with expr rewriting.
+    AnalyzesOk("create table t primary key(id) stored as kudu as select id, bool_col " +
+        "from functional.alltypestiny where id between 0 and 10");
     // CTAS in an external Kudu table
     AnalysisError("create external table t stored as kudu " +
         "tblproperties('kudu.table_name'='t') as select id, int_col from " +
@@ -1979,8 +2017,11 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     // Unsupported column options
     AnalysisError("alter table functional_kudu.testtbl change column zip zip_code int " +
         "encoding rle compression lz4 default 90000", "Unsupported column options in " +
-        "ALTER TABLE CHANGE COLUMN statement: zip_code INT ENCODING RLE COMPRESSION " +
-        "LZ4 DEFAULT 90000");
+        "ALTER TABLE CHANGE COLUMN statement: 'zip_code INT ENCODING RLE COMPRESSION " +
+        "LZ4 DEFAULT 90000'. Use ALTER TABLE ALTER COLUMN instead.");
+    AnalysisError(
+        "alter table functional_kudu.testtbl change column zip zip int comment 'comment'",
+        "Kudu does not support column comments.");
     // Changing the column type is not supported for Kudu tables
     AnalysisError("alter table functional_kudu.testtbl change column zip zip bigint",
         "Cannot change the type of a Kudu column using an ALTER TABLE CHANGE COLUMN " +
@@ -2163,9 +2204,10 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalysisError("create table tab (x int) tblproperties (" +
         "'storage_handler'='com.cloudera.kudu.hive.KuduStorageHandler')",
         CreateTableStmt.KUDU_STORAGE_HANDLER_ERROR_MESSAGE);
-    AnalysisError("create table tab (x int primary key) stored as kudu tblproperties (" +
+    // Creating unpartitioned table results in a warning.
+    AnalyzesOk("create table tab (x int primary key) stored as kudu tblproperties (" +
         "'storage_handler'='com.cloudera.kudu.hive.KuduStorageHandler')",
-        "Table partitioning must be specified for managed Kudu tables.");
+        "Unpartitioned Kudu tables are inefficient for large data sizes.");
     // Invalid value for number of replicas
     AnalysisError("create table t (x int primary key) stored as kudu tblproperties (" +
         "'kudu.num_tablet_replicas'='1.1')",
@@ -2177,9 +2219,9 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalysisError("create table tab (a int primary key) partition by hash (a) " +
         "partitions 3 stored as kudu location '/test-warehouse/'",
         "LOCATION cannot be specified for a Kudu table.");
-    // PARTITION BY is required for managed tables.
-    AnalysisError("create table tab (a int, primary key (a)) stored as kudu",
-        "Table partitioning must be specified for managed Kudu tables.");
+    // Creating unpartitioned table results in a warning.
+    AnalyzesOk("create table tab (a int, primary key (a)) stored as kudu",
+        "Unpartitioned Kudu tables are inefficient for large data sizes.");
     AnalysisError("create table tab (a int) stored as kudu",
         "A primary key is required for a Kudu table.");
     // Using ROW FORMAT with a Kudu table
@@ -2345,7 +2387,7 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalyzesOk("create table tdefault (id int primary key, ts timestamp default now())" +
         "partition by hash(id) partitions 3 stored as kudu");
     AnalyzesOk("create table tdefault (id int primary key, ts timestamp default " +
-        "timestamp_from_unix_micros(1230768000000000)) partition by hash(id) " +
+        "unix_micros_to_utc_timestamp(1230768000000000)) partition by hash(id) " +
         "partitions 3 stored as kudu");
     AnalyzesOk("create table tdefault (id int primary key, " +
         "ts timestamp not null default '2009-01-01 00:00:00') " +
@@ -3088,6 +3130,9 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     AnalysisError("create aggregate function foo(int) RETURNS struct<f:int> " +
         loc + "UPDATE_FN='AggUpdate'",
         "Type 'STRUCT<f:INT>' is not supported in UDFs/UDAs.");
+    AnalysisError("create aggregate function foo(int) RETURNS int " +
+        "INTERMEDIATE fixed_uda_intermediate(10) " + loc + " UPDATE_FN='foo'",
+        "Syntax error in line 1");
 
     // Test missing .ll file. TODO: reenable when we can run IR UDAs
     AnalysisError("create aggregate function foo(int) RETURNS int LOCATION " +

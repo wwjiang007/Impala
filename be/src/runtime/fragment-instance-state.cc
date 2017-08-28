@@ -36,10 +36,10 @@
 #include "runtime/backend-client.h"
 #include "runtime/runtime-filter-bank.h"
 #include "runtime/client-cache.h"
+#include "runtime/data-stream-mgr.h"
 #include "runtime/runtime-state.h"
 #include "runtime/query-state.h"
 #include "runtime/query-state.h"
-#include "runtime/data-stream-mgr.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/row-batch.h"
 #include "scheduling/query-schedule.h"
@@ -97,7 +97,9 @@ done:
 }
 
 void FragmentInstanceState::Cancel() {
-  WaitForPrepare();  // make sure Prepare() finished
+  // Make sure Prepare() finished. We don't care about the status since the query is
+  // being cancelled.
+  discard_result(WaitForPrepare());
 
   // Ensure that the sink is closed from both sides. Although in ordinary executions we
   // rely on the consumer to do this, in error cases the consumer may not be able to send
@@ -126,8 +128,6 @@ Status FragmentInstanceState::Prepare() {
   profile()->AddChild(timings_profile_);
   SCOPED_TIMER(ADD_TIMER(timings_profile_, PREPARE_TIMER_NAME));
 
-  // TODO: move this into a RuntimeState::Init()
-  RETURN_IF_ERROR(runtime_state_->CreateBlockMgr());
   runtime_state_->InitFilterBank();
 
   // Reserve one main thread from the pool
@@ -185,9 +185,8 @@ Status FragmentInstanceState::Prepare() {
 
   // prepare sink_
   DCHECK(fragment_ctx_.fragment.__isset.output_sink);
-  RETURN_IF_ERROR(
-      DataSink::Create(
-          obj_pool(), fragment_ctx_, instance_ctx_, exec_tree_->row_desc(), &sink_));
+  RETURN_IF_ERROR(DataSink::Create(fragment_ctx_, instance_ctx_, exec_tree_->row_desc(),
+      runtime_state_, &sink_));
   RETURN_IF_ERROR(sink_->Prepare(runtime_state_, runtime_state_->instance_mem_tracker()));
   RuntimeProfile* sink_profile = sink_->profile();
   if (sink_profile != nullptr) profile()->AddChild(sink_profile);

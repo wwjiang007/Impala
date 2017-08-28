@@ -24,15 +24,13 @@ set(LIBRARY_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/runtime")
 set(EXECUTABLE_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/runtime")
 
 add_library(Runtime
-  buffered-block-mgr.cc
   buffered-tuple-stream.cc
-  buffered-tuple-stream-v2.cc
   client-cache.cc
   coordinator.cc
   coordinator-backend-state.cc
   data-stream-mgr.cc
-  data-stream-sender.cc
   data-stream-recvr.cc
+  data-stream-sender.cc
   debug-options.cc
   descriptors.cc
   disk-io-mgr.cc
@@ -45,6 +43,9 @@ add_library(Runtime
   hbase-table.cc
   hbase-table-factory.cc
   hdfs-fs-cache.cc
+  initial-reservations.cc
+  krpc-data-stream-mgr.cc
+  krpc-data-stream-recvr.cc
   lib-cache.cc
   mem-tracker.cc
   mem-pool.cc
@@ -83,7 +84,6 @@ ADD_BE_TEST(string-buffer-test)
 ADD_BE_TEST(data-stream-test)
 ADD_BE_TEST(timestamp-test)
 ADD_BE_TEST(disk-io-mgr-test)
-ADD_BE_TEST(buffered-block-mgr-test)
 ADD_BE_TEST(parallel-executor-test)
 ADD_BE_TEST(raw-value-test)
 ADD_BE_TEST(string-compare-test)
@@ -94,7 +94,6 @@ ADD_BE_TEST(mem-tracker-test)
 ADD_BE_TEST(multi-precision-test)
 ADD_BE_TEST(decimal-test)
 ADD_BE_TEST(buffered-tuple-stream-test)
-ADD_BE_TEST(buffered-tuple-stream-v2-test)
 ADD_BE_TEST(hdfs-fs-cache-test)
 ADD_BE_TEST(tmp-file-mgr-test)
 ADD_BE_TEST(row-batch-serialize-test)

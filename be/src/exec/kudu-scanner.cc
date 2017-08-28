@@ -22,9 +22,9 @@
 #include <vector>
 #include <string>
 
-#include "exprs/expr.h"
-#include "exprs/expr-context.h"
 #include "exec/kudu-util.h"
+#include "exprs/scalar-expr.h"
+#include "exprs/scalar-expr-evaluator.h"
 #include "runtime/mem-pool.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/raw-value.h"
@@ -63,6 +63,7 @@ const string MODE_READ_AT_SNAPSHOT = "READ_AT_SNAPSHOT";
 KuduScanner::KuduScanner(KuduScanNodeBase* scan_node, RuntimeState* state)
   : scan_node_(scan_node),
     state_(state),
+    expr_mem_pool_(new MemPool(scan_node->expr_mem_tracker())),
     cur_kudu_batch_num_read_(0),
     last_alive_time_micros_(0) {
 }
@@ -73,7 +74,8 @@ Status KuduScanner::Open() {
     if (slot->type().type != TYPE_TIMESTAMP) continue;
     timestamp_slots_.push_back(slot);
   }
-  return scan_node_->GetConjunctCtxs(&conjunct_ctxs_);
+  return ScalarExprEvaluator::Clone(&obj_pool_, state_, expr_mem_pool_.get(),
+      scan_node_->conjunct_evals(), &conjunct_evals_);
 }
 
 void KuduScanner::KeepKuduScannerAlive() {
@@ -128,7 +130,8 @@ Status KuduScanner::GetNext(RowBatch* row_batch, bool* eos) {
 
 void KuduScanner::Close() {
   if (scanner_) CloseCurrentClientScanner();
-  Expr::Close(conjunct_ctxs_, state_);
+  ScalarExprEvaluator::Close(conjunct_evals_, state_);
+  expr_mem_pool_->FreeAll();
 }
 
 Status KuduScanner::OpenNextScanToken(const string& scan_token)  {
@@ -152,8 +155,12 @@ Status KuduScanner::OpenNextScanToken(const string& scan_token)  {
       "Could not set scanner timeout");
   VLOG_ROW << "Starting KuduScanner with ReadMode=" << mode << " timeout=" <<
       FLAGS_kudu_operation_timeout_ms;
-  uint64_t row_format_flags = kudu::client::KuduScanner::PAD_UNIXTIME_MICROS_TO_16_BYTES;
-  scanner_->SetRowFormatFlags(row_format_flags);
+
+  if (!timestamp_slots_.empty()) {
+    uint64_t row_format_flags =
+        kudu::client::KuduScanner::PAD_UNIXTIME_MICROS_TO_16_BYTES;
+    scanner_->SetRowFormatFlags(row_format_flags);
+  }
 
   {
     SCOPED_TIMER(state_->total_storage_wait_timer());
@@ -185,13 +192,13 @@ Status KuduScanner::DecodeRowsIntoRowBatch(RowBatch* row_batch, Tuple** tuple_me
 
   // Iterate through the Kudu rows, evaluate conjuncts and deep-copy survivors into
   // 'row_batch'.
-  bool has_conjuncts = !conjunct_ctxs_.empty();
+  bool has_conjuncts = !conjunct_evals_.empty();
   int num_rows = cur_kudu_batch_.NumRows();
 
   for (int krow_idx = cur_kudu_batch_num_read_; krow_idx < num_rows; ++krow_idx) {
-    Tuple* kudu_tuple = const_cast<Tuple*>(reinterpret_cast<const Tuple*>(
-        cur_kudu_batch_.direct_data().data() +
-        (krow_idx * scan_node_->row_desc().GetRowSize())));
+    Tuple* kudu_tuple = const_cast<Tuple*>(
+        reinterpret_cast<const Tuple*>(cur_kudu_batch_.direct_data().data()
+            + (krow_idx * scan_node_->row_desc()->GetRowSize())));
     ++cur_kudu_batch_num_read_;
 
     // Kudu tuples containing TIMESTAMP columns (UNIXTIME_MICROS in Kudu, stored as an
@@ -208,7 +215,7 @@ Status KuduScanner::DecodeRowsIntoRowBatch(RowBatch* row_batch, Tuple** tuple_me
       }
       int64_t ts_micros = *reinterpret_cast<int64_t*>(
           kudu_tuple->GetSlot(slot->tuple_offset()));
-      TimestampValue tv = TimestampValue::FromUnixTimeMicros(ts_micros);
+      TimestampValue tv = TimestampValue::UtcFromUnixTimeMicros(ts_micros);
       if (tv.HasDateAndTime()) {
         RawValue::Write(&tv, kudu_tuple, slot, NULL);
       } else {
@@ -223,8 +230,8 @@ Status KuduScanner::DecodeRowsIntoRowBatch(RowBatch* row_batch, Tuple** tuple_me
     // Evaluate the conjuncts that haven't been pushed down to Kudu. Conjunct evaluation
     // is performed directly on the Kudu tuple because its memory layout is identical to
     // Impala's. We only copy the surviving tuples to Impala's output row batch.
-    if (has_conjuncts && !ExecNode::EvalConjuncts(&conjunct_ctxs_[0],
-        conjunct_ctxs_.size(), reinterpret_cast<TupleRow*>(&kudu_tuple))) {
+    if (has_conjuncts && !ExecNode::EvalConjuncts(conjunct_evals_.data(),
+            conjunct_evals_.size(), reinterpret_cast<TupleRow*>(&kudu_tuple))) {
       continue;
     }
     // Deep copy the tuple, set it in a new row, and commit the row.
@@ -238,7 +245,7 @@ Status KuduScanner::DecodeRowsIntoRowBatch(RowBatch* row_batch, Tuple** tuple_me
     // Move to the next tuple in the tuple buffer.
     *tuple_mem = next_tuple(*tuple_mem);
   }
-  ExprContext::FreeLocalAllocations(conjunct_ctxs_);
+  ScalarExprEvaluator::FreeLocalAllocations(conjunct_evals_);
 
   // Check the status in case an error status was set during conjunct evaluation.
   return state_->GetQueryStatus();

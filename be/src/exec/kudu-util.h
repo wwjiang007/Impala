@@ -18,6 +18,9 @@
 #ifndef IMPALA_UTIL_KUDU_UTIL_H_
 #define IMPALA_UTIL_KUDU_UTIL_H_
 
+// TODO: Remove when toolchain callbacks.h properly defines ::tm.
+struct tm;
+
 #include <kudu/client/callbacks.h>
 #include <kudu/client/client.h>
 
@@ -45,7 +48,7 @@ bool KuduClientIsSupported();
 /// Returns OK if Kudu is available or an error status containing the reason Kudu is not
 /// available. Kudu may not be available if no Kudu client is available for the platform
 /// or if Kudu was disabled by the startup flag --disable_kudu.
-Status CheckKuduAvailability();
+Status CheckKuduAvailability() WARN_UNUSED_RESULT;
 
 /// Convenience function for the bool equivalent of CheckKuduAvailability().
 bool KuduIsAvailable();
@@ -53,7 +56,7 @@ bool KuduIsAvailable();
 /// Creates a new KuduClient using the specified master adresses. If any error occurs,
 /// 'client' is not set and an error status is returned.
 Status CreateKuduClient(const std::vector<std::string>& master_addrs,
-    kudu::client::sp::shared_ptr<kudu::client::KuduClient>* client);
+    kudu::client::sp::shared_ptr<kudu::client::KuduClient>* client) WARN_UNUSED_RESULT;
 
 /// Returns a debug string for the KuduSchema.
 std::string KuduSchemaDebugString(const kudu::client::KuduSchema& schema);
@@ -73,7 +76,10 @@ void LogKuduMessage(kudu::client::KuduLogSeverity severity, const char* filename
 /// into memory owned by the row. If false, string data must remain valid while the row
 /// is being used.
 Status WriteKuduValue(int col, PrimitiveType type, const void* value,
-    bool copy_strings, kudu::KuduPartialRow* row);
+    bool copy_strings, kudu::KuduPartialRow* row) WARN_UNUSED_RESULT;
+
+/// Takes a Kudu client DataType and returns the corresponding Impala ColumnType.
+ColumnType KuduDataTypeToColumnType(kudu::client::KuduColumnSchema::DataType type);
 
 } /// namespace impala
 #endif

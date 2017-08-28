@@ -18,8 +18,8 @@
 #ifndef IMPALA_RUNTIME_DISK_IO_MGR_H
 #define IMPALA_RUNTIME_DISK_IO_MGR_H
 
+#include <deque>
 #include <functional>
-#include <list>
 #include <vector>
 
 #include <boost/scoped_ptr.hpp>
@@ -146,9 +146,9 @@ class MemTracker;
 /// caller when constructing the scan range.
 ///
 /// As a caller reads from a scan range, these buffers are wrapped in BufferDescriptors
-/// and returned to the caller. The caller must always call Return() on the buffer
-/// descriptor when it when it is done to allow recycling of the buffer descriptor and
-/// the associated buffer (if there is an IoMgr-allocated or HDFS cached buffer).
+/// and returned to the caller. The caller must always call ReturnBuffer() on the buffer
+/// descriptor to allow recycling of the associated buffer (if there is an
+/// IoMgr-allocated or HDFS cached buffer).
 ///
 /// Caching support:
 /// Scan ranges contain metadata on whether or not it is cached on the DN. In that
@@ -169,7 +169,7 @@ class MemTracker;
 /// the number of scanner threads properly controls the amount of files we mlock.
 /// With cached scan ranges, we cannot close the scan range until the cached buffer
 /// is returned (HDFS does not allow this). We therefore need to defer the close until
-/// the cached buffer is returned (BufferDescriptor::Return()).
+/// the cached buffer is returned (ReturnBuffer()).
 //
 /// Remote filesystem support (e.g. S3):
 /// Remote filesystems are modeled as "remote disks". That is, there is a seperate disk
@@ -208,6 +208,10 @@ class DiskIoMgr : public CacheLineAligned {
   /// time.
   class BufferDescriptor {
    public:
+    ~BufferDescriptor() {
+      DCHECK(buffer_ == nullptr); // Check we didn't leak a buffer.
+    }
+
     ScanRange* scan_range() { return scan_range_; }
     uint8_t* buffer() { return buffer_; }
     int64_t buffer_len() { return buffer_len_; }
@@ -225,15 +229,16 @@ class DiskIoMgr : public CacheLineAligned {
     /// TODO: IMPALA-3209: revisit this as part of scanner memory usage revamp.
     void TransferOwnership(MemTracker* dst);
 
-    /// Returns the buffer to the IoMgr. This must be called for every buffer
-    /// returned by GetNext()/Read() that did not return an error. This is non-blocking.
-    /// After calling this, the buffer descriptor is invalid and cannot be accessed.
-    void Return();
-
    private:
     friend class DiskIoMgr;
+    friend class DiskIoMgr::ScanRange;
     friend class DiskIoRequestContext;
-    BufferDescriptor(DiskIoMgr* io_mgr);
+
+    /// Create a buffer descriptor for a new reader, range and data buffer. The buffer
+    /// memory should already be accounted against 'mem_tracker'.
+    BufferDescriptor(DiskIoMgr* io_mgr, DiskIoRequestContext* reader,
+        ScanRange* scan_range, uint8_t* buffer, int64_t buffer_len,
+        MemTracker* mem_tracker);
 
     /// Return true if this is a cached buffer owned by HDFS.
     bool is_cached() const {
@@ -248,42 +253,34 @@ class DiskIoMgr : public CacheLineAligned {
           == ScanRange::ExternalBufferTag::CLIENT_BUFFER;
     }
 
-    /// Reset the buffer descriptor to an uninitialized state.
-    void Reset();
-
-    /// Resets the buffer descriptor state for a new reader, range and data buffer.
-    /// The buffer memory should already be accounted against MemTracker
-    void Reset(DiskIoRequestContext* reader, ScanRange* range, uint8_t* buffer,
-        int64_t buffer_len, MemTracker* mem_tracker);
-
     DiskIoMgr* const io_mgr_;
 
     /// Reader that this buffer is for.
-    DiskIoRequestContext* reader_;
+    DiskIoRequestContext* const reader_;
 
     /// The current tracker this buffer is associated with. After initialisation,
     /// NULL for cached buffers and non-NULL for all other buffers.
     MemTracker* mem_tracker_;
 
     /// Scan range that this buffer is for. Non-NULL when initialised.
-    ScanRange* scan_range_;
+    ScanRange* const scan_range_;
 
     /// buffer with the read contents
     uint8_t* buffer_;
 
     /// length of buffer_. For buffers from cached reads, the length is 0.
-    int64_t buffer_len_;
+    const int64_t buffer_len_;
 
     /// length of read contents
-    int64_t len_;
+    int64_t len_ = 0;
 
     /// true if the current scan range is complete
-    bool eosr_;
+    bool eosr_ = false;
 
     /// Status of the read to this buffer. if status is not ok, 'buffer' is nullptr
     Status status_;
 
-    int64_t scan_range_offset_;
+    int64_t scan_range_offset_ = 0;
   };
 
   /// The request type, read or write associated with a request range.
@@ -411,7 +408,7 @@ class DiskIoMgr : public CacheLineAligned {
     /// called when all buffers have been returned, *buffer is set to nullptr and Status::OK
     /// is returned.
     /// Only one thread can be in GetNext() at any time.
-    Status GetNext(BufferDescriptor** buffer) WARN_UNUSED_RESULT;
+    Status GetNext(std::unique_ptr<BufferDescriptor>* buffer) WARN_UNUSED_RESULT;
 
     /// Cancel this scan range. This cleans up all queued buffers and
     /// wakes up any threads blocked on GetNext().
@@ -435,7 +432,7 @@ class DiskIoMgr : public CacheLineAligned {
     /// Returns true if this scan range has hit the queue capacity, false otherwise.
     /// The caller passes ownership of buffer to the scan range and it is not
     /// valid to access buffer after this call.
-    bool EnqueueBuffer(BufferDescriptor* buffer);
+    bool EnqueueBuffer(std::unique_ptr<BufferDescriptor> buffer);
 
     /// Cleanup any queued buffers (i.e. due to cancellation). This cannot
     /// be called with any locks taken.
@@ -455,7 +452,8 @@ class DiskIoMgr : public CacheLineAligned {
     /// If 'use_file_handle_cache' is false or this is a remote hdfs file or this is
     /// a local OS file, Open() will maintain a file handle on the scan range for
     /// exclusive use by this scan range. An exclusive hdfs file handle still comes
-    /// from the cache, but it is held for the entire duration of a scan range's lifetime.
+    /// from the cache, but it is a newly opened file handle that is held for the
+    /// entire duration of a scan range's lifetime and destroyed in Close().
     /// All local OS files are opened using normal OS file APIs.
     Status Open(bool use_file_handle_cache) WARN_UNUSED_RESULT;
 
@@ -486,14 +484,14 @@ class DiskIoMgr : public CacheLineAligned {
     /// If true, this scan range is expected to be cached. Note that this might be wrong
     /// since the block could have been uncached. In that case, the cached path
     /// will fail and we'll just put the scan range on the normal read path.
-    bool try_cache_;
+    bool try_cache_ = false;
 
     /// If true, we expect this scan range to be a local read. Note that if this is false,
     /// it does not necessarily mean we expect the read to be remote, and that we never
     /// create scan ranges where some of the range is expected to be remote and some of it
     /// local.
     /// TODO: we can do more with this
-    bool expected_local_;
+    bool expected_local_ = false;
 
     /// Total number of bytes read remotely. This is necessary to maintain a count of
     /// the number of remote scan ranges. Since IO statistics can be collected multiple
@@ -515,8 +513,8 @@ class DiskIoMgr : public CacheLineAligned {
     /// 2. The scan range is using hdfs caching.
     /// -OR-
     /// 3. The hdfs file is expected to be remote (expected_local_ == false)
-    /// In each case, the scan range gets a file handle from the file handle cache
-    /// at Open() and holds it exclusively until Close() is called.
+    /// In each case, the scan range gets a new file handle from the file handle cache
+    /// at Open(), holds it exclusively, and destroys it in Close().
     union {
       FILE* local_file_ = nullptr;
       HdfsFileHandle* exclusive_hdfs_fh_;
@@ -554,19 +552,19 @@ class DiskIoMgr : public CacheLineAligned {
     Status status_;
 
     /// If true, the last buffer for this scan range has been queued.
-    bool eosr_queued_;
+    bool eosr_queued_ = false;
 
     /// If true, the last buffer for this scan range has been returned.
-    bool eosr_returned_;
+    bool eosr_returned_ = false;
 
     /// If true, this scan range has been removed from the reader's in_flight_ranges
     /// queue because the ready_buffers_ queue is full.
-    bool blocked_on_queue_;
+    bool blocked_on_queue_ = false;
 
     /// IO buffers that are queued for this scan range.
     /// Condition variable for GetNext
     boost::condition_variable buffer_ready_cv_;
-    std::list<BufferDescriptor*> ready_buffers_;
+    std::deque<std::unique_ptr<BufferDescriptor>> ready_buffers_;
 
     /// The soft capacity limit for ready_buffers_. ready_buffers_ can exceed
     /// the limit temporarily as the capacity is adjusted dynamically.
@@ -583,7 +581,7 @@ class DiskIoMgr : public CacheLineAligned {
     boost::mutex hdfs_lock_;
 
     /// If true, this scan range has been cancelled.
-    bool is_cancelled_;
+    bool is_cancelled_ = false;
 
     /// Last modified time of the file associated with the scan range
     int64_t mtime_;
@@ -630,15 +628,17 @@ class DiskIoMgr : public CacheLineAligned {
     WriteDoneCallback callback_;
   };
 
-  /// Create a DiskIoMgr object.
+  /// Create a DiskIoMgr object. This constructor is only used for testing.
   ///  - num_disks: The number of disks the IoMgr should use. This is used for testing.
   ///    Specify 0, to have the disk IoMgr query the os for the number of disks.
-  ///  - threads_per_disk: number of read threads to create per disk. This is also
-  ///    the max queue depth.
+  ///  - threads_per_rotational_disk: number of read threads to create per rotational
+  ///    disk. This is also the max queue depth.
+  ///  - threads_per_solid_state_disk: number of read threads to create per solid state
+  ///    disk. This is also the max queue depth.
   ///  - min_buffer_size: minimum io buffer size (in bytes)
   ///  - max_buffer_size: maximum io buffer size (in bytes). Also the max read size.
-  DiskIoMgr(int num_disks, int threads_per_disk, int min_buffer_size,
-      int max_buffer_size);
+  DiskIoMgr(int num_disks, int threads_per_rotational_disk,
+      int threads_per_solid_state_disk, int min_buffer_size, int max_buffer_size);
 
   /// Create DiskIoMgr with default configs.
   DiskIoMgr();
@@ -711,7 +711,12 @@ class DiskIoMgr : public CacheLineAligned {
   /// This can only be used if the scan range fits in a single IO buffer (i.e. is smaller
   /// than max_read_buffer_size()) or if reading into a client-provided buffer.
   Status Read(DiskIoRequestContext* reader, ScanRange* range,
-      BufferDescriptor** buffer) WARN_UNUSED_RESULT;
+      std::unique_ptr<BufferDescriptor>* buffer) WARN_UNUSED_RESULT;
+
+  /// Returns the buffer to the IoMgr. This must be called for every buffer
+  /// returned by GetNext()/Read() that did not return an error. This is non-blocking.
+  /// After calling this, the buffer descriptor is invalid and cannot be accessed.
+  void ReturnBuffer(std::unique_ptr<BufferDescriptor> buffer);
 
   /// Determine which disk queue this file should be assigned to.  Returns an index into
   /// disk_queues_.  The disk_id is the volume ID for the local disk that holds the
@@ -771,14 +776,19 @@ class DiskIoMgr : public CacheLineAligned {
   bool Validate() const;
 
   /// Given a FS handle, name and last modified time of the file, gets an HdfsFileHandle
-  /// from the file handle cache. On success, records statistics about whether this was
-  /// a cache hit or miss in the `reader` as well as at the system level. In case of an
+  /// from the file handle cache. If 'require_new_handle' is true, the cache will open
+  /// a fresh file handle. On success, records statistics about whether this was
+  /// a cache hit or miss in the 'reader' as well as at the system level. In case of an
   /// error returns nullptr.
   HdfsFileHandle* GetCachedHdfsFileHandle(const hdfsFS& fs,
-      std::string* fname, int64_t mtime, DiskIoRequestContext *reader);
+      std::string* fname, int64_t mtime, DiskIoRequestContext *reader,
+      bool require_new_handle);
 
   /// Releases a file handle back to the file handle cache when it is no longer in use.
-  void ReleaseCachedHdfsFileHandle(std::string* fname, HdfsFileHandle* fid);
+  /// If 'destroy_handle' is true, the file handle cache will close the file handle
+  /// immediately.
+  void ReleaseCachedHdfsFileHandle(std::string* fname, HdfsFileHandle* fid,
+      bool destroy_handle);
 
   /// Reopens a file handle by destroying the file handle and getting a fresh
   /// file handle from the cache. Returns an error if the file could not be reopened.
@@ -809,9 +819,7 @@ class DiskIoMgr : public CacheLineAligned {
   class RequestContextCache;
 
   friend class DiskIoMgrTest_Buffers_Test;
-
-  /// Pool to allocate BufferDescriptors.
-  ObjectPool pool_;
+  friend class DiskIoMgrTest_VerifyNumThreadsParameter_Test;
 
   /// Memory tracker for unused I/O buffers owned by DiskIoMgr.
   boost::scoped_ptr<MemTracker> free_buffer_mem_tracker_;
@@ -821,9 +829,13 @@ class DiskIoMgr : public CacheLineAligned {
   /// provide a MemTracker.
   boost::scoped_ptr<MemTracker> unowned_buffer_mem_tracker_;
 
-  /// Number of worker(read) threads per disk. Also the max depth of queued
+  /// Number of worker(read) threads per rotational disk. Also the max depth of queued
   /// work to the disk.
-  const int num_threads_per_disk_;
+  const int num_io_threads_per_rotational_disk_;
+
+  /// Number of worker(read) threads per solid state disk. Also the max depth of queued
+  /// work to the disk.
+  const int num_io_threads_per_solid_state_disk_;
 
   /// Maximum read size. This is also the maximum size of each allocated buffer.
   const int max_buffer_size_;
@@ -853,7 +865,7 @@ class DiskIoMgr : public CacheLineAligned {
   /// contention.
   boost::scoped_ptr<RequestContextCache> request_context_cache_;
 
-  /// Protects free_buffers_ and free_buffer_descs_
+  /// Protects free_buffers_
   boost::mutex free_buffers_lock_;
 
   /// Free buffers that can be handed out to clients. There is one list for each buffer
@@ -867,10 +879,7 @@ class DiskIoMgr : public CacheLineAligned {
   ///  free_buffers_[10] => list of free buffers with size 1 MB
   ///  free_buffers_[13] => list of free buffers with size 8 MB
   ///  free_buffers_[n]  => list of free buffers with size 2^n * 1024 B
-  std::vector<std::list<uint8_t*>> free_buffers_;
-
-  /// List of free buffer desc objects that can be handed out to clients
-  std::list<BufferDescriptor*> free_buffer_descs_;
+  std::vector<std::deque<uint8_t*>> free_buffers_;
 
   /// Total number of allocated buffers, used for debugging.
   AtomicInt32 num_allocated_buffers_;
@@ -905,21 +914,8 @@ class DiskIoMgr : public CacheLineAligned {
   /// The returned *buffer_size must be between 0 and 'max_buffer_size_'.
   /// The buffer memory is tracked against reader's mem tracker, or
   /// 'unowned_buffer_mem_tracker_' if the reader does not have one.
-  BufferDescriptor* GetFreeBuffer(DiskIoRequestContext* reader, ScanRange* range,
-      int64_t buffer_size);
-
-  /// Gets a BufferDescriptor initialized with the provided parameters. The object may be
-  /// recycled or newly allocated. Does not do anything aside from initialize the
-  /// descriptor's fields.
-  BufferDescriptor* GetBufferDesc(DiskIoRequestContext* reader, MemTracker* mem_tracker,
-      ScanRange* range, uint8_t* buffer, int64_t buffer_size);
-
-  /// Returns the buffer desc and underlying buffer to the disk IoMgr. This also updates
-  /// the reader and disk queue state.
-  void ReturnBuffer(BufferDescriptor* buffer);
-
-  /// Returns a buffer desc object which can now be used for another reader.
-  void ReturnBufferDesc(BufferDescriptor* desc);
+  std::unique_ptr<BufferDescriptor> GetFreeBuffer(
+      DiskIoRequestContext* reader, ScanRange* range, int64_t buffer_size);
 
   /// Disassociates the desc->buffer_ memory from 'desc' (which cannot be nullptr), either
   /// freeing it or returning it to 'free_buffers_'. Memory tracking is updated to
@@ -941,7 +937,8 @@ class DiskIoMgr : public CacheLineAligned {
 
   /// Updates disk queue and reader state after a read is complete. The read result
   /// is captured in the buffer descriptor.
-  void HandleReadFinished(DiskQueue*, DiskIoRequestContext*, BufferDescriptor*);
+  void HandleReadFinished(DiskQueue* disk_queue, DiskIoRequestContext* reader,
+      std::unique_ptr<BufferDescriptor> buffer);
 
   /// Invokes write_range->callback_  after the range has been written and
   /// updates per-disk state and handle state. The status of the write OK/RUNTIME_ERROR
@@ -971,10 +968,9 @@ class DiskIoMgr : public CacheLineAligned {
   /// if successful. If 'reader' is cancelled, cancels the range and returns nullptr.
   /// If there is memory pressure and buffers are already queued, adds the range
   /// to the blocked ranges and returns nullptr.
-  BufferDescriptor* TryAllocateNextBufferForRange(DiskQueue* disk_queue,
+  std::unique_ptr<BufferDescriptor> TryAllocateNextBufferForRange(DiskQueue* disk_queue,
       DiskIoRequestContext* reader, ScanRange* range, int64_t buffer_size);
 };
-
 }
 
 #endif

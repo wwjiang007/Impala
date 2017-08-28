@@ -168,7 +168,7 @@ abstract public class ScanNode extends PlanNode {
 
   public boolean isTableMissingColumnStats() {
     for (SlotDescriptor slot: desc_.getSlots()) {
-      if (!slot.getStats().hasStats()) return true;
+      if (slot.getColumn() != null && !slot.getStats().hasStats()) return true;
     }
     return false;
   }
@@ -193,7 +193,9 @@ abstract public class ScanNode extends PlanNode {
 
   @Override
   public long getInputCardinality() {
-    if (getConjuncts().isEmpty() && hasLimit()) return getLimit();
+    if (!hasScanConjuncts() && !hasStorageLayerConjuncts() && hasLimit()) {
+      return getLimit();
+    }
     return inputCardinality_;
   }
 
@@ -210,4 +212,16 @@ abstract public class ScanNode extends PlanNode {
       return desc_.getPath().toString();
     }
   }
+
+  /**
+   * Returns true if this node has conjuncts to be evaluated by Impala against the scan
+   * tuple.
+   */
+  public boolean hasScanConjuncts() { return !getConjuncts().isEmpty(); }
+
+  /**
+   * Returns true if this node has conjuncts to be evaluated by the underlying storage
+   * engine.
+   */
+  public boolean hasStorageLayerConjuncts() { return false; }
 }

@@ -20,6 +20,7 @@ package org.apache.impala.util;
 import static java.lang.String.format;
 
 import java.util.List;
+import java.util.Map;
 
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.DescriptorTable;
@@ -55,6 +56,7 @@ import org.apache.kudu.client.RangePartitionBound;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 
 public class KuduUtil {
 
@@ -66,23 +68,32 @@ public class KuduUtil {
   // be sufficient for the Frontend/Catalog use, and has been tested in stress tests.
   private static int KUDU_CLIENT_WORKER_THREAD_COUNT = 5;
 
+  // Maps lists of master addresses to KuduClients, for sharing clients across the FE.
+  private static Map<String, KuduClient> kuduClients_ = Maps.newHashMap();
+
   /**
-   * Creates a KuduClient with the specified Kudu master addresses (as a comma-separated
-   * list of host:port pairs). The 'admin operation timeout' and the 'operation timeout'
-   * are set to BackendConfig.getKuduClientTimeoutMs(). The 'admin operations timeout' is
-   * used for operations like creating/deleting tables. The 'operation timeout' is used
-   * when fetching tablet metadata.
+   * Gets a KuduClient for the specified Kudu master addresses (as a comma-separated
+   * list of host:port pairs). It will look up and share an existing KuduClient, if
+   * possible, or it will create a new one to return.
+   * The 'admin operation timeout' and the 'operation timeout' are set to
+   * BackendConfig.getKuduClientTimeoutMs(). The 'admin operations timeout' is used for
+   * operations like creating/deleting tables. The 'operation timeout' is used when
+   * fetching tablet metadata.
    */
-  public static KuduClient createKuduClient(String kuduMasters) {
-    KuduClientBuilder b = new KuduClient.KuduClientBuilder(kuduMasters);
-    b.defaultAdminOperationTimeoutMs(BackendConfig.INSTANCE.getKuduClientTimeoutMs());
-    b.defaultOperationTimeoutMs(BackendConfig.INSTANCE.getKuduClientTimeoutMs());
-    b.workerCount(KUDU_CLIENT_WORKER_THREAD_COUNT);
-    return b.build();
+  public static KuduClient getKuduClient(String kuduMasters) {
+    if (!kuduClients_.containsKey(kuduMasters)) {
+      KuduClientBuilder b = new KuduClient.KuduClientBuilder(kuduMasters);
+      b.defaultAdminOperationTimeoutMs(BackendConfig.INSTANCE.getKuduClientTimeoutMs());
+      b.defaultOperationTimeoutMs(BackendConfig.INSTANCE.getKuduClientTimeoutMs());
+      b.workerCount(KUDU_CLIENT_WORKER_THREAD_COUNT);
+      kuduClients_.put(kuduMasters, b.build());
+    }
+    return kuduClients_.get(kuduMasters);
   }
 
   /**
    * Creates a PartialRow from a list of range partition boundary values.
+   * 'rangePartitionColumns' must be specified in Kudu case.
    */
   private static PartialRow parseRangePartitionBoundaryValues(Schema schema,
       List<String> rangePartitionColumns, List<TExpr> boundaryValues)
@@ -104,7 +115,7 @@ public class KuduUtil {
    * table. The range-partition bound consists of a PartialRow with the boundary
    * values and a RangePartitionBound indicating if the bound is inclusive or exclusive.
    * Throws an ImpalaRuntimeException if an error occurs while parsing the boundary
-   * values.
+   * values. 'rangePartitionColumns' must be specified in Kudu case.
    */
   public static Pair<PartialRow, RangePartitionBound> buildRangePartitionBound(
       Schema schema, List<String> rangePartitionColumns, List<TExpr> boundaryValues,
@@ -312,7 +323,7 @@ public class KuduUtil {
 
   public static TColumn setColumnOptions(TColumn column, boolean isKey,
       Boolean isNullable, Encoding encoding, CompressionAlgorithm compression,
-      Expr defaultValue, Integer blockSize) {
+      Expr defaultValue, Integer blockSize, String kuduName) {
     column.setIs_key(isKey);
     if (isNullable != null) column.setIs_nullable(isNullable);
     try {
@@ -330,6 +341,8 @@ public class KuduUtil {
       column.setDefault_value(defaultValue.treeToThrift());
     }
     if (blockSize != null) column.setBlock_size(blockSize);
+    Preconditions.checkNotNull(kuduName);
+    column.setKudu_column_name(kuduName);
     return column;
   }
 

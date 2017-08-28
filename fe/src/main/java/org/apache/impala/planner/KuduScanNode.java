@@ -35,6 +35,7 @@ import org.apache.impala.analysis.SlotDescriptor;
 import org.apache.impala.analysis.SlotRef;
 import org.apache.impala.analysis.StringLiteral;
 import org.apache.impala.analysis.TupleDescriptor;
+import org.apache.impala.catalog.KuduColumn;
 import org.apache.impala.catalog.KuduTable;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.ImpalaRuntimeException;
@@ -110,7 +111,8 @@ public class KuduScanNode extends ScanNode {
   public void init(Analyzer analyzer) throws ImpalaRuntimeException {
     conjuncts_ = orderConjunctsByCost(conjuncts_);
 
-    try (KuduClient client = KuduUtil.createKuduClient(kuduTable_.getKuduMasterHosts())) {
+    KuduClient client = KuduUtil.getKuduClient(kuduTable_.getKuduMasterHosts());
+    try {
       org.apache.kudu.client.KuduTable rpcTable =
           client.openTable(kuduTable_.getKuduTableName());
       validateSchema(rpcTable);
@@ -149,7 +151,7 @@ public class KuduScanNode extends ScanNode {
       throws ImpalaRuntimeException {
     Schema tableSchema = rpcTable.getSchema();
     for (SlotDescriptor desc: getTupleDesc().getSlots()) {
-      String colName = desc.getColumn().getName();
+      String colName = ((KuduColumn) desc.getColumn()).getKuduName();
       Type colType = desc.getColumn().getType();
       ColumnSchema kuduCol = null;
       try {
@@ -235,7 +237,7 @@ public class KuduScanNode extends ScanNode {
       org.apache.kudu.client.KuduTable rpcTable) {
     List<String> projectedCols = Lists.newArrayList();
     for (SlotDescriptor desc: getTupleDesc().getSlotsOrderedByOffset()) {
-      projectedCols.add(desc.getColumn().getName());
+      projectedCols.add(((KuduColumn) desc.getColumn()).getKuduName());
     }
     KuduScanTokenBuilder tokenBuilder = client.newScanTokenBuilder(rpcTable);
     tokenBuilder.setProjectedColumnNames(projectedCols);
@@ -254,7 +256,7 @@ public class KuduScanNode extends ScanNode {
   protected void computeStats(Analyzer analyzer) {
     super.computeStats(analyzer);
     // Update the number of nodes to reflect the hosts that have relevant data.
-    numNodes_ = hostIndexSet_.size();
+    numNodes_ = Math.max(1, hostIndexSet_.size());
 
     // Update the cardinality
     inputCardinality_ = cardinality_ = kuduTable_.getNumRows();
@@ -267,8 +269,8 @@ public class KuduScanNode extends ScanNode {
   }
 
   @Override
-  public void computeResourceProfile(TQueryOptions queryOptions) {
-    resourceProfile_ = new ResourceProfile(0, 0);
+  public void computeNodeResourceProfile(TQueryOptions queryOptions) {
+    nodeResourceProfile_ = ResourceProfile.noReservation(0);
   }
 
   @Override
@@ -350,7 +352,7 @@ public class KuduScanNode extends ScanNode {
     // Cannot push predicates with null literal values (KUDU-1595).
     if (literal instanceof NullLiteral) return false;
 
-    String colName = ref.getDesc().getColumn().getName();
+    String colName = ((KuduColumn) ref.getDesc().getColumn()).getKuduName();
     ColumnSchema column = table.getSchema().getColumn(colName);
     KuduPredicate kuduPredicate = null;
     switch (literal.getType().getPrimitiveType()) {
@@ -438,7 +440,7 @@ public class KuduScanNode extends ScanNode {
       values.add(value);
     }
 
-    String colName = ref.getDesc().getColumn().getName();
+    String colName = ((KuduColumn) ref.getDesc().getColumn()).getKuduName();
     ColumnSchema column = table.getSchema().getColumn(colName);
     kuduPredicates_.add(KuduPredicate.newInListPredicate(column, values));
     kuduConjuncts_.add(predicate);
@@ -461,7 +463,7 @@ public class KuduScanNode extends ScanNode {
     if (!(predicate.getChild(0) instanceof SlotRef)) return false;
     SlotRef ref = (SlotRef) predicate.getChild(0);
 
-    String colName = ref.getDesc().getColumn().getName();
+    String colName = ((KuduColumn) ref.getDesc().getColumn()).getKuduName();
     ColumnSchema column = table.getSchema().getColumn(colName);
     KuduPredicate kuduPredicate = null;
     if (predicate.isNotNull()) {
@@ -519,4 +521,7 @@ public class KuduScanNode extends ScanNode {
       default: return null;
     }
   }
+
+  @Override
+  public boolean hasStorageLayerConjuncts() { return !kuduConjuncts_.isEmpty(); }
 }

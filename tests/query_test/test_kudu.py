@@ -30,7 +30,10 @@ from kudu.schema import (
 from kudu.client import Partitioning
 import logging
 import pytest
+import random
 import textwrap
+import threading
+import time
 from datetime import datetime
 from pytz import utc
 
@@ -358,6 +361,85 @@ class TestKuduOperations(KuduTestSuite):
         kudu_client.delete_table(name)
 
 
+  def test_column_storage_attributes(self, cursor, unique_database):
+    """Tests that for every valid combination of column type, encoding, and compression,
+       we can insert a value and scan it back from Kudu."""
+    # This test takes about 2min and is unlikely to break, so only run it in exhaustive.
+    if self.exploration_strategy() != 'exhaustive':
+      pytest.skip("Only runs in exhaustive to reduce core time.")
+    table_name = "%s.storage_attrs" % unique_database
+    types = ['boolean', 'tinyint', 'smallint', 'int', 'bigint', 'float', 'double', \
+        'string', 'timestamp']
+
+    create_query = "create table %s (id int primary key" % table_name
+    for t in types:
+      create_query += ", %s_col %s" % (t, t)
+    create_query += ") partition by hash(id) partitions 16 stored as kudu"
+    cursor.execute(create_query)
+
+    encodings = ['AUTO_ENCODING', 'PLAIN_ENCODING', 'PREFIX_ENCODING', 'GROUP_VARINT', \
+        'RLE', 'DICT_ENCODING', 'BIT_SHUFFLE']
+    compressions = ['DEFAULT_COMPRESSION', 'NO_COMPRESSION', 'SNAPPY', 'LZ4', 'ZLIB']
+    i = 0
+    for e in encodings:
+      for c in compressions:
+        for t in types:
+          try:
+            cursor.execute("""alter table %s alter column %s_col
+                set encoding %s compression %s""" % (table_name, t, e, c))
+          except Exception as err:
+            assert "encoding %s not supported for type" % e in str(err)
+        cursor.execute("""insert into %s values (%s, true, 0, 0, 0, 0, 0, 0, '0',
+            cast('2009-01-01' as timestamp))""" % (table_name, i))
+        cursor.execute("select * from %s where id = %s" % (table_name, i))
+        assert cursor.fetchall() == \
+            [(i, True, 0, 0, 0, 0, 0.0, 0.0, '0', datetime(2009, 1, 1, 0, 0))]
+        i += 1
+    cursor.execute("select count(*) from %s" % table_name)
+    print cursor.fetchall() == [(i, )]
+
+  def test_concurrent_schema_change(self, cursor, unique_database):
+    """Tests that an insert into a Kudu table with a concurrent schema change either
+    succeeds or fails gracefully."""
+    table_name = "%s.test_schema_change" % unique_database
+    cursor.execute("""create table %s (col0 bigint primary key, col1 bigint)
+    partition by hash(col0) partitions 16 stored as kudu""" % table_name)
+
+    iters = 5
+    def insert_values():
+      threading.current_thread().errors = []
+      client = self.create_impala_client()
+      for i in range(0, iters):
+        time.sleep(random.random()) # sleeps for up to one second
+        try:
+          client.execute("insert into %s values (0, 0), (1, 1)" % table_name)
+        except Exception as e:
+          threading.current_thread().errors.append(e)
+
+    insert_thread = threading.Thread(target=insert_values)
+    insert_thread.start()
+
+    for i in range(0, iters):
+      time.sleep(random.random()) # sleeps for up to one second
+      cursor.execute("alter table %s drop column col1" % table_name)
+      if i % 2 == 0:
+        cursor.execute("alter table %s add columns (col1 string)" % table_name)
+      else:
+        cursor.execute("alter table %s add columns (col1 bigint)" % table_name)
+
+    insert_thread.join()
+
+    for error in insert_thread.errors:
+      msg = str(error)
+      # The first two are AnalysisExceptions, the next two come from KuduTableSink::Open()
+      # if the schema has changed since analysis, the last comes from the Kudu server if
+      # the schema changes between KuduTableSink::Open() and when the write ops are sent.
+      assert "has fewer columns (1) than the SELECT / VALUES clause returns (2)" in msg \
+        or "(type: TINYINT) is not compatible with column 'col1' (type: STRING)" in msg \
+        or "has fewer columns than expected." in msg \
+        or "Column col1 has unexpected type." in msg \
+        or "Client provided column col1[int64 NULLABLE] not present in tablet" in msg
+
 class TestCreateExternalTable(KuduTestSuite):
 
   def test_external_timestamp_default_value(self, cursor, kudu_client, unique_database):
@@ -555,6 +637,83 @@ class TestCreateExternalTable(KuduTestSuite):
       if kudu_client.table_exists(name):
         kudu_client.delete_table(name)
 
+  def test_column_name_case(self, cursor, kudu_client, unique_database):
+    """IMPALA-5286: Tests that an external Kudu table that was created with a column name
+       containing upper case letters is handled correctly."""
+    table_name = '%s.kudu_external_test' % unique_database
+    if kudu_client.table_exists(table_name):
+      kudu_client.delete_table(table_name)
+
+    schema_builder = SchemaBuilder()
+    key_col = 'Key'
+    schema_builder.add_column(key_col, INT64).nullable(False).primary_key()
+    schema = schema_builder.build()
+    partitioning = Partitioning().set_range_partition_columns([key_col])\
+        .add_range_partition([1], [10])
+
+    try:
+      kudu_client.create_table(table_name, schema, partitioning)
+
+      props = "tblproperties('kudu.table_name' = '%s')" % table_name
+      cursor.execute("create external table %s stored as kudu %s" % (table_name, props))
+
+      # Perform a variety of operations on the table.
+      cursor.execute("insert into %s (kEy) values (5), (1), (4)" % table_name)
+      cursor.execute("select keY from %s where KeY %% 2 = 0" % table_name)
+      assert cursor.fetchall() == [(4, )]
+      cursor.execute("select * from %s order by kEY" % (table_name))
+      assert cursor.fetchall() == [(1, ), (4, ), (5, )]
+      cursor.execute("alter table %s add range partition 11 < values < 20" % table_name)
+
+      new_key = "KEY2"
+      cursor.execute("alter table %s change KEy %s bigint" % (table_name, new_key))
+      val_col = "vaL"
+      cursor.execute("alter table %s add columns (%s bigint)" % (table_name, val_col))
+
+      cursor.execute("describe %s" % table_name)
+      results = cursor.fetchall()
+      # 'describe' should print the column name in lower case.
+      assert new_key.lower() in results[0]
+      assert val_col.lower() in results[1]
+
+      cursor.execute("alter table %s drop column Val" % table_name);
+      cursor.execute("describe %s" % table_name)
+      assert len(cursor.fetchall()) == 1
+
+      cursor.execute("alter table %s drop range partition 11 < values < 20" % table_name)
+    finally:
+      if kudu_client.table_exists(table_name):
+        kudu_client.delete_table(table_name)
+
+  def test_conflicting_column_name(self, cursor, kudu_client, unique_database):
+    """IMPALA-5283: Tests that loading an external Kudu table that was created with column
+       names that differ only in case results in an error."""
+    table_name = '%s.kudu_external_test' % unique_database
+    if kudu_client.table_exists(table_name):
+      kudu_client.delete_table(table_name)
+
+    schema_builder = SchemaBuilder()
+    col0 = 'col'
+    schema_builder.add_column(col0, INT64).nullable(False).primary_key()
+    col1 = 'COL'
+    schema_builder.add_column(col1, INT64)
+    schema = schema_builder.build()
+    partitioning = Partitioning().set_range_partition_columns([col0])\
+        .add_range_partition([1], [10])
+
+    try:
+      kudu_client.create_table(table_name, schema, partitioning)
+
+      props = "tblproperties('kudu.table_name' = '%s')" % table_name
+      cursor.execute("create external table %s stored as kudu %s" % (table_name, props))
+      assert False, 'create table should have resulted in an exception'
+    except Exception as e:
+      assert 'Error loading Kudu table: Impala does not support column names that ' \
+          + 'differ only in casing' in str(e)
+    finally:
+      if kudu_client.table_exists(table_name):
+        kudu_client.delete_table(table_name)
+
 class TestShowCreateTable(KuduTestSuite):
 
   def assert_show_create_equals(self, cursor, create_sql, show_create_sql):
@@ -659,7 +818,7 @@ class TestShowCreateTable(KuduTestSuite):
         CREATE TABLE {db}.{{table}} (
           c INT NOT NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION,
           d TIMESTAMP NOT NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION,
-          e TIMESTAMP NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION DEFAULT timestamp_from_unix_micros(%s),
+          e TIMESTAMP NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION DEFAULT unix_micros_to_utc_timestamp(%s),
           PRIMARY KEY (c, d)
         )
         PARTITION BY HASH (c) PARTITIONS 3

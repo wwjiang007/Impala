@@ -233,10 +233,11 @@ public class TupleDescriptor {
 
   /**
    * In some cases changes are made to a tuple after the memory layout has been computed.
-   * This function allows us to recompute the memory layout.
+   * This function allows us to recompute the memory layout, if necessary. No-op if this
+   * tuple does not have an existing mem layout.
    */
   public void recomputeMemLayout() {
-    Preconditions.checkState(hasMemLayout_);
+    if (!hasMemLayout_) return;
     hasMemLayout_ = false;
     computeMemLayout();
   }
@@ -338,7 +339,7 @@ public class TupleDescriptor {
     for (SlotDescriptor slotDesc: getSlots()) {
       if (!slotDesc.isMaterialized()) continue;
       if (slotDesc.getColumn() == null ||
-          slotDesc.getColumn().getPosition() >= hdfsTable.getNumClusteringCols()) {
+          !hdfsTable.isClusteringColumn(slotDesc.getColumn())) {
         return false;
       }
     }

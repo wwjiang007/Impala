@@ -112,7 +112,7 @@ under the License.
 
   <keydef href="https://code.google.com/p/re2/" scope="external" format="html" keys="re2"/>
   <keydef href="http://goog-perftools.sourceforge.net/doc/tcmalloc.html" scope="external" format="html" keys="tcmalloc"/>
-  <keydef href="http://google-glog.googlecode.com/svn/trunk/doc/glog.html" scope="external" format="html" keys="glog"/>
+  <keydef href="https://github.com/google/glog" scope="external" format="html" keys="glog.html"/>
 
   <keydef href="https://issues.apache.org/jira/browse/HIVE-656" scope="external" format="html" keys="HIVE-656"/>
 
@@ -10732,6 +10732,7 @@ under the License.
   <keydef href="topics/impala_joins.xml" keys="joins"/>
   <keydef href="topics/impala_order_by.xml" keys="order_by"/>
   <keydef href="topics/impala_group_by.xml" keys="group_by"/>
+  <keydef rev="IMPALA-5309" href="topics/impala_tablesample.xml" keys="tablesample"/>
   <keydef href="topics/impala_having.xml" keys="having"/>
   <keydef href="topics/impala_limit.xml" keys="limit"/>
   <keydef href="topics/impala_offset.xml" keys="offset"/>
@@ -10749,6 +10750,7 @@ under the License.
   <keydef href="topics/impala_batch_size.xml" keys="batch_size"/>
   <keydef href="topics/impala_compression_codec.xml" keys="compression_codec"/>
   <keydef href="topics/impala_debug_action.xml" keys="debug_action"/>
+  <keydef href="topics/impala_default_join_distribution_mode.xml" keys="default_join_distribution_mode"/>
   <keydef href="topics/impala_default_order_by_limit.xml" keys="default_order_by_limit"/>
   <keydef href="topics/impala_disable_cached_reads.xml" keys="disable_cached_reads"/>
   <keydef href="topics/impala_disable_codegen.xml" keys="disable_codegen"/>
@@ -10926,6 +10928,7 @@ under the License.
   <keydef href="topics/impala_scalability.xml" keys="scalability"/>
   <keydef audience="hidden" href="topics/impala_scalability.xml#scalability_memory" keys="scalability_memory"/>
   <keydef href="topics/impala_scalability.xml#scalability_catalog" keys="scalability_catalog"/>
+  <keydef href="topics/impala_scalability.xml#scalability_coordinator" keys="scalability_coordinator"/>
   <keydef href="topics/impala_scalability.xml#statestore_scalability" keys="statestore_scalability"/>
   <keydef audience="hidden" href="topics/impala_scalability.xml#scalability_cluster_size" keys="scalability_cluster_size"/>
   <keydef audience="hidden" href="topics/impala_scalability.xml#concurrent_connections" keys="concurrent_connections"/>

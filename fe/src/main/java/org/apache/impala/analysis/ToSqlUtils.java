@@ -18,9 +18,12 @@
 package org.apache.impala.analysis;
 
 import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
@@ -31,6 +34,7 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import org.antlr.runtime.ANTLRStringStream;
 import org.antlr.runtime.Token;
+import org.apache.commons.lang.ObjectUtils;
 import org.apache.commons.lang.StringEscapeUtils;
 import org.apache.hadoop.hive.common.StatsSetupConst;
 import org.apache.hadoop.hive.metastore.TableType;
@@ -183,7 +187,9 @@ public class ToSqlUtils {
     for (ColumnDef col: innerStmt.getPartitionColumnDefs()) {
       partitionColsSql.add(col.getColName());
     }
-    HashMap<String, String> properties = Maps.newHashMap(innerStmt.getTblProperties());
+    // Use a LinkedHashMap to preserve the ordering of the table properties.
+    LinkedHashMap<String, String> properties =
+        Maps.newLinkedHashMap(innerStmt.getTblProperties());
     removeHiddenTableProperties(properties);
     String kuduParamsSql = getKuduPartitionByParams(innerStmt);
     // TODO: Pass the correct compression, if applicable.
@@ -205,7 +211,8 @@ public class ToSqlUtils {
     Preconditions.checkNotNull(table);
     if (table instanceof View) return getCreateViewSql((View)table);
     org.apache.hadoop.hive.metastore.api.Table msTable = table.getMetaStoreTable();
-    HashMap<String, String> properties = Maps.newHashMap(msTable.getParameters());
+    // Use a LinkedHashMap to preserve the ordering of the table properties.
+    LinkedHashMap<String, String> properties = Maps.newLinkedHashMap(msTable.getParameters());
     if (properties.containsKey("transient_lastDdlTime")) {
       properties.remove("transient_lastDdlTime");
     }
@@ -421,8 +428,15 @@ public class ToSqlUtils {
   }
 
   private static String propertyMapToSql(Map<String, String> propertyMap) {
+    // Sort entries on the key to ensure output is deterministic for tests (IMPALA-5757).
+    List<Entry<String, String>> mapEntries = Lists.newArrayList(propertyMap.entrySet());
+    Collections.sort(mapEntries, new Comparator<Entry<String, String>>() {
+      public int compare(Entry<String, String> o1, Entry<String, String> o2) {
+        return ObjectUtils.compare(o1.getKey(), o2.getKey());
+      } });
+
     List<String> properties = Lists.newArrayList();
-    for (Map.Entry<String, String> entry: propertyMap.entrySet()) {
+    for (Map.Entry<String, String> entry: mapEntries) {
       properties.add(String.format("'%s'='%s'", entry.getKey(),
           // Properties may contain characters that need to be escaped.
           // e.g. If the row format escape delimiter is '\', the map of serde properties

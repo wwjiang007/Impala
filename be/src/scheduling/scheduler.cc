@@ -24,6 +24,7 @@
 #include <boost/algorithm/string/join.hpp>
 #include <boost/bind.hpp>
 #include <boost/mem_fn.hpp>
+#include <boost/unordered_set.hpp>
 #include <gutil/strings/substitute.h>
 
 #include "common/logging.h"
@@ -68,21 +69,6 @@ Scheduler::Scheduler(StatestoreSubscriber* subscriber, const string& backend_id,
     initialized_(nullptr),
     request_pool_service_(request_pool_service) {
   local_backend_descriptor_.address = backend_address;
-}
-
-Scheduler::Scheduler(const vector<TNetworkAddress>& backends, MetricGroup* metrics,
-    Webserver* webserver, RequestPoolService* request_pool_service)
-  : executors_config_(std::make_shared<const BackendConfig>(backends)),
-    metrics_(metrics),
-    webserver_(webserver),
-    statestore_subscriber_(nullptr),
-    thrift_serializer_(false),
-    total_assignments_(nullptr),
-    total_local_assignments_(nullptr),
-    initialized_(nullptr),
-    request_pool_service_(request_pool_service) {
-  DCHECK(backends.size() > 0);
-  local_backend_descriptor_.address = MakeNetworkAddress(FLAGS_hostname, FLAGS_be_port);
 }
 
 Status Scheduler::Init() {
@@ -693,27 +679,49 @@ void Scheduler::GetScanHosts(TPlanNodeId scan_id, const FragmentExecParams& para
 }
 
 Status Scheduler::Schedule(QuerySchedule* schedule) {
+  RETURN_IF_ERROR(ComputeScanRangeAssignment(schedule));
+  ComputeFragmentExecParams(schedule);
+  ComputeBackendExecParams(schedule);
+#ifndef NDEBUG
+  schedule->Validate();
+#endif
+
+  // TODO: Move to admission control, it doesn't need to be in the Scheduler.
   string resolved_pool;
   RETURN_IF_ERROR(request_pool_service_->ResolveRequestPool(
       schedule->request().query_ctx, &resolved_pool));
   schedule->set_request_pool(resolved_pool);
   schedule->summary_profile()->AddInfoString("Request Pool", resolved_pool);
+  return Status::OK();
+}
 
-  RETURN_IF_ERROR(ComputeScanRangeAssignment(schedule));
-  ComputeFragmentExecParams(schedule);
-#ifndef NDEBUG
-  schedule->Validate();
-#endif
-
-  // compute unique hosts
-  unordered_set<TNetworkAddress> unique_hosts;
+void Scheduler::ComputeBackendExecParams(QuerySchedule* schedule) {
+  PerBackendExecParams per_backend_params;
   for (const FragmentExecParams& f : schedule->fragment_exec_params()) {
     for (const FInstanceExecParams& i : f.instance_exec_params) {
-      unique_hosts.insert(i.host);
+      BackendExecParams& be_params = per_backend_params[i.host];
+      be_params.instance_params.push_back(&i);
+      // Different fragments do not synchronize their Open() and Close(), so the backend
+      // does not provide strong guarantees about whether one fragment instance releases
+      // resources before another acquires them. Conservatively assume that all fragment
+      // instances on this backend can consume their peak resources at the same time,
+      // i.e. that this backend's peak resources is the sum of the per-fragment-instance
+      // peak resources for the instances executing on this backend.
+      be_params.min_reservation_bytes += f.fragment.min_reservation_bytes;
+      be_params.initial_reservation_total_claims +=
+          f.fragment.initial_reservation_total_claims;
     }
   }
-  schedule->SetUniqueHosts(unique_hosts);
-  return Status::OK();
+  schedule->set_per_backend_exec_params(per_backend_params);
+
+  stringstream min_reservation_ss;
+  for (const auto& e: per_backend_params) {
+    min_reservation_ss << e.first << "("
+         << PrettyPrinter::Print(e.second.min_reservation_bytes, TUnit::BYTES)
+         << ") ";
+  }
+  schedule->summary_profile()->AddInfoString("Per Host Min Reservation",
+      min_reservation_ss.str());
 }
 
 Scheduler::AssignmentCtx::AssignmentCtx(const BackendConfig& executor_config,

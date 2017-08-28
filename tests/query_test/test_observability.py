@@ -79,7 +79,7 @@ class TestObservability(ImpalaTestSuite):
     assert result.exec_summary[scan_idx]['operator'] == '00:SCAN HBASE'
     assert result.exec_summary[scan_idx]['detail'] == 'functional_hbase.alltypestiny'
 
-  def test_get_profile(self):
+  def test_query_states(self):
     """Tests that the query profile shows expected query states."""
     query = "select count(*) from functional.alltypes"
     handle = self.execute_query_async(query, dict())
@@ -93,3 +93,18 @@ class TestObservability(ImpalaTestSuite):
     profile = self.client.get_runtime_profile(handle)
     # After fetching the results, the query must be in state FINISHED.
     assert "Query State: FINISHED" in profile, profile
+
+  def test_query_options(self):
+    """Test that the query profile shows expected non-default query options, both set
+    explicitly through client and those set by planner"""
+    # Set a query option explicitly through client
+    self.execute_query("set MEM_LIMIT = 8589934592")
+    # Make sure explicitly set default values are not shown in the profile
+    self.execute_query("set MAX_IO_BUFFERS = 0")
+    runtime_profile = self.execute_query("select 1").runtime_profile
+    assert "Query Options (set by configuration): MEM_LIMIT=8589934592" in runtime_profile
+    # For this query, the planner sets NUM_NODES=1, NUM_SCANNER_THREADS=1,
+    # RUNTIME_FILTER_MODE=0 and MT_DOP=0
+    assert "Query Options (set by configuration and planner): MEM_LIMIT=8589934592," \
+        "NUM_NODES=1,NUM_SCANNER_THREADS=1,RUNTIME_FILTER_MODE=0,MT_DOP=0\n" \
+        in runtime_profile

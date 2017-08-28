@@ -230,6 +230,9 @@ void TestTimestampTokens(vector<TimestampToken>* toks, int year, int month,
 }
 
 TEST(TimestampTest, Basic) {
+  // Fix current time to determine the behavior parsing 2-digit year format
+  TimestampValue now(date(2017, 7, 28), time_duration(16, 14, 24));
+
   char s1[] = "2012-01-20 01:10:01";
   char s2[] = "1990-10-20 10:10:10.123456789  ";
   char s3[] = "  1990-10-20 10:10:10.123456789";
@@ -472,6 +475,14 @@ TEST(TimestampTest, Basic) {
     // Test short year token
     (TimestampTC("y-MM-dd", "2013-11-13", false, true, false, 2013, 11, 13))
     (TimestampTC("y-MM-dd", "13-11-13", false, true, false, 2013, 11, 13))
+    // Test 2-digit year format
+    (TimestampTC("yy-MM-dd", "37-07-28", false, true, false, 2037, 7, 28))
+    (TimestampTC("yy-MM-dd", "37-07-29", false, true, false, 1937, 7, 29))
+    // Test 1-digit year format with time to show the exact boundary
+    (TimestampTC("y-MM-dd HH:mm:ss", "37-07-28 16:14:23", false, true, false,
+                 2037, 7, 28, 16, 14, 23))
+    (TimestampTC("y-MM-dd HH:mm:ss", "37-07-28 16:14:24", false, true, false,
+                 1937, 7, 28, 16, 14, 24))
     // Test short month token
     (TimestampTC("yyyy-M-dd", "2013-11-13", false, true, false, 2013, 11, 13))
     (TimestampTC("yyyy-M-dd", "2013-1-13", false, true, false, 2013, 1, 13))
@@ -501,6 +512,7 @@ TEST(TimestampTest, Basic) {
   for (int i = 0; i < test_cases.size(); ++i) {
     TimestampTC test_case = test_cases[i];
     DateTimeFormatContext dt_ctx(test_case.fmt, strlen(test_case.fmt));
+    dt_ctx.SetCenturyBreak(now);
     bool parse_result = TimestampParser::ParseFormatTokens(&dt_ctx);
     if (test_case.fmt_should_fail) {
       EXPECT_FALSE(parse_result) << "TC: " << i;
@@ -666,6 +678,20 @@ TEST(TimestampTest, Basic) {
       TimestampValue::FromUnixTime(2147483648).ToString());
   EXPECT_EQ("2038-01-19 03:14:09",
       TimestampValue::FromUnixTime(2147483649).ToString());
+
+  // Test FromUnixTime around the boundary of the values that are converted via boost via
+  // gmtime (IMPALA-5357). Tests 1 second before and after the values supported by the
+  // boost conversion logic.
+  const int64_t MIN_BOOST_CONVERT_UNIX_TIME = -9223372036;
+  const int64_t MAX_BOOST_CONVERT_UNIX_TIME = 9223372036;
+  EXPECT_EQ("1677-09-21 00:12:43",
+      TimestampValue::FromUnixTime(MIN_BOOST_CONVERT_UNIX_TIME - 1).ToString());
+  EXPECT_EQ("1677-09-21 00:12:44",
+      TimestampValue::FromUnixTime(MIN_BOOST_CONVERT_UNIX_TIME).ToString());
+  EXPECT_EQ("2262-04-11 23:47:16",
+      TimestampValue::FromUnixTime(MAX_BOOST_CONVERT_UNIX_TIME).ToString());
+  EXPECT_EQ("2262-04-11 23:47:17",
+      TimestampValue::FromUnixTime(MAX_BOOST_CONVERT_UNIX_TIME + 1).ToString());
 
   // Test a leap second in 1998 represented by the UTC time 1998-12-31 23:59:60.
   // Unix time cannot represent the leap second, which repeats 915148800.

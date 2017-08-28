@@ -36,6 +36,8 @@ import org.apache.impala.thrift.TExpr;
 import org.apache.impala.thrift.TPlanNode;
 import org.apache.impala.thrift.TPlanNodeType;
 import org.apache.impala.thrift.TQueryOptions;
+import org.apache.impala.util.BitUtil;
+
 import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
@@ -278,33 +280,65 @@ public class AggregationNode extends PlanNode {
   }
 
   @Override
-  public void computeResourceProfile(TQueryOptions queryOptions) {
+  public void computeNodeResourceProfile(TQueryOptions queryOptions) {
     Preconditions.checkNotNull(
         fragment_, "PlanNode must be placed into a fragment before calling this method.");
-    // Must be kept in sync with PartitionedAggregationNode::MinRequiredBuffers() in be.
-    long perInstanceMinBuffers;
-    if (aggInfo_.getGroupingExprs().isEmpty() || useStreamingPreagg_) {
-      perInstanceMinBuffers = 0;
-    } else {
-      final int PARTITION_FANOUT = 16;
-      long minBuffers = 2 * PARTITION_FANOUT + 1 + (aggInfo_.needsSerialize() ? 1 : 0);
-      perInstanceMinBuffers = SPILLABLE_BUFFER_BYTES * minBuffers;
-    }
-
     long perInstanceCardinality = fragment_.getPerInstanceNdv(
         queryOptions.getMt_dop(), aggInfo_.getGroupingExprs());
+    long perInstanceMemEstimate;
+    long perInstanceDataBytes = -1;
     if (perInstanceCardinality == -1) {
-      resourceProfile_ =
-          new ResourceProfile(DEFAULT_PER_INSTANCE_MEM, perInstanceMinBuffers);
-      return;
+      perInstanceMemEstimate = DEFAULT_PER_INSTANCE_MEM;
+    } else {
+      // Per-instance cardinality cannot be greater than the total output cardinality.
+      if (cardinality_ != -1) {
+        perInstanceCardinality = Math.min(perInstanceCardinality, cardinality_);
+      }
+      perInstanceDataBytes = (long)Math.ceil(perInstanceCardinality * avgRowSize_);
+      perInstanceMemEstimate = (long)Math.max(perInstanceDataBytes *
+          PlannerContext.HASH_TBL_SPACE_OVERHEAD, MIN_HASH_TBL_MEM);
     }
-    // Per-instance cardinality cannot be greater than the total output cardinality.
-    if (cardinality_ != -1) {
-      perInstanceCardinality = Math.min(perInstanceCardinality, cardinality_);
+
+    // Must be kept in sync with PartitionedAggregationNode::MinReservation() in be.
+    long perInstanceMinReservation;
+    long bufferSize = queryOptions.getDefault_spillable_buffer_size();
+    long maxRowBufferSize =
+        computeMaxSpillableBufferSize(bufferSize, queryOptions.getMax_row_size());
+    if (aggInfo_.getGroupingExprs().isEmpty()) {
+      perInstanceMinReservation = 0;
+    } else {
+      // This is a grouping pre-aggregation or merge aggregation.
+      final int PARTITION_FANOUT = 16;
+      if (perInstanceDataBytes != -1) {
+        long bytesPerPartition = perInstanceDataBytes / PARTITION_FANOUT;
+        // Scale down the buffer size if we think there will be excess free space with the
+        // default buffer size, e.g. with small dimension tables.
+        bufferSize = Math.min(bufferSize, Math.max(
+            queryOptions.getMin_spillable_buffer_size(),
+            BitUtil.roundUpToPowerOf2(bytesPerPartition)));
+        // Recompute the max row buffer size with the smaller buffer.
+        maxRowBufferSize =
+            computeMaxSpillableBufferSize(bufferSize, queryOptions.getMax_row_size());
+      }
+      if (useStreamingPreagg_) {
+        // We can execute a streaming preagg without any buffers by passing through rows,
+        // but that is a very low performance mode of execution if the aggregation reduces
+        // its input significantly. Instead reserve memory for one buffer and 64kb of hash
+        // tables per partition. We don't need to reserve memory for large rows since they
+        // can be passed through if needed.
+        perInstanceMinReservation = (bufferSize + 64 * 1024) * PARTITION_FANOUT;
+      } else {
+        long minBuffers = PARTITION_FANOUT + 1 + (aggInfo_.needsSerialize() ? 1 : 0);
+        // Two of the buffers need to be buffers large enough to hold the maximum-sized
+        // row to serve as input and output buffers while repartitioning.
+        perInstanceMinReservation = bufferSize * (minBuffers - 2) + maxRowBufferSize * 2;
+      }
     }
-    long perInstanceMemEstimate = (long)Math.max(perInstanceCardinality * avgRowSize_ *
-        PlannerContext.HASH_TBL_SPACE_OVERHEAD, MIN_HASH_TBL_MEM);
-    resourceProfile_ =
-        new ResourceProfile(perInstanceMemEstimate, perInstanceMinBuffers);
+
+    nodeResourceProfile_ = new ResourceProfileBuilder()
+        .setMemEstimateBytes(perInstanceMemEstimate)
+        .setMinReservationBytes(perInstanceMinReservation)
+        .setSpillableBufferBytes(bufferSize)
+        .setMaxRowBufferBytes(maxRowBufferSize).build();
   }
 }

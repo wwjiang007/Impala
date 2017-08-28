@@ -104,6 +104,7 @@ namespace impala {
 bool LlvmCodeGen::llvm_initialized_ = false;
 string LlvmCodeGen::cpu_name_;
 vector<string> LlvmCodeGen::cpu_attrs_;
+string LlvmCodeGen::target_features_attr_;
 CodegenCallGraph LlvmCodeGen::shared_call_graph_;
 
 [[noreturn]] static void LlvmCodegenHandleError(
@@ -134,8 +135,8 @@ Status LlvmCodeGen::InitializeLlvm(bool load_backend) {
   cpu_name_ = llvm::sys::getHostCPUName().str();
   LOG(INFO) << "CPU class for runtime code generation: " << cpu_name_;
   GetHostCPUAttrs(&cpu_attrs_);
-  LOG(INFO) << "CPU flags for runtime code generation: "
-            << boost::algorithm::join(cpu_attrs_, ",");
+  target_features_attr_ = boost::algorithm::join(cpu_attrs_, ",");
+  LOG(INFO) << "CPU flags for runtime code generation: " << target_features_attr_;
 
   // Write an empty map file for perf to find.
   if (FLAGS_perf_map) CodegenSymbolEmitter::WritePerfMap();
@@ -150,7 +151,7 @@ Status LlvmCodeGen::InitializeLlvm(bool load_backend) {
   // Validate the module by verifying that functions for all IRFunction::Type
   // can be found.
   for (int i = IRFunction::FN_START; i < IRFunction::FN_END; ++i) {
-    DCHECK(FN_MAPPINGS[i].fn == i);
+    DCHECK_EQ(FN_MAPPINGS[i].fn, i);
     const string& fn_name = FN_MAPPINGS[i].fn_name;
     if (init_codegen->module_->getFunction(fn_name) == nullptr) {
       return Status(Substitute("Failed to find function $0", fn_name));
@@ -159,6 +160,7 @@ Status LlvmCodeGen::InitializeLlvm(bool load_backend) {
 
   // Initialize the global shared call graph.
   shared_call_graph_.Init(init_codegen->module_);
+  init_codegen->Close();
   return Status::OK();
 }
 
@@ -167,7 +169,7 @@ LlvmCodeGen::LlvmCodeGen(RuntimeState* state, ObjectPool* pool,
   : state_(state),
     id_(id),
     profile_(pool, "CodeGen"),
-    mem_tracker_(new MemTracker(&profile_, -1, "CodeGen", parent_mem_tracker)),
+    mem_tracker_(pool->Add(new MemTracker(&profile_, -1, "CodeGen", parent_mem_tracker))),
     optimizations_enabled_(false),
     is_corrupt_(false),
     is_compiled_(false),
@@ -324,15 +326,15 @@ Status LlvmCodeGen::CreateImpalaCodegen(RuntimeState* state,
   SCOPED_TIMER(codegen->prepare_module_timer_);
 
   // Get type for StringValue
-  codegen->string_val_type_ = codegen->GetType(StringValue::LLVM_CLASS_NAME);
+  codegen->string_value_type_ = codegen->GetType(StringValue::LLVM_CLASS_NAME);
 
   // Get type for TimestampValue
-  codegen->timestamp_val_type_ = codegen->GetType(TimestampValue::LLVM_CLASS_NAME);
+  codegen->timestamp_value_type_ = codegen->GetType(TimestampValue::LLVM_CLASS_NAME);
 
   // Verify size is correct
   const DataLayout& data_layout = codegen->execution_engine()->getDataLayout();
   const StructLayout* layout =
-      data_layout.getStructLayout(static_cast<StructType*>(codegen->string_val_type_));
+      data_layout.getStructLayout(static_cast<StructType*>(codegen->string_value_type_));
   if (layout->getSizeInBytes() != sizeof(StringValue)) {
     DCHECK_EQ(layout->getSizeInBytes(), sizeof(StringValue));
     return Status("Could not create llvm struct type for StringVal");
@@ -404,13 +406,20 @@ void LlvmCodeGen::SetupJITListeners() {
 }
 
 LlvmCodeGen::~LlvmCodeGen() {
-  if (memory_manager_ != NULL) mem_tracker_->Release(memory_manager_->bytes_tracked());
-  if (mem_tracker_->parent() != NULL) mem_tracker_->UnregisterFromParent();
-  mem_tracker_.reset();
+  DCHECK(execution_engine_ == nullptr) << "Must Close() before destruction";
+}
+
+void LlvmCodeGen::Close() {
+  if (memory_manager_ != nullptr) {
+    mem_tracker_->Release(memory_manager_->bytes_tracked());
+    memory_manager_ = nullptr;
+  }
+  if (mem_tracker_ != nullptr) mem_tracker_->Close();
 
   // Execution engine executes callback on event listener, so tear down engine first.
   execution_engine_.reset();
   symbol_emitter_.reset();
+  module_ = nullptr;
 }
 
 void LlvmCodeGen::EnableOptimizations(bool enable) {
@@ -461,14 +470,17 @@ Type* LlvmCodeGen::GetType(const ColumnType& type) {
       return Type::getDoubleTy(context());
     case TYPE_STRING:
     case TYPE_VARCHAR:
-      return string_val_type_;
+      return string_value_type_;
+    case TYPE_FIXED_UDA_INTERMEDIATE:
+      // Represent this as an array of bytes.
+      return ArrayType::get(GetType(TYPE_TINYINT), type.len);
     case TYPE_CHAR:
       // IMPALA-3207: Codegen for CHAR is not yet implemented, this should not
       // be called for TYPE_CHAR.
       DCHECK(false) << "NYI";
       return NULL;
     case TYPE_TIMESTAMP:
-      return timestamp_val_type_;
+      return timestamp_value_type_;
     case TYPE_DECIMAL:
       return Type::getIntNTy(context(), type.GetByteSize() * 8);
     default:
@@ -499,6 +511,10 @@ PointerType* LlvmCodeGen::GetPtrType(Type* type) {
 
 PointerType* LlvmCodeGen::GetPtrPtrType(Type* type) {
   return PointerType::get(PointerType::get(type, 0), 0);
+}
+
+PointerType* LlvmCodeGen::GetPtrPtrType(const string& name) {
+  return PointerType::get(GetPtrType(name), 0);
 }
 
 // Llvm doesn't let you create a PointerValue from a c-side ptr.  Instead
@@ -589,6 +605,7 @@ Status LlvmCodeGen::MaterializeFunctionHelper(Function *fn) {
 
   // Materialized functions are marked as not materializable by LLVM.
   DCHECK(!fn->isMaterializable());
+  SetCPUAttrs(fn);
   const unordered_set<string>* callees = shared_call_graph_.GetCallees(fn->getName());
   if (callees != nullptr) {
     for (const string& callee : *callees) {
@@ -628,8 +645,6 @@ Function* LlvmCodeGen::GetFunction(IRFunction::Type ir_type, bool clone) {
       LOG(ERROR) << "Unable to locate function " << fn_name;
       return NULL;
     }
-    // Mixing "NoInline" with "AlwaysInline" will lead to compilation failure.
-    if (!fn->hasFnAttribute(Attribute::NoInline)) fn->addFnAttr(Attribute::AlwaysInline);
     loaded_functions_[ir_type] = fn;
   }
   Status status = MaterializeFunction(fn);
@@ -692,7 +707,18 @@ bool LlvmCodeGen::VerifyFunction(Function* fn) {
 
 void LlvmCodeGen::SetNoInline(llvm::Function* function) const {
   function->removeFnAttr(llvm::Attribute::AlwaysInline);
+  function->removeFnAttr(llvm::Attribute::InlineHint);
   function->addFnAttr(llvm::Attribute::NoInline);
+}
+
+void LlvmCodeGen::SetCPUAttrs(llvm::Function* function) {
+  // Set all functions' "target-cpu" and "target-features" to match the
+  // host's CPU's features. It's assumed that the functions don't use CPU
+  // features which the host doesn't support. CreateFromMemory() checks
+  // the features of the host's CPU and loads the module compatible with
+  // the host's CPU.
+  function->addFnAttr("target-cpu", cpu_name_);
+  function->addFnAttr("target-features", target_features_attr_);
 }
 
 LlvmCodeGen::FnPrototype::FnPrototype(
@@ -951,10 +977,7 @@ Function* LlvmCodeGen::CloneFunction(Function* fn) {
 }
 
 Function* LlvmCodeGen::FinalizeFunction(Function* function) {
-  if (LIKELY(!function->hasFnAttribute(llvm::Attribute::NoInline))) {
-    function->addFnAttr(llvm::Attribute::AlwaysInline);
-  }
-
+  SetCPUAttrs(function);
   if (!VerifyFunction(function)) {
     function->eraseFromParent(); // deletes function
     return NULL;
@@ -1080,7 +1103,9 @@ Status LlvmCodeGen::OptimizeModule() {
   pass_builder.OptLevel = 2;
   // Don't optimize for code size (this corresponds to -O2/-O3)
   pass_builder.SizeLevel = 0;
-  pass_builder.Inliner = createFunctionInliningPass();
+  // Use a threshold equivalent to adding InlineHint on all functions.
+  // This results in slightly better performance than the default threshold (225).
+  pass_builder.Inliner = createFunctionInliningPass(325);
 
   // The TargetIRAnalysis pass is required to provide information about the target
   // machine to optimisation passes, e.g. the cost model.
@@ -1228,6 +1253,7 @@ Status LlvmCodeGen::GetSymbols(const string& file, const string& module_id,
   for (const Function& fn: codegen->module_->functions()) {
     if (fn.isMaterializable()) symbols->insert(fn.getName());
   }
+  codegen->Close();
   return Status::OK();
 }
 

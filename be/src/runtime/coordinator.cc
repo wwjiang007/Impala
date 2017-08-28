@@ -40,46 +40,38 @@
 #include "common/logging.h"
 #include "exec/data-sink.h"
 #include "exec/plan-root-sink.h"
-#include "exec/scan-node.h"
 #include "gen-cpp/Frontend_types.h"
 #include "gen-cpp/ImpalaInternalService.h"
 #include "gen-cpp/ImpalaInternalService_constants.h"
 #include "gen-cpp/ImpalaInternalService_types.h"
 #include "gen-cpp/Partitions_types.h"
 #include "gen-cpp/PlanNodes_types.h"
-#include "runtime/backend-client.h"
-#include "runtime/client-cache.h"
-#include "runtime/data-stream-mgr.h"
-#include "runtime/data-stream-sender.h"
 #include "runtime/exec-env.h"
 #include "runtime/fragment-instance-state.h"
 #include "runtime/hdfs-fs-cache.h"
 #include "runtime/mem-tracker.h"
-#include "runtime/parallel-executor.h"
 #include "runtime/query-exec-mgr.h"
-#include "runtime/row-batch.h"
-#include "runtime/tuple-row.h"
 #include "runtime/coordinator-filter-state.h"
 #include "runtime/coordinator-backend-state.h"
 #include "runtime/debug-options.h"
 #include "runtime/query-state.h"
 #include "scheduling/scheduler.h"
 #include "util/bloom-filter.h"
-#include "util/container-util.h"
 #include "util/counting-barrier.h"
 #include "util/debug-util.h"
 #include "util/error-util.h"
 #include "util/hdfs-bulk-ops.h"
 #include "util/hdfs-util.h"
+#include "util/histogram-metric.h"
 #include "util/network-util.h"
 #include "util/pretty-printer.h"
-#include "util/summary-util.h"
+#include "util/runtime-profile.h"
 #include "util/table-printer.h"
-#include "util/uid-util.h"
 
 #include "common/names.h"
 
 using namespace apache::thrift;
+using namespace rapidjson;
 using namespace strings;
 using boost::algorithm::iequals;
 using boost::algorithm::is_any_of;
@@ -153,7 +145,7 @@ Status Coordinator::Exec() {
   lock_guard<mutex> l(lock_);
 
   query_state_ = ExecEnv::GetInstance()->query_exec_mgr()->CreateQueryState(query_ctx_);
-  filter_mem_tracker_.reset(new MemTracker(
+  filter_mem_tracker_ = query_state_->obj_pool()->Add(new MemTracker(
       -1, "Runtime Filter (Coordinator)", query_state_->query_mem_tracker(), false));
 
   InitFragmentStats();
@@ -234,25 +226,15 @@ void Coordinator::InitFragmentStats() {
 }
 
 void Coordinator::InitBackendStates() {
-  int num_backends = schedule_.unique_hosts().size();
+  int num_backends = schedule_.per_backend_exec_params().size();
   DCHECK_GT(num_backends, 0);
   backend_states_.resize(num_backends);
-
-  // collect the FInstanceExecParams for each host
-  typedef map<TNetworkAddress, vector<const FInstanceExecParams*>> BackendParamsMap;
-  BackendParamsMap backend_params_map;
-  for (const FragmentExecParams& fragment_params: schedule_.fragment_exec_params()) {
-    for (const FInstanceExecParams& instance_params:
-        fragment_params.instance_exec_params) {
-      backend_params_map[instance_params.host].push_back(&instance_params);
-    }
-  }
 
   // create BackendStates
   bool has_coord_fragment = schedule_.GetCoordFragment() != nullptr;
   const TNetworkAddress& coord_address = ExecEnv::GetInstance()->backend_address();
   int backend_idx = 0;
-  for (const auto& entry: backend_params_map) {
+  for (const auto& entry: schedule_.per_backend_exec_params()) {
     if (has_coord_fragment && coord_address == entry.first) {
       coord_backend_idx_ = backend_idx;
     }
@@ -408,7 +390,8 @@ Status Coordinator::FinishBackendStartup() {
   Status status = Status::OK();
   const TMetricDef& def =
       MakeTMetricDef("backend-startup-latencies", TMetricKind::HISTOGRAM, TUnit::TIME_MS);
-  HistogramMetric latencies(def, 20000, 3);
+  // Capture up to 30 minutes of start-up times, in ms, with 4 s.f. accuracy.
+  HistogramMetric latencies(def, 30 * 60 * 1000, 4);
   for (BackendState* backend_state: backend_states_) {
     // preserve the first non-OK, if there is one
     Status backend_status = backend_state->GetStatus();
@@ -587,7 +570,8 @@ Status Coordinator::FinalizeSuccessfulInsert() {
   // TODO: add DescriptorTbl::CreateTableDescriptor() so we can create a
   // descriptor for just the output table, calling Create() can be very
   // expensive.
-  DescriptorTbl::Create(obj_pool(), query_ctx_.desc_tbl, nullptr, &descriptor_table);
+  RETURN_IF_ERROR(
+      DescriptorTbl::Create(obj_pool(), query_ctx_.desc_tbl, &descriptor_table));
   HdfsTableDescriptor* hdfs_table = static_cast<HdfsTableDescriptor*>(
       descriptor_table->GetTableDescriptor(finalize_params_.table_id));
   DCHECK(hdfs_table != nullptr)
@@ -651,7 +635,7 @@ Status Coordinator::FinalizeSuccessfulInsert() {
         // when the directory is empty(HDFS-8407). Need to check errno to make sure
         // the call fails.
         if (existing_files == nullptr && errno != 0) {
-          return GetHdfsErrorMsg("Could not list directory: ", part_path);
+          return Status(GetHdfsErrorMsg("Could not list directory: ", part_path));
         }
         for (int i = 0; i < num_files; ++i) {
           const string filename = path(existing_files[i].mName).filename().string();
@@ -696,6 +680,11 @@ Status Coordinator::FinalizeSuccessfulInsert() {
       }
     }
   }
+
+  // Release resources on the descriptor table.
+  descriptor_table->ReleaseResources();
+  descriptor_table = nullptr;
+  hdfs_table = nullptr;
 
   {
     SCOPED_TIMER(ADD_CHILD_TIMER(query_profile_, "Overwrite/PartitionCreationTimer",
@@ -943,15 +932,9 @@ Status Coordinator::UpdateBackendExecStatus(const TReportExecStatusParams& param
             params.coord_state_idx, backend_states_.size() - 1));
   }
   BackendState* backend_state = backend_states_[params.coord_state_idx];
-  // ignore stray exec reports if we're already done, otherwise we lose
-  // track of num_remaining_backends_
-  if (backend_state->IsDone()) return Status::OK();
   // TODO: return here if returned_all_results_?
   // TODO: return CANCELLED in that case? Although that makes the cancellation propagation
   // path more irregular.
-
-  bool done;
-  backend_state->ApplyExecStatusReport(params, &exec_summary_, &progress_, &done);
 
   // TODO: only do this when the sink is done; probably missing a done field
   // in TReportExecStatus for that
@@ -959,39 +942,38 @@ Status Coordinator::UpdateBackendExecStatus(const TReportExecStatusParams& param
     UpdateInsertExecStatus(params.insert_exec_status);
   }
 
-  // for now, abort the query if we see any error except if returned_all_results_ is true
-  // (UpdateStatus() initiates cancellation, if it hasn't already been)
-  // TODO: clarify control flow here, it's unclear we should even process this status
-  // report if returned_all_results_ is true
-  TUniqueId failed_instance_id;
-  Status status = backend_state->GetStatus(&failed_instance_id);
-  if (!status.ok() && !returned_all_results_) {
-    Status ignored = UpdateStatus(status, failed_instance_id,
-        TNetworkAddressToString(backend_state->impalad_address()));
-    return Status::OK();
-  }
+  if (backend_state->ApplyExecStatusReport(params, &exec_summary_, &progress_)) {
+    // This report made this backend done, so update the status and
+    // num_remaining_backends_.
 
-  if (done) {
+    // for now, abort the query if we see any error except if returned_all_results_ is
+    // true (UpdateStatus() initiates cancellation, if it hasn't already been)
+    // TODO: clarify control flow here, it's unclear we should even process this status
+    // report if returned_all_results_ is true
+    TUniqueId failed_instance_id;
+    Status status = backend_state->GetStatus(&failed_instance_id);
+    if (!status.ok() && !returned_all_results_) {
+      Status ignored = UpdateStatus(status, failed_instance_id,
+          TNetworkAddressToString(backend_state->impalad_address()));
+      return Status::OK();
+    }
+
     lock_guard<mutex> l(lock_);
     DCHECK_GT(num_remaining_backends_, 0);
-    VLOG_QUERY << "Backend completed: "
-        << " host=" << backend_state->impalad_address()
-        << " remaining=" << num_remaining_backends_ - 1;
     if (VLOG_QUERY_IS_ON && num_remaining_backends_ > 1) {
-      // print host/port info for the first backend that's still in progress as a
-      // debugging aid for backend deadlocks
-      for (BackendState* backend_state: backend_states_) {
-        if (!backend_state->IsDone()) {
-          VLOG_QUERY << "query_id=" << query_id() << ": first in-progress backend: "
-                     << backend_state->impalad_address();
-          break;
-        }
-      }
+      VLOG_QUERY << "Backend completed: "
+          << " host=" << backend_state->impalad_address()
+          << " remaining=" << num_remaining_backends_ - 1;
+      BackendState::LogFirstInProgress(backend_states_);
     }
     if (--num_remaining_backends_ == 0 || !status.ok()) {
       backend_completion_cv_.notify_all();
     }
+    return Status::OK();
   }
+  // If all results have been returned, return a cancelled status to force the fragment
+  // instance to stop executing.
+  if (returned_all_results_) return Status::CANCELLED;
 
   return Status::OK();
 }
@@ -1089,15 +1071,11 @@ void Coordinator::ReleaseResources() {
     lock_guard<SpinLock> l(filter_lock_);
     for (auto& filter : filter_routing_table_) {
       FilterState* state = &filter.second;
-      state->Disable(filter_mem_tracker_.get());
+      state->Disable(filter_mem_tracker_);
     }
   }
   // This may be NULL while executing UDFs.
-  if (filter_mem_tracker_.get() != nullptr) {
-    // TODO: move this elsewhere, this isn't releasing resources (it's dismantling
-    // control structures)
-    filter_mem_tracker_->UnregisterFromParent();
-  }
+  if (filter_mem_tracker_ != nullptr) filter_mem_tracker_->Close();
   // Need to protect against failed Prepare(), where root_sink() would not be set.
   if (coord_sink_ != nullptr) {
     coord_sink_->CloseConsumer();
@@ -1170,7 +1148,7 @@ void Coordinator::UpdateFilter(const TUpdateFilterParams& params) {
     }
 
     // Filter is complete, and can be released.
-    state->Disable(filter_mem_tracker_.get());
+    state->Disable(filter_mem_tracker_);
     DCHECK(state->bloom_filter() == nullptr);
   }
 
@@ -1195,15 +1173,15 @@ void Coordinator::FilterState::ApplyUpdate(const TUpdateFilterParams& params,
 
   --pending_count_;
   if (params.bloom_filter.always_true) {
-    Disable(coord->filter_mem_tracker_.get());
+    Disable(coord->filter_mem_tracker_);
   } else if (bloom_filter_.get() == nullptr) {
     int64_t heap_space = params.bloom_filter.directory.size();
-    if (!coord->filter_mem_tracker_.get()->TryConsume(heap_space)) {
+    if (!coord->filter_mem_tracker_->TryConsume(heap_space)) {
       VLOG_QUERY << "Not enough memory to allocate filter: "
                  << PrettyPrinter::Print(heap_space, TUnit::BYTES)
                  << " (query: " << coord->query_id() << ")";
       // Disable, as one missing update means a correct filter cannot be produced.
-      Disable(coord->filter_mem_tracker_.get());
+      Disable(coord->filter_mem_tracker_);
     } else {
       bloom_filter_.reset(new TBloomFilter());
       // Workaround for fact that parameters are const& for Thrift RPCs - yet we want to
@@ -1243,5 +1221,16 @@ void Coordinator::GetTExecSummary(TExecSummary* exec_summary) {
 
 MemTracker* Coordinator::query_mem_tracker() const {
   return query_state()->query_mem_tracker();
+}
+
+void Coordinator::BackendsToJson(Document* doc) {
+  lock_guard<mutex> l(lock_);
+  Value states(kArrayType);
+  for (BackendState* state : backend_states_) {
+    Value val(kObjectType);
+    state->ToJson(&val, doc);
+    states.PushBack(val, doc->GetAllocator());
+  }
+  doc->AddMember("backend_states", states, doc->GetAllocator());
 }
 }

@@ -95,10 +95,11 @@ public class HdfsTableSink extends TableSink {
           Math.max(1L, inputNode.getCardinality() / numInstances);
       long perInstanceInputBytes =
           (long) Math.ceil(perInstanceInputCardinality * inputNode.getAvgRowSize());
-      perInstanceMemEstimate =
-          Math.min(perInstanceInputBytes, numPartitionsPerInstance * perPartitionMemReq);
+      long perInstanceMemReq =
+          PlanNode.checkedMultiply(numPartitionsPerInstance, perPartitionMemReq);
+      perInstanceMemEstimate = Math.min(perInstanceInputBytes, perInstanceMemReq);
     }
-    resourceProfile_ = new ResourceProfile(perInstanceMemEstimate, 0);
+    resourceProfile_ = ResourceProfile.noReservation(perInstanceMemEstimate);
   }
 
   /**

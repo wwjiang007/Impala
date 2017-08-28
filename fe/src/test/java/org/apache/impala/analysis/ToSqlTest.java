@@ -346,7 +346,8 @@ public class ToSqlTest extends FrontendTestBase {
         "default",
         "CREATE TABLE default.p PRIMARY KEY (a, b) PARTITION BY HASH (a) PARTITIONS 3, " +
         "RANGE (b) (PARTITION VALUE = 1) STORED AS KUDU TBLPROPERTIES " +
-        "('kudu.master_addresses'='foo', 'kudu.table_name'='impala::default.p', " +
+        "('kudu.master_addresses'='foo', " +
+        "'kudu.table_name'='impala::default.p', " +
         "'storage_handler'='com.cloudera.kudu.hive.KuduStorageHandler') AS " +
         "SELECT int_col a, bigint_col b FROM functional.alltypes", true);
   }
@@ -1165,6 +1166,11 @@ public class ToSqlTest extends FrontendTestBase {
           + "rows between unbounded preceding and current row) from functional.alltypes",
         "SELECT sum(int_col) OVER (PARTITION BY id ORDER BY tinyint_col ASC ROWS "
           + "BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM functional.alltypes");
+    testToSql(
+        "select last_value(tinyint_col ignore nulls) over (order by tinyint_col) "
+          + "from functional.alltypesagg",
+        "SELECT last_value(tinyint_col IGNORE NULLS) OVER (ORDER BY tinyint_col ASC) "
+          + "FROM functional.alltypesagg");
   }
 
   /**

@@ -36,6 +36,7 @@ namespace impala {
 class AdmissionController;
 class BufferPool;
 class CallableThreadPool;
+class DataStreamMgrBase;
 class DataStreamMgr;
 class DiskIoMgr;
 class QueryExecMgr;
@@ -43,25 +44,27 @@ class Frontend;
 class HBaseTableFactory;
 class HdfsFsCache;
 class ImpalaServer;
+class KrpcDataStreamMgr;
 class LibCache;
 class MemTracker;
-class PoolMemTrackerRegistry;
 class MetricGroup;
+class PoolMemTrackerRegistry;
+class ObjectPool;
 class QueryResourceMgr;
 class RequestPoolService;
 class ReservationTracker;
 class Scheduler;
 class StatestoreSubscriber;
-class TestExecEnv;
-
 class ThreadResourceMgr;
 class TmpFileMgr;
 class Webserver;
 
-/// Execution environment for queries/plan fragments.
-/// Contains all required global structures, and handles to
-/// singleton services. Clients must call StartServices exactly
-/// once to properly initialise service state.
+/// Execution environment for Impala daemon. Contains all required global structures, and
+/// handles to singleton services. Clients must call StartServices() exactly once to
+/// properly initialise service state.
+///
+/// There should only be one ExecEnv instance. It should always be accessed by calling
+/// ExecEnv::GetInstance().
 class ExecEnv {
  public:
   ExecEnv();
@@ -75,11 +78,22 @@ class ExecEnv {
   static ExecEnv* GetInstance() { return exec_env_; }
 
   /// Destructor - only used in backend tests that create new environment per test.
-  virtual ~ExecEnv();
+  ~ExecEnv();
 
+  /// Starts any dependent services in their correct order
+  Status StartServices() WARN_UNUSED_RESULT;
+
+  /// TODO: Should ExecEnv own the ImpalaServer as well?
   void SetImpalaServer(ImpalaServer* server) { impala_server_ = server; }
 
-  DataStreamMgr* stream_mgr() { return stream_mgr_.get(); }
+  DataStreamMgrBase* stream_mgr() { return stream_mgr_.get(); }
+
+  /// TODO: Remove once a single DataStreamMgrBase implementation is standardized on.
+  /// Clients of DataStreamMgrBase should use stream_mgr() unless they need to access
+  /// members that are not a part of the DataStreamMgrBase interface.
+  DataStreamMgr* ThriftStreamMgr();
+  KrpcDataStreamMgr* KrpcStreamMgr();
+
   ImpalaBackendClientCache* impalad_client_cache() {
     return impalad_client_cache_.get();
   }
@@ -112,11 +126,8 @@ class ExecEnv {
 
   const TNetworkAddress& backend_address() const { return backend_address_; }
 
-  /// Starts any dependent services in their correct order
-  virtual Status StartServices();
-
   /// Initializes the exec env for running FE tests.
-  Status InitForFeTests();
+  Status InitForFeTests() WARN_UNUSED_RESULT;
 
   /// Returns true if this environment was created from the FE tests. This makes the
   /// environment special since the JVM is started first and libraries are loaded
@@ -124,19 +135,19 @@ class ExecEnv {
   bool is_fe_tests() { return is_fe_tests_; }
 
   /// Returns the configured defaultFs set in core-site.xml
-  string default_fs() { return default_fs_; }
+  const string& default_fs() { return default_fs_; }
 
   /// Gets a KuduClient for this list of master addresses. It will look up and share
   /// an existing KuduClient if possible. Otherwise, it will create a new KuduClient
   /// internally and return a pointer to it. All KuduClients accessed through this
   /// interface are owned by the ExecEnv. Thread safe.
-  Status GetKuduClient(
-      const std::vector<std::string>& master_addrs, kudu::client::KuduClient** client);
+  Status GetKuduClient(const std::vector<std::string>& master_addrs,
+      kudu::client::KuduClient** client) WARN_UNUSED_RESULT;
 
- protected:
-  /// Leave protected so that subclasses can override
+ private:
+  boost::scoped_ptr<ObjectPool> obj_pool_;
   boost::scoped_ptr<MetricGroup> metrics_;
-  boost::scoped_ptr<DataStreamMgr> stream_mgr_;
+  boost::scoped_ptr<DataStreamMgrBase> stream_mgr_;
   boost::scoped_ptr<Scheduler> scheduler_;
   boost::scoped_ptr<AdmissionController> admission_controller_;
   boost::scoped_ptr<StatestoreSubscriber> statestore_subscriber_;
@@ -157,13 +168,13 @@ class ExecEnv {
   boost::scoped_ptr<QueryExecMgr> query_exec_mgr_;
 
   /// Query-wide buffer pool and the root reservation tracker for the pool. The
-  /// reservation limit is equal to the maximum capacity of the pool.
-  /// For now this is only used by backend tests that create them via InitBufferPool();
+  /// reservation limit is equal to the maximum capacity of the pool. Created in
+  /// InitBufferPool();
   boost::scoped_ptr<ReservationTracker> buffer_reservation_;
   boost::scoped_ptr<BufferPool> buffer_pool_;
 
   /// Not owned by this class
-  ImpalaServer* impala_server_;
+  ImpalaServer* impala_server_ = nullptr;
 
   bool enable_webserver_;
 
@@ -171,7 +182,7 @@ class ExecEnv {
   friend class TestEnv;
 
   static ExecEnv* exec_env_;
-  bool is_fe_tests_;
+  bool is_fe_tests_ = false;
 
   /// Address of the Impala backend server instance
   TNetworkAddress backend_address_;
@@ -195,7 +206,7 @@ class ExecEnv {
   KuduClientMap kudu_client_map_;
 
   /// Initialise 'buffer_pool_' and 'buffer_reservation_' with given capacity.
-  void InitBufferPool(int64_t min_page_len, int64_t capacity);
+  void InitBufferPool(int64_t min_page_len, int64_t capacity, int64_t clean_pages_limit);
 };
 
 } // namespace impala

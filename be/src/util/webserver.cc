@@ -101,6 +101,8 @@ DEFINE_string(webserver_x_frame_options, "DENY",
     "webserver will add X-Frame-Options HTTP header with this value");
 
 DECLARE_bool(is_coordinator);
+DECLARE_string(ssl_minimum_version);
+DECLARE_string(ssl_cipher_list);
 
 static const char* DOC_FOLDER = "/www/";
 static const int DOC_FOLDER_LEN = strlen(DOC_FOLDER);
@@ -174,31 +176,6 @@ Webserver::Webserver(const int port)
 
 Webserver::~Webserver() {
   Stop();
-}
-
-void Webserver::RootHandler(const ArgumentMap& args, Document* document) {
-  Value version(GetVersionString().c_str(), document->GetAllocator());
-  document->AddMember("version", version, document->GetAllocator());
-  Value cpu_info(CpuInfo::DebugString().c_str(), document->GetAllocator());
-  document->AddMember("cpu_info", cpu_info, document->GetAllocator());
-  Value mem_info(MemInfo::DebugString().c_str(), document->GetAllocator());
-  document->AddMember("mem_info", mem_info, document->GetAllocator());
-  Value disk_info(DiskInfo::DebugString().c_str(), document->GetAllocator());
-  document->AddMember("disk_info", disk_info, document->GetAllocator());
-  Value os_info(OsInfo::DebugString().c_str(), document->GetAllocator());
-  document->AddMember("os_info", os_info, document->GetAllocator());
-  Value process_state_info(ProcessStateInfo().DebugString().c_str(),
-    document->GetAllocator());
-  document->AddMember("process_state_info", process_state_info,
-    document->GetAllocator());
-
-  ExecEnv* env = ExecEnv::GetInstance();
-  if (env == nullptr || env->impala_server() == nullptr) return;
-  document->AddMember("impala_server_mode", true, document->GetAllocator());
-  document->AddMember("is_coordinator", env->impala_server()->IsCoordinator(),
-      document->GetAllocator());
-  document->AddMember("is_executor", env->impala_server()->IsExecutor(),
-      document->GetAllocator());
 }
 
 void Webserver::ErrorHandler(const ArgumentMap& args, Document* document) {
@@ -286,6 +263,13 @@ Status Webserver::Start() {
         options.push_back(key_password.c_str());
       }
     }
+
+    options.push_back("ssl_min_version");
+    options.push_back(FLAGS_ssl_minimum_version.c_str());
+    if (!FLAGS_ssl_cipher_list.empty()) {
+      options.push_back("ssl_ciphers");
+      options.push_back(FLAGS_ssl_cipher_list.c_str());
+    }
   }
 
   if (!FLAGS_webserver_authentication_domain.empty()) {
@@ -329,7 +313,7 @@ Status Webserver::Start() {
   // pointer to this server in the per-server state, and register a static method as the
   // default callback. That method unpacks the pointer to this and calls the real
   // callback.
-  context_ = sq_start(&callbacks, reinterpret_cast<void*>(this), &options[0]);
+  context_ = sq_start(&callbacks, reinterpret_cast<void*>(this), options.data());
 
   // Restore the child signal handler so wait() works properly.
   signal(SIGCHLD, sig_chld);
@@ -339,11 +323,6 @@ Status Webserver::Start() {
     error_msg << "Webserver: Could not start on address " << http_address_;
     return Status(error_msg.str());
   }
-
-  UrlCallback default_callback =
-      bind<void>(mem_fn(&Webserver::RootHandler), this, _1, _2);
-
-  RegisterUrlCallback("/", "root.tmpl", default_callback, false);
 
   LOG(INFO) << "Webserver started";
   return Status::OK();

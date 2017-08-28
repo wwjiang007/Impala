@@ -180,16 +180,16 @@ class ImpalaTestSuite(BaseTestSuite):
     return hdfs_client
 
   @classmethod
-  def all_db_names(self):
-    results = self.client.execute("show databases").data
+  def all_db_names(cls):
+    results = cls.client.execute("show databases").data
     # Extract first column - database name
     return [row.split("\t")[0] for row in results]
 
   @classmethod
-  def cleanup_db(self, db_name, sync_ddl=1):
-    self.client.execute("use default")
-    self.client.set_configuration({'sync_ddl': sync_ddl})
-    self.client.execute("drop database if exists `" + db_name + "` cascade")
+  def cleanup_db(cls, db_name, sync_ddl=1):
+    cls.client.execute("use default")
+    cls.client.set_configuration({'sync_ddl': sync_ddl})
+    cls.client.execute("drop database if exists `" + db_name + "` cascade")
 
   def __restore_query_options(self, query_options_changed, impalad_client):
     """
@@ -621,7 +621,7 @@ class ImpalaTestSuite(BaseTestSuite):
     # This should never happen.
     assert 0, 'Unable to get location for table: ' + table_name
 
-  def run_stmt_in_hive(self, stmt):
+  def run_stmt_in_hive(self, stmt, username=getuser()):
     """
     Run a statement in Hive, returning stdout if successful and throwing
     RuntimeError(stderr) if not.
@@ -630,7 +630,7 @@ class ImpalaTestSuite(BaseTestSuite):
         ['beeline',
          '--outputformat=csv2',
          '-u', 'jdbc:hive2://' + pytest.config.option.hive_server2,
-         '-n', getuser(),
+         '-n', username,
          '-e', stmt],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE)
@@ -682,7 +682,8 @@ class ImpalaTestSuite(BaseTestSuite):
       cluster_sizes = ALL_NODES_ONLY
     return create_exec_option_dimension(cluster_sizes, disable_codegen_options,
                                         batch_sizes,
-                                        exec_single_node_option=exec_single_node_option)
+                                        exec_single_node_option=exec_single_node_option,
+                                        disable_codegen_rows_threshold_options=[0])
 
   @classmethod
   def exploration_strategy(cls):

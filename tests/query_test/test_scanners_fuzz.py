@@ -17,6 +17,7 @@
 
 from copy import copy
 import itertools
+import math
 import os
 import pytest
 import random
@@ -150,6 +151,7 @@ class TestScannersFuzzing(ImpalaTestSuite):
       query_options = copy(vector.get_value('exec_option'))
       query_options['batch_size'] = batch_size
       query_options['disable_codegen'] = disable_codegen
+      query_options['disable_codegen_rows_threshold'] = 0
       try:
         result = self.execute_query(query, query_options = query_options)
         LOG.info('\n'.join(result.log))
@@ -212,17 +214,18 @@ class TestScannersFuzzing(ImpalaTestSuite):
     with open(path, "rb") as f:
       data = bytearray(f.read())
 
-    if rng.random() < 0.5:
+    num_corruptions = rng.randint(0, int(math.log(len(data))))
+    for _ in xrange(num_corruptions):
       flip_offset = rng.randint(0, len(data) - 1)
       flip_val = rng.randint(0, 255)
-      LOG.info("corrupt_file: Flip byte in %s at %d from %d to %d", path, flip_offset,
-          data[flip_offset], flip_val)
+      LOG.info("corrupt file: Flip byte in {0} at {1} from {2} to {3}".format(
+          path, flip_offset, data[flip_offset], flip_val))
       data[flip_offset] = flip_val
-    else:
+
+    if rng.random() < 0.4:
       truncation = rng.randint(0, len(data))
-      LOG.info("corrupt_file: Truncate %s to %d", path, truncation)
+      LOG.info("corrupt file: Truncate {0} to {1}".format(path, truncation))
       data = data[:truncation]
 
     with open(path, "wb") as f:
       f.write(data)
-

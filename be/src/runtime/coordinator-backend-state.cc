@@ -18,6 +18,8 @@
 #include "runtime/coordinator-backend-state.h"
 
 #include <sstream>
+#include <string>
+#include <boost/lexical_cast.hpp>
 #include <boost/thread/locks.hpp>
 #include <boost/thread/lock_guard.hpp>
 #include <boost/accumulators/accumulators.hpp>
@@ -41,9 +43,11 @@
 #include "gen-cpp/Types_types.h"
 #include "gen-cpp/ImpalaInternalService_types.h"
 #include "gen-cpp/ImpalaInternalService_constants.h"
+
 #include "common/names.h"
 
 using namespace impala;
+using namespace rapidjson;
 namespace accumulators = boost::accumulators;
 
 Coordinator::BackendState::BackendState(
@@ -57,16 +61,17 @@ Coordinator::BackendState::BackendState(
 }
 
 void Coordinator::BackendState::Init(
-    const vector<const FInstanceExecParams*>& instance_params_list,
+    const BackendExecParams& exec_params,
     const vector<FragmentStats*>& fragment_stats, ObjectPool* obj_pool) {
-  instance_params_list_ = instance_params_list;
-  host_ = instance_params_list_[0]->host;
-  num_remaining_instances_ = instance_params_list.size();
+  backend_exec_params_ = &exec_params;
+  host_ = backend_exec_params_->instance_params[0]->host;
+  num_remaining_instances_ = backend_exec_params_->instance_params.size();
 
   // populate instance_stats_map_ and install instance
   // profiles as child profiles in fragment_stats' profile
   int prev_fragment_idx = -1;
-  for (const FInstanceExecParams* instance_params: instance_params_list) {
+  for (const FInstanceExecParams* instance_params:
+       backend_exec_params_->instance_params) {
     DCHECK_EQ(host_, instance_params->host);  // all hosts must be the same
     int fragment_idx = instance_params->fragment().idx;
     DCHECK_LT(fragment_idx, fragment_stats.size());
@@ -89,12 +94,17 @@ void Coordinator::BackendState::SetRpcParams(
     TExecQueryFInstancesParams* rpc_params) {
   rpc_params->__set_protocol_version(ImpalaInternalServiceVersion::V1);
   rpc_params->__set_coord_state_idx(state_idx_);
+  rpc_params->__set_min_reservation_bytes(backend_exec_params_->min_reservation_bytes);
+  rpc_params->__set_initial_reservation_total_claims(
+      backend_exec_params_->initial_reservation_total_claims);
 
   // set fragment_ctxs and fragment_instance_ctxs
-  rpc_params->fragment_instance_ctxs.resize(instance_params_list_.size());
-  for (int i = 0; i < instance_params_list_.size(); ++i) {
+  rpc_params->__isset.fragment_ctxs = true;
+  rpc_params->__isset.fragment_instance_ctxs = true;
+  rpc_params->fragment_instance_ctxs.resize(backend_exec_params_->instance_params.size());
+  for (int i = 0; i < backend_exec_params_->instance_params.size(); ++i) {
     TPlanFragmentInstanceCtx& instance_ctx = rpc_params->fragment_instance_ctxs[i];
-    const FInstanceExecParams& params = *instance_params_list_[i];
+    const FInstanceExecParams& params = *backend_exec_params_->instance_params[i];
     int fragment_idx = params.fragment_exec_params.fragment.idx;
 
     // add a TPlanFragmentCtx, if we don't already have it
@@ -113,7 +123,7 @@ void Coordinator::BackendState::SetRpcParams(
     instance_ctx.__set_per_exch_num_senders(
         params.fragment_exec_params.per_exch_num_senders);
     instance_ctx.__set_sender_id(params.sender_id);
-    if (debug_options.node_id() != -1
+    if (debug_options.enabled()
         && (debug_options.instance_idx() == -1
             || debug_options.instance_idx() == GetInstanceIdx(params.instance_id))) {
       instance_ctx.__set_debug_options(debug_options.ToThrift());
@@ -219,29 +229,42 @@ void Coordinator::BackendState::MergeErrorLog(ErrorLogMap* merged) {
   if (error_log_.size() > 0)  MergeErrorMaps(error_log_, merged);
 }
 
-bool Coordinator::BackendState::IsDone() {
-  lock_guard<mutex> l(lock_);
-  return IsDoneInternal();
+void Coordinator::BackendState::LogFirstInProgress(
+    std::vector<Coordinator::BackendState*> backend_states) {
+  for (Coordinator::BackendState* backend_state : backend_states) {
+    lock_guard<mutex> l(backend_state->lock_);
+    if (!backend_state->IsDone()) {
+      VLOG_QUERY << "query_id=" << backend_state->query_id_
+                 << ": first in-progress backend: " << backend_state->impalad_address();
+      break;
+    }
+  }
 }
 
-inline bool Coordinator::BackendState::IsDoneInternal() const {
+inline bool Coordinator::BackendState::IsDone() const {
   return num_remaining_instances_ == 0 || !status_.ok();
 }
 
-void Coordinator::BackendState::ApplyExecStatusReport(
+bool Coordinator::BackendState::ApplyExecStatusReport(
     const TReportExecStatusParams& backend_exec_status, ExecSummary* exec_summary,
-    ProgressUpdater* scan_range_progress, bool* done) {
+    ProgressUpdater* scan_range_progress) {
   lock_guard<SpinLock> l1(exec_summary->lock);
   lock_guard<mutex> l2(lock_);
+  last_report_time_ms_ = MonotonicMillis();
+
+  // If this backend completed previously, don't apply the update.
+  if (IsDone()) return false;
   for (const TFragmentInstanceExecStatus& instance_exec_status:
       backend_exec_status.instance_exec_status) {
     Status instance_status(instance_exec_status.status);
+    int instance_idx = GetInstanceIdx(instance_exec_status.fragment_instance_id);
+    DCHECK_EQ(instance_stats_map_.count(instance_idx), 1);
+    InstanceStats* instance_stats = instance_stats_map_[instance_idx];
+    DCHECK_EQ(instance_stats->exec_params_.instance_id,
+        instance_exec_status.fragment_instance_id);
+    // Ignore duplicate or out-of-order messages.
+    if (instance_stats->done_) continue;
     if (instance_status.ok()) {
-      int instance_idx = GetInstanceIdx(instance_exec_status.fragment_instance_id);
-      DCHECK_EQ(instance_stats_map_.count(instance_idx), 1);
-      InstanceStats* instance_stats = instance_stats_map_[instance_idx];
-      DCHECK_EQ(instance_stats->exec_params_.instance_id,
-          instance_exec_status.fragment_instance_id);
       instance_stats->Update(instance_exec_status, exec_summary, scan_range_progress);
       if (instance_stats->peak_mem_counter_ != nullptr) {
         // protect against out-of-order status updates
@@ -258,7 +281,11 @@ void Coordinator::BackendState::ApplyExecStatusReport(
       }
     }
     DCHECK_GT(num_remaining_instances_, 0);
-    if (instance_exec_status.done) --num_remaining_instances_;
+    if (instance_exec_status.done) {
+      DCHECK(!instance_stats->done_);
+      instance_stats->done_ = true;
+      --num_remaining_instances_;
+    }
 
     // TODO: clean up the ReportQuerySummary() mess
     if (status_.ok()) {
@@ -283,8 +310,8 @@ void Coordinator::BackendState::ApplyExecStatusReport(
     VLOG_FILE << "host=" << host_ << " error log: " << PrintErrorMapToString(error_log_);
   }
 
-  *done = IsDoneInternal();
   // TODO: keep backend-wide stopwatch?
+  return IsDone();
 }
 
 void Coordinator::BackendState::UpdateExecStats(
@@ -312,7 +339,7 @@ bool Coordinator::BackendState::Cancel() {
   if (!rpc_sent_) return false;
 
   // don't cancel if it already finished (for any reason)
-  if (IsDoneInternal()) return false;
+  if (IsDone()) return false;
 
   /// If the status is not OK, we still try to cancel - !OK status might mean
   /// communication failure between backend and coordinator, but fragment
@@ -321,30 +348,41 @@ bool Coordinator::BackendState::Cancel() {
   // set an error status to make sure we only cancel this once
   if (status_.ok()) status_ = Status::CANCELLED;
 
-  Status status;
-  ImpalaBackendConnection backend_client(
-      ExecEnv::GetInstance()->impalad_client_cache(), impalad_address(), &status);
-  if (!status.ok()) return false;
   TCancelQueryFInstancesParams params;
   params.protocol_version = ImpalaInternalServiceVersion::V1;
   params.__set_query_id(query_id_);
   TCancelQueryFInstancesResult dummy;
   VLOG_QUERY << "sending CancelQueryFInstances rpc for query_id="
-             << query_id_ << " backend=" << impalad_address();
+             << query_id_ << " backend=" << TNetworkAddressToString(impalad_address());
+
   Status rpc_status;
+  Status client_status;
   // Try to send the RPC 3 times before failing.
-  bool retry_is_safe;
   for (int i = 0; i < 3; ++i) {
-    rpc_status = backend_client.DoRpc(
-        &ImpalaBackendClient::CancelQueryFInstances, params, &dummy, &retry_is_safe);
-    if (rpc_status.ok() || !retry_is_safe) break;
+    ImpalaBackendConnection backend_client(ExecEnv::GetInstance()->impalad_client_cache(),
+        impalad_address(), &client_status);
+    if (client_status.ok()) {
+      // The return value 'dummy' is ignored as it's only set if the fragment instance
+      // cannot be found in the backend. The fragment instances of a query can all be
+      // cancelled locally in a backend due to RPC failure to coordinator. In which case,
+      // the query state can be gone already.
+      rpc_status = backend_client.DoRpc(
+          &ImpalaBackendClient::CancelQueryFInstances, params, &dummy);
+      if (rpc_status.ok()) break;
+    }
+  }
+  if (!client_status.ok()) {
+    status_.MergeStatus(client_status);
+    VLOG_QUERY << "CancelQueryFInstances query_id= " << query_id_
+               << " failed to connect to " << TNetworkAddressToString(impalad_address())
+               << " :" << client_status.msg().msg();
+    return true;
   }
   if (!rpc_status.ok()) {
     status_.MergeStatus(rpc_status);
-    stringstream msg;
-    msg << "CancelQueryFInstances rpc query_id=" << query_id_
-        << " failed: " << rpc_status.msg().msg();
-    status_.AddDetail(msg.str());
+    VLOG_QUERY << "CancelQueryFInstances query_id= " << query_id_
+               << " rpc to " << TNetworkAddressToString(impalad_address())
+               << " failed: " << rpc_status.msg().msg();
     return true;
   }
   return true;
@@ -362,7 +400,10 @@ void Coordinator::BackendState::PublishFilter(
   TPublishFilterParams local_params(*rpc_params);
   local_params.__set_bloom_filter(rpc_params->bloom_filter);
   TPublishFilterResult res;
-  backend_client.DoRpc(&ImpalaBackendClient::PublishFilter, local_params, &res);
+  status = backend_client.DoRpc(&ImpalaBackendClient::PublishFilter, local_params, &res);
+  if (!status.ok()) {
+    LOG(WARNING) << "Error publishing filter, continuing..." << status.GetDetail();
+  }
   // TODO: switch back to the following once we fix the lifecycle
   // problems of Coordinator
   //std::cref(fragment_inst->impalad_address()),
@@ -374,6 +415,7 @@ Coordinator::BackendState::InstanceStats::InstanceStats(
     ObjectPool* obj_pool)
   : exec_params_(exec_params),
     profile_(nullptr),
+    done_(false),
     profile_created_(false),
     total_split_size_(0),
     total_ranges_complete_(0) {
@@ -521,4 +563,27 @@ void Coordinator::FragmentStats::AddExecStats() {
   // why plural?
   avg_profile_->AddInfoString("execution rates", rates_label.str());
   avg_profile_->AddInfoString("num instances", lexical_cast<string>(num_instances_));
+}
+
+void Coordinator::BackendState::ToJson(Value* value, Document* document) {
+  lock_guard<mutex> l(lock_);
+  value->AddMember("num_instances", fragments_.size(), document->GetAllocator());
+  value->AddMember("done", IsDone(), document->GetAllocator());
+  value->AddMember(
+      "peak_mem_consumption", peak_consumption_, document->GetAllocator());
+
+  string host = TNetworkAddressToString(impalad_address());
+  Value val(host.c_str(), document->GetAllocator());
+  value->AddMember("host", val, document->GetAllocator());
+
+  value->AddMember("rpc_latency", rpc_latency(), document->GetAllocator());
+  value->AddMember("time_since_last_heard_from", MonotonicMillis() - last_report_time_ms_,
+      document->GetAllocator());
+
+  string status_str = status_.ok() ? "OK" : status_.GetDetail();
+  Value status_val(status_str.c_str(), document->GetAllocator());
+  value->AddMember("status", status_val, document->GetAllocator());
+
+  value->AddMember(
+      "num_remaining_instances", num_remaining_instances_, document->GetAllocator());
 }

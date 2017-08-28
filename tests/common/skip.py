@@ -24,7 +24,7 @@ import os
 import pytest
 from functools import partial
 
-from tests.common.environ import IMPALAD_BUILD, USING_OLD_AGGS_JOINS
+from tests.common.environ import IMPALAD_BUILD
 from tests.util.filesystem_utils import (
     IS_ISILON,
     IS_LOCAL,
@@ -99,16 +99,6 @@ class SkipIfIsilon:
       reason="This Isilon issue has yet to be triaged.")
   jira = partial(pytest.mark.skipif, IS_ISILON)
 
-class SkipIfOldAggsJoins:
-  nested_types = pytest.mark.skipif(USING_OLD_AGGS_JOINS,
-      reason="Nested types not supported with old aggs and joins")
-  passthrough_preagg = pytest.mark.skipif(USING_OLD_AGGS_JOINS,
-      reason="Passthrough optimization not implemented by old agg")
-  unsupported = pytest.mark.skipif(USING_OLD_AGGS_JOINS,
-      reason="Query unsupported with old aggs and joins")
-  requires_spilling = pytest.mark.skipif(USING_OLD_AGGS_JOINS,
-      reason="Test case requires spilling to pass")
-
 class SkipIfLocal:
   # These ones are skipped due to product limitations.
   caching = pytest.mark.skipif(IS_LOCAL,
@@ -123,6 +113,8 @@ class SkipIfLocal:
       reason="Multiple impalads are not supported when using local file system")
   parquet_file_size = pytest.mark.skipif(IS_LOCAL,
       reason="Parquet block size incorrectly determined")
+  hdfs_fd_caching = pytest.mark.skipif(IS_LOCAL,
+      reason="HDFS file handle caching not supported for local non-HDFS files")
 
   # These ones need test infra work to re-enable.
   hbase = pytest.mark.skipif(IS_LOCAL,

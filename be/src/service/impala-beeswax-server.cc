@@ -17,8 +17,6 @@
 
 #include "service/impala-server.h"
 
-#include <boost/algorithm/string/join.hpp>
-
 #include "common/logging.h"
 #include "gen-cpp/Frontend_types.h"
 #include "rpc/thrift-util.h"
@@ -28,6 +26,7 @@
 #include "service/client-request-state.h"
 #include "service/query-options.h"
 #include "service/query-result-set.h"
+#include "util/auth-util.h"
 #include "util/impalad-metrics.h"
 #include "util/webserver.h"
 #include "util/runtime-profile.h"
@@ -35,8 +34,6 @@
 
 #include "common/names.h"
 
-using boost::adopt_lock_t;
-using boost::algorithm::join;
 using namespace apache::thrift;
 using namespace apache::hive::service::cli::thrift;
 using namespace beeswax;
@@ -76,7 +73,7 @@ void ImpalaServer::query(QueryHandle& query_handle, const Query& query) {
   // set of in-flight queries.
   Status status = SetQueryInflight(session, request_state);
   if (!status.ok()) {
-    (void) UnregisterQuery(request_state->query_id(), false, &status);
+    discard_result(UnregisterQuery(request_state->query_id(), false, &status));
     RaiseBeeswaxException(status.GetDetail(), SQLSTATE_GENERAL_ERROR);
   }
   TUniqueIdToQueryHandle(request_state->query_id(), &query_handle);
@@ -114,18 +111,20 @@ void ImpalaServer::executeAndWait(QueryHandle& query_handle, const Query& query,
   // set of in-flight queries.
   Status status = SetQueryInflight(session, request_state);
   if (!status.ok()) {
-    (void) UnregisterQuery(request_state->query_id(), false, &status);
+    discard_result(UnregisterQuery(request_state->query_id(), false, &status));
     RaiseBeeswaxException(status.GetDetail(), SQLSTATE_GENERAL_ERROR);
   }
   // block until results are ready
   request_state->Wait();
-  status = request_state->query_status();
+  {
+    lock_guard<mutex> l(*request_state->lock());
+    status = request_state->query_status();
+  }
   if (!status.ok()) {
-    (void) UnregisterQuery(request_state->query_id(), false, &status);
+    discard_result(UnregisterQuery(request_state->query_id(), false, &status));
     RaiseBeeswaxException(status.GetDetail(), SQLSTATE_GENERAL_ERROR);
   }
 
-  request_state->UpdateNonErrorQueryState(beeswax::QueryState::FINISHED);
   TUniqueIdToQueryHandle(request_state->query_id(), &query_handle);
 
   // If the input log context id is an empty string, then create a new number and
@@ -172,7 +171,7 @@ void ImpalaServer::fetch(Results& query_results, const QueryHandle& query_handle
   VLOG_ROW << "fetch result: #results=" << query_results.data.size()
            << " has_more=" << (query_results.has_more ? "true" : "false");
   if (!status.ok()) {
-    (void) UnregisterQuery(query_id, false, &status);
+    discard_result(UnregisterQuery(query_id, false, &status));
     RaiseBeeswaxException(status.GetDetail(), SQLSTATE_GENERAL_ERROR);
   }
 }
@@ -243,17 +242,18 @@ beeswax::QueryState::type ImpalaServer::get_state(const QueryHandle& handle) {
   QueryHandleToTUniqueId(handle, &query_id);
   VLOG_ROW << "get_state(): query_id=" << PrintId(query_id);
 
-  lock_guard<mutex> l(client_request_state_map_lock_);
-  ClientRequestStateMap::iterator entry = client_request_state_map_.find(query_id);
-  if (entry != client_request_state_map_.end()) {
-    return entry->second->query_state();
-  } else {
+  shared_ptr<ClientRequestState> request_state = GetClientRequestState(query_id);
+  if (UNLIKELY(request_state == nullptr)) {
     VLOG_QUERY << "ImpalaServer::get_state invalid handle";
     RaiseBeeswaxException(Substitute("Invalid query handle: $0", PrintId(query_id)),
       SQLSTATE_GENERAL_ERROR);
   }
-  // dummy to keep compiler happy
-  return beeswax::QueryState::FINISHED;
+  // Take the lock to ensure that if the client sees a query_state == EXCEPTION, it is
+  // guaranteed to see the error query_status.
+  lock_guard<mutex> l(*request_state->lock());
+  DCHECK_EQ(request_state->query_state() == beeswax::QueryState::EXCEPTION,
+      !request_state->query_status().ok());
+  return request_state->query_state();
 }
 
 void ImpalaServer::echo(string& echo_string, const string& input_string) {
@@ -284,18 +284,28 @@ void ImpalaServer::get_log(string& log, const LogContextId& context) {
     return;
   }
   stringstream error_log_ss;
-  // If the query status is !ok, include the status error message at the top of the log.
-  if (!request_state->query_status().ok()) {
-    error_log_ss << request_state->query_status().GetDetail() << "\n";
+
+  {
+    // Take the lock to ensure that if the client sees a query_state == EXCEPTION, it is
+    // guaranteed to see the error query_status.
+    lock_guard<mutex> l(*request_state->lock());
+    DCHECK_EQ(request_state->query_state() == beeswax::QueryState::EXCEPTION,
+        !request_state->query_status().ok());
+    // If the query status is !ok, include the status error message at the top of the log.
+    if (!request_state->query_status().ok()) {
+      error_log_ss << request_state->query_status().GetDetail() << "\n";
+    }
   }
 
   // Add warnings from analysis
-  error_log_ss << join(request_state->GetAnalysisWarnings(), "\n");
+  for (const string& warning : request_state->GetAnalysisWarnings()) {
+    error_log_ss << warning << "\n";
+  }
 
   // Add warnings from execution
   if (request_state->coord() != nullptr) {
-    if (!request_state->query_status().ok()) error_log_ss << "\n\n";
-    error_log_ss << request_state->coord()->GetErrorLog();
+    const std::string coord_errors = request_state->coord()->GetErrorLog();
+    if (!coord_errors.empty()) error_log_ss << coord_errors << "\n";
   }
   log = error_log_ss.str();
 }
@@ -348,14 +358,19 @@ void ImpalaServer::CloseInsert(TInsertResult& insert_result,
 // getting the profile, such as no matching queries found.
 void ImpalaServer::GetRuntimeProfile(string& profile_output, const QueryHandle& handle) {
   ScopedSessionState session_handle(this);
-  RAISE_IF_ERROR(session_handle.WithSession(ThriftServer::GetThreadConnectionId()),
+  const TUniqueId& session_id = ThriftServer::GetThreadConnectionId();
+  stringstream ss;
+  shared_ptr<SessionState> session;
+  RAISE_IF_ERROR(session_handle.WithSession(session_id, &session),
       SQLSTATE_GENERAL_ERROR);
-
+  if (session == NULL) {
+    ss << Substitute("Invalid session id: $0", PrintId(session_id));
+    RaiseBeeswaxException(ss.str(), SQLSTATE_GENERAL_ERROR);
+  }
   TUniqueId query_id;
   QueryHandleToTUniqueId(handle, &query_id);
   VLOG_RPC << "GetRuntimeProfile(): query_id=" << PrintId(query_id);
-  stringstream ss;
-  Status status = GetRuntimeProfileStr(query_id, false, &ss);
+  Status status = GetRuntimeProfileStr(query_id, GetEffectiveUser(*session), false, &ss);
   if (!status.ok()) {
     ss << "GetRuntimeProfile error: " << status.GetDetail();
     RaiseBeeswaxException(ss.str(), SQLSTATE_GENERAL_ERROR);
@@ -366,12 +381,19 @@ void ImpalaServer::GetRuntimeProfile(string& profile_output, const QueryHandle& 
 void ImpalaServer::GetExecSummary(impala::TExecSummary& result,
       const beeswax::QueryHandle& handle) {
   ScopedSessionState session_handle(this);
-  RAISE_IF_ERROR(session_handle.WithSession(ThriftServer::GetThreadConnectionId()),
+  const TUniqueId& session_id = ThriftServer::GetThreadConnectionId();
+  shared_ptr<SessionState> session;
+  RAISE_IF_ERROR(session_handle.WithSession(session_id, &session),
       SQLSTATE_GENERAL_ERROR);
+  if (session == NULL) {
+    stringstream ss;
+    ss << Substitute("Invalid session id: $0", PrintId(session_id));
+    RaiseBeeswaxException(ss.str(), SQLSTATE_GENERAL_ERROR);
+  }
   TUniqueId query_id;
   QueryHandleToTUniqueId(handle, &query_id);
   VLOG_RPC << "GetExecSummary(): query_id=" << PrintId(query_id);
-  Status status = GetExecSummary(query_id, &result);
+  Status status = GetExecSummary(query_id, GetEffectiveUser(*session), &result);
   if (!status.ok()) RaiseBeeswaxException(status.GetDetail(), SQLSTATE_GENERAL_ERROR);
 }
 

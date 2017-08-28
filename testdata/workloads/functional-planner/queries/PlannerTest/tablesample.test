@@ -2,11 +2,12 @@
 select * from functional.alltypes tablesample system(10) repeatable(1234)
 ---- PLAN
 F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=32.00MB mem-reservation=0B
 PLAN-ROOT SINK
 |  mem-estimate=0B mem-reservation=0B
 |
 00:SCAN HDFS [functional.alltypes]
-   partitions=3/24 files=3 size=60.02KB
+   partitions=3/24 files=3 size=60.68KB
    stats-rows=7300 extrapolated-rows=disabled
    table stats: rows=7300 size=478.45KB
    column stats: all
@@ -17,11 +18,12 @@ PLAN-ROOT SINK
 select * from functional.alltypes tablesample system(50) repeatable(1234)
 ---- PLAN
 F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=80.00MB mem-reservation=0B
 PLAN-ROOT SINK
 |  mem-estimate=0B mem-reservation=0B
 |
 00:SCAN HDFS [functional.alltypes]
-   partitions=12/24 files=12 size=239.44KB
+   partitions=12/24 files=12 size=239.26KB
    stats-rows=7300 extrapolated-rows=disabled
    table stats: rows=7300 size=478.45KB
    column stats: all
@@ -34,11 +36,12 @@ select * from functional.alltypes tablesample system(50) repeatable(1234)
 where id < 10
 ---- PLAN
 F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=80.00MB mem-reservation=0B
 PLAN-ROOT SINK
 |  mem-estimate=0B mem-reservation=0B
 |
 00:SCAN HDFS [functional.alltypes]
-   partitions=12/24 files=12 size=239.44KB
+   partitions=12/24 files=12 size=239.26KB
    predicates: id < 10
    stats-rows=7300 extrapolated-rows=disabled
    table stats: rows=7300 size=478.45KB
@@ -52,11 +55,12 @@ select * from functional.alltypes tablesample system(50) repeatable(1234)
 where year = 2009
 ---- PLAN
 F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=48.00MB mem-reservation=0B
 PLAN-ROOT SINK
 |  mem-estimate=0B mem-reservation=0B
 |
 00:SCAN HDFS [functional.alltypes]
-   partitions=6/24 files=6 size=120.46KB
+   partitions=6/24 files=6 size=119.70KB
    stats-rows=3650 extrapolated-rows=disabled
    table stats: rows=7300 size=478.45KB
    column stats: all
@@ -67,6 +71,7 @@ PLAN-ROOT SINK
 select * from functional.alltypes tablesample system(0)
 ---- PLAN
 F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=0B mem-reservation=0B
 PLAN-ROOT SINK
 |  mem-estimate=0B mem-reservation=0B
 |
@@ -82,6 +87,7 @@ PLAN-ROOT SINK
 select * from functional.alltypes tablesample system(1) repeatable(1234)
 ---- PLAN
 F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=32.00MB mem-reservation=0B
 PLAN-ROOT SINK
 |  mem-estimate=0B mem-reservation=0B
 |
@@ -98,6 +104,7 @@ select * from functional.alltypes tablesample system(1) repeatable(1234)
 where year = 2010
 ---- PLAN
 F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=32.00MB mem-reservation=0B
 PLAN-ROOT SINK
 |  mem-estimate=0B mem-reservation=0B
 |
@@ -113,6 +120,7 @@ PLAN-ROOT SINK
 select * from functional.alltypes tablesample system (100)
 ---- PLAN
 F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=128.00MB mem-reservation=0B
 PLAN-ROOT SINK
 |  mem-estimate=0B mem-reservation=0B
 |
@@ -128,11 +136,12 @@ PLAN-ROOT SINK
 select id from functional_parquet.alltypes tablesample system(10) repeatable(1234)
 ---- PLAN
 F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=16.00MB mem-reservation=0B
 PLAN-ROOT SINK
 |  mem-estimate=0B mem-reservation=0B
 |
 00:SCAN HDFS [functional_parquet.alltypes]
-   partitions=3/24 files=3 size=22.05KB
+   partitions=3/24 files=3 size=22.53KB
    stats-rows=unavailable extrapolated-rows=disabled
    table stats: rows=unavailable size=unavailable
    column stats: unavailable
@@ -145,17 +154,18 @@ select id from functional.alltypes t1 where exists (
   where t1.id = t2.id)
 ---- PLAN
 F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=161.94MB mem-reservation=1.94MB
 PLAN-ROOT SINK
 |  mem-estimate=0B mem-reservation=0B
 |
 02:HASH JOIN [LEFT SEMI JOIN]
 |  hash predicates: t1.id = t2.id
 |  runtime filters: RF000 <- t2.id
-|  mem-estimate=44B mem-reservation=136.00MB
+|  mem-estimate=1.94MB mem-reservation=1.94MB spill-buffer=64.00KB
 |  tuple-ids=0 row-size=4B cardinality=10
 |
 |--01:SCAN HDFS [functional.alltypessmall t2]
-|     partitions=1/4 files=1 size=1.58KB
+|     partitions=1/4 files=1 size=1.57KB
 |     stats-rows=100 extrapolated-rows=disabled
 |     table stats: rows=100 size=6.32KB
 |     column stats: all
@@ -176,11 +186,12 @@ with t as (select * from functional.alltypes tablesample system(10) repeatable(1
 select id from t
 ---- PLAN
 F00:PLAN FRAGMENT [UNPARTITIONED] hosts=1 instances=1
+|  Per-Host Resources: mem-estimate=32.00MB mem-reservation=0B
 PLAN-ROOT SINK
 |  mem-estimate=0B mem-reservation=0B
 |
 00:SCAN HDFS [functional.alltypes]
-   partitions=3/24 files=3 size=60.02KB
+   partitions=3/24 files=3 size=60.68KB
    stats-rows=7300 extrapolated-rows=disabled
    table stats: rows=7300 size=478.45KB
    column stats: all

@@ -270,8 +270,12 @@ public class CreateTableLikeFileStmt extends CreateTableStmt {
 
     PrimitiveType prim = parquetType.asPrimitiveType();
     if (prim.getPrimitiveTypeName() == PrimitiveType.PrimitiveTypeName.BINARY &&
-        orig == OriginalType.UTF8) {
+        (orig == OriginalType.UTF8 || orig == OriginalType.ENUM)) {
       // UTF8 is the type annotation Parquet uses for strings
+      // ENUM is the type annotation Parquet uses to indicate that
+      // the original data type, before conversion to parquet, had been enum.
+      // Applications which do not have enumerated types (e.g. Impala)
+      // should interpret it as a string.
       // We check to make sure it applies to BINARY to avoid errors if there is a bad
       // annotation.
       return Type.STRING;
@@ -358,7 +362,7 @@ public class CreateTableLikeFileStmt extends CreateTableStmt {
       throw new AnalysisException("CREATE TABLE LIKE FILE statement is not supported " +
           "for Kudu tables.");
     }
-    schemaLocation_.analyze(analyzer, Privilege.ALL, FsAction.READ_WRITE);
+    schemaLocation_.analyze(analyzer, Privilege.ALL, FsAction.READ);
     switch (schemaFileFormat_) {
       case PARQUET:
         getColumnDefs().addAll(extractParquetSchema(schemaLocation_));

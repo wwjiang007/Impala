@@ -159,7 +159,7 @@ enum TImpalaQueryOptions {
   QUERY_TIMEOUT_S,
 
   // Test hook for spill to disk operators
-  MAX_BLOCK_MGR_MEMORY,
+  BUFFER_POOL_LIMIT,
 
   // Transforms all count(distinct) aggregations into NDV()
   APPX_COUNT_DISTINCT,
@@ -271,6 +271,23 @@ enum TImpalaQueryOptions {
   // processing. This includes skipping data based on the statistics and computing query
   // results like "select min()".
   PARQUET_READ_STATISTICS,
+
+  // Join distribution mode that is used when the join inputs have an unknown
+  // cardinality, e.g., because of missing table statistics.
+  DEFAULT_JOIN_DISTRIBUTION_MODE,
+
+  // If the number of rows processed per node is below the threshold and disable_codegen
+  // is unset, codegen will be automatically be disabled by the planner.
+  DISABLE_CODEGEN_ROWS_THRESHOLD,
+
+  // The default spillable buffer size, in bytes.
+  DEFAULT_SPILLABLE_BUFFER_SIZE,
+
+  // The minimum spillable buffer size, in bytes.
+  MIN_SPILLABLE_BUFFER_SIZE,
+
+  // The maximum row size that memory is reserved for, in bytes.
+  MAX_ROW_SIZE,
 }
 
 // The summary of a DML statement.

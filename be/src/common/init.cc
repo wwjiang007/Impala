@@ -23,7 +23,7 @@
 #include "common/logging.h"
 #include "common/status.h"
 #include "exec/kudu-util.h"
-#include "exprs/expr.h"
+#include "exprs/scalar-expr-evaluator.h"
 #include "gutil/atomicops.h"
 #include "rpc/authentication.h"
 #include "rpc/thrift-util.h"
@@ -55,16 +55,14 @@
 
 using namespace impala;
 
-DECLARE_string(hostname);
-DECLARE_string(redaction_rules_file);
-// TODO: renamed this to be more generic when we have a good CM release to do so.
-DECLARE_int32(logbufsecs);
-DECLARE_string(heap_profile_dir);
 DECLARE_bool(enable_process_lifetime_heap_profiling);
-
-DEFINE_int32(max_log_files, 10, "Maximum number of log files to retain per severity "
-    "level. The most recent log files are retained. If set to 0, all log files are "
-    "retained.");
+DECLARE_string(heap_profile_dir);
+DECLARE_string(hostname);
+// TODO: rename this to be more generic when we have a good CM release to do so.
+DECLARE_int32(logbufsecs);
+DECLARE_int32(max_minidumps);
+DECLARE_string(redaction_rules_file);
+DECLARE_int32(max_log_files);
 
 DEFINE_int32(max_audit_event_log_files, 0, "Maximum number of audit event log files "
     "to retain. The most recent audit event log files are retained. If set to 0, "
@@ -121,6 +119,10 @@ static scoped_ptr<impala::Thread> pause_monitor;
     impala::CheckAndRotateLogFiles(FLAGS_max_log_files);
     // Check for audit event log rotation in every interval of the maintenance thread
     impala::CheckAndRotateAuditEventLogFiles(FLAGS_max_audit_event_log_files);
+    // Check for minidump rotation in every interval of the maintenance thread. This is
+    // necessary since an arbitrary number of minidumps can be written by sending SIGUSR1
+    // to the process.
+    impala::CheckAndRotateMinidumps(FLAGS_max_minidumps);
   }
 }
 
@@ -128,21 +130,27 @@ static scoped_ptr<impala::Thread> pause_monitor;
   while (true) {
     SleepForMs(FLAGS_memory_maintenance_sleep_time_ms);
     impala::ExecEnv* env = impala::ExecEnv::GetInstance();
-    if (env == nullptr) continue; // ExecEnv may not have been created yet.
-    BufferPool* buffer_pool = env->buffer_pool();
-    if (buffer_pool != nullptr) buffer_pool->Maintenance();
+    // ExecEnv may not have been created yet or this may be the catalogd or statestored,
+    // which don't have ExecEnvs.
+    if (env != nullptr) {
+      BufferPool* buffer_pool = env->buffer_pool();
+      if (buffer_pool != nullptr) buffer_pool->Maintenance();
 
 #ifndef ADDRESS_SANITIZER
-    // When using tcmalloc, the process limit as measured by our trackers will
-    // be out of sync with the process usage. The metric is refreshed whenever
-    // memory is consumed or released via a MemTracker, so on a system with
-    // queries executing it will be refreshed frequently. However if the system
-    // is idle, we need to refresh the tracker occasionally since untracked
-    // memory may be allocated or freed, e.g. by background threads.
-    if (env != NULL && env->process_mem_tracker() != NULL) {
-      env->process_mem_tracker()->RefreshConsumptionFromMetric();
-    }
+      // When using tcmalloc, the process limit as measured by our trackers will
+      // be out of sync with the process usage. The metric is refreshed whenever
+      // memory is consumed or released via a MemTracker, so on a system with
+      // queries executing it will be refreshed frequently. However if the system
+      // is idle, we need to refresh the tracker occasionally since untracked
+      // memory may be allocated or freed, e.g. by background threads.
+      if (env->process_mem_tracker() != nullptr) {
+        env->process_mem_tracker()->RefreshConsumptionFromMetric();
+      }
 #endif
+    }
+    // Periodically refresh values of the aggregate memory metrics to ensure they are
+    // somewhat up-to-date.
+    AggregateMemoryMetrics::Refresh();
   }
 }
 
@@ -173,7 +181,7 @@ void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
   CpuInfo::VerifyCpuRequirements();
 
   // Set the default hostname. The user can override this with the hostname flag.
-  GetHostname(&FLAGS_hostname);
+  ABORT_IF_ERROR(GetHostname(&FLAGS_hostname));
 
   google::SetVersionString(impala::GetBuildVersion());
   google::ParseCommandLineFlags(&argc, &argv, true);
@@ -199,14 +207,6 @@ void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
   log_maintenance_thread.reset(
       new Thread("common", "log-maintenance-thread", &LogMaintenanceThread));
 
-  // Memory maintenance isn't necessary for frontend tests, and it's undesirable
-  // to asynchronously free memory in backend tests that are testing memory
-  // management behaviour.
-  if (!impala::TestInfo::is_test()) {
-    memory_maintenance_thread.reset(
-        new Thread("common", "memory-maintenance-thread", &MemoryMaintenanceThread));
-  }
-
   pause_monitor.reset(new Thread("common", "pause-monitor", &PauseMonitorLoop));
 
   LOG(INFO) << impala::GetVersionString();
@@ -222,7 +222,7 @@ void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
   LOG(INFO) << "Process ID: " << getpid();
 
   // Required for the FE's Catalog
-  impala::LibCache::Init();
+  ABORT_IF_ERROR(impala::LibCache::Init());
   Status fs_cache_init_status = impala::HdfsFsCache::Init();
   if (!fs_cache_init_status.ok()) CLEAN_EXIT_WITH_ERROR(fs_cache_init_status.GetDetail());
 
@@ -235,7 +235,7 @@ void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
     // Should not be called. We need BuiltinsInit() so the builtin symbols are
     // not stripped.
     DCHECK(false);
-    Expr::InitBuiltinsDummy();
+    ScalarExprEvaluator::InitBuiltinsDummy();
   }
 
   if (impala::KuduIsAvailable()) impala::InitKuduLogging();
@@ -246,4 +246,10 @@ void impala::InitCommonRuntime(int argc, char** argv, bool init_jvm,
     HeapProfilerStart(FLAGS_heap_profile_dir.c_str());
   }
 #endif
+}
+
+void impala::StartMemoryMaintenanceThread() {
+  DCHECK(AggregateMemoryMetrics::NUM_MAPS != nullptr) << "Mem metrics not registered.";
+  memory_maintenance_thread.reset(
+      new Thread("common", "memory-maintenance-thread", &MemoryMaintenanceThread));
 }

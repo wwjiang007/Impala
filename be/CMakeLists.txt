@@ -70,6 +70,16 @@ SET(CXX_CLANG_FLAGS "${CXX_CLANG_FLAGS} -Wno-mismatched-tags")
 #   -g: Enable symbols for profiler tools
 #   -Wno-unused-local-typedefs: Do not warn for local typedefs that are unused.
 SET(CXX_GCC_FLAGS "-g -Wno-unused-local-typedefs")
+if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER 7.0)
+  # We need to add additional arguments for GCC 7+. We go down this branch if building
+  # with a non-GCC compiler of version 7+, but in that case CXX_GCC_FLAGS is not used,
+  # so it is inconsequential. TODO: IMPALA-5490: make this non-conditional when we
+  # upgrade GCC.
+  #  -faligned-new: new will automatically align types. Otherwise "new Counter()" in the
+  #       Kudu util code produces a warning (see KUDU-2094).
+  #   TODO: -faligned-new is part of C++17, remove flag when we bump language version.
+  SET(CXX_GCC_FLAGS "${CXX_GCC_FLAGS} -faligned-new")
+endif()
 
 # compiler flags for different build types (run 'cmake -DCMAKE_BUILD_TYPE=<type> .')
 # For CMAKE_BUILD_TYPE=Debug
@@ -172,6 +182,12 @@ set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ${RULE_LAUNCH_PREFIX})
 # Thrift requires these definitions for some types that we use
 add_definitions(-DHAVE_INTTYPES_H -DHAVE_NETINET_IN_H -DHAVE_NETDB_H)
 
+# Kudu flags. 1. Enable non KUDU_* prefixes for status macros to allow Kudu code to
+# compile without changing the macro. 2. Enable full support for all backing types of
+# kudu::Slices. 3. Don't include stubs.h
+add_definitions(-DKUDU_HEADERS_USE_SHORT_STATUS_MACROS -DKUDU_HEADERS_USE_RICH_SLICE
+  -DKUDU_HEADERS_NO_STUBS)
+
 # Set clang flags for cross-compiling to IR.
 # IR_COMPILE is #defined for the cross compile to remove code that bloats the IR.
 # We enable basic optimizations (-O1) to reduce the IR size and speed up runtime JIT.
@@ -187,6 +203,10 @@ set(CLANG_IR_CXX_FLAGS "-emit-llvm" "-c" "-std=c++14" "-DIR_COMPILE" "-DNDEBUG"
   "-Wno-return-type-c-linkage" "-O1")
 # -Werror: compile warnings should be errors when using the toolchain compiler.
 set(CLANG_IR_CXX_FLAGS "${CLANG_IR_CXX_FLAGS}" "-Werror")
+
+if ("${CMAKE_BUILD_TYPE}" STREQUAL "ADDRESS_SANITIZER")
+  SET(CLANG_IR_CXX_FLAGS "${CLANG_IR_CXX_FLAGS}" "-DADDRESS_SANITIZER")
+endif()
 
 IF($ENV{ENABLE_IMPALA_IR_DEBUG_INFO} STREQUAL "true")
   # -g: emit debug symbols in IR. These increase IR size and memory overhead of LLVM, but
@@ -254,7 +274,8 @@ set(CLANG_INCLUDE_FLAGS
   "-I${GFLAGS_INCLUDE_DIR}"
   "-I${RAPIDJSON_INCLUDE_DIR}"
   "-I${AVRO_INCLUDE_DIR}"
-  "-I${BOOST_INCLUDEDIR}"
+  # Include Boost as a system directory to suppress warnings from headers.
+  "-isystem${BOOST_INCLUDEDIR}"
   # Required so that jni.h can be found during Clang compilation
   "-I${JAVA_INCLUDE_PATH}"
   "-I${JAVA_INCLUDE_PATH2}"
@@ -290,6 +311,20 @@ EXECUTE_PROCESS(COMMAND ln ${MORE_ARGS} -sf ${BUILD_OUTPUT_ROOT_DIRECTORY}
 # Determine what functions are available on the current platform.
 INCLUDE(CheckFunctionExists)
 CHECK_FUNCTION_EXISTS(sched_getcpu HAVE_SCHED_GETCPU)
+CHECK_FUNCTION_EXISTS(pipe2 HAVE_PIPE2)
+
+# linux/fs.h defines HAVE_FALLOCATE whether or not the function is available,
+# which is why we use IMPALA_HAVE_FALLOCATE here.
+CHECK_FUNCTION_EXISTS(fallocate IMPALA_HAVE_FALLOCATE)
+CHECK_FUNCTION_EXISTS(preadv HAVE_PREADV)
+INCLUDE(CheckIncludeFiles)
+CHECK_INCLUDE_FILES(linux/magic.h HAVE_MAGIC_H)
+
+include(CheckLibraryExists)
+CHECK_LIBRARY_EXISTS("krb5" krb5_is_config_principal
+  ${KERBEROS_LIBRARY} HAVE_KRB5_IS_CONFIG_PRINCIPAL)
+CHECK_LIBRARY_EXISTS("krb5" krb5_get_init_creds_opt_set_out_ccache
+  ${KERBEROS_LIBRARY} HAVE_KRB5_GET_INIT_CREDS_OPT_SET_OUT_CCACHE)
 
 # This is a list of impala library dependencies. Individual libraries
 # must not specify library dependencies in their own CMakeLists.txt file.
@@ -314,14 +349,22 @@ set (IMPALA_LINK_LIBS
   Exec
   Exprs
   GlobalFlags
+  histogram_proto
   ImpalaThrift
+  kudu_util
+  krpc
   Rpc
+  rpc_header_proto
+  rpc_introspection_proto
+  pb_util_proto
   Runtime
   Scheduling
+  security
   Service
   Statestore
   TestUtil
   ThriftSaslTransport
+  token_proto
   Udf
   Util
   ${WL_END_GROUP}
@@ -339,6 +382,7 @@ if (BUILD_SHARED_LIBS)
     Exprs
     Rpc
     Service
+    security
     Statestore
     Scheduling
     Catalog
@@ -350,27 +394,31 @@ if (BUILD_SHARED_LIBS)
 endif ()
 
 set (IMPALA_DEPENDENCIES
-  ${SNAPPY_STATIC_LIB}
-  ${LZ4_STATIC_LIB}
-  ${RE2_STATIC_LIB}
+  snappy
+  lz4
+  re2
   ${Boost_LIBRARIES}
   ${LLVM_MODULE_LIBS}
-  thriftstatic
-  ${SASL_LIBRARY}
-  ${LDAP_LIBRARY}
-  ${LBER_LIBRARY}
+  thrift
+  cyrus_sasl
+  ldap
+  lber
   ThriftSaslTransport
-  ${OPENSSL_LIBS}
+  openssl_ssl
+  openssl_crypto
+  crcutil
   gutil
-  glogstatic
-  gflagsstatic
-  pprofstatic
-  breakpad
-  ${HDFS_LIB}
-  ${LIBZ}
-  ${LIBBZ2}
-  ${AVRO_STATIC_LIB}
-  ${JAVA_JVM_LIBRARY}
+  glog
+  gflags
+  krb5
+  libev
+  pprof
+  breakpad_client
+  hdfs
+  zlib
+  bzip2
+  avro
+  java_jvm
   kudu_client)
 
 # Add all external dependencies. They should come after the impala libs.
@@ -396,8 +444,9 @@ endif()
 # library. The result will not compile as libhdfs.a is not compiled with -fpic. The same
 # is true for other system dependencies that we don't have control over.
 set(IMPALA_LINK_LIBS_DYNAMIC_TARGETS ${IMPALA_LINK_LIBS_NO_TCMALLOC})
-list(REMOVE_ITEM IMPALA_LINK_LIBS_DYNAMIC_TARGETS HDFS_STATIC)
-set(IMPALA_LINK_LIBS_DYNAMIC_TARGETS ${IMPALA_LINK_LIBS_DYNAMIC_TARGETS} ${HDFS_LIBRARIES})
+list(REMOVE_ITEM IMPALA_LINK_LIBS_DYNAMIC_TARGETS hdfs)
+set(IMPALA_LINK_LIBS_DYNAMIC_TARGETS ${IMPALA_LINK_LIBS_DYNAMIC_TARGETS}
+  ${HDFS_SHARED_LIB})
 
 # Link libs for test executables.  Although not all tests need all libs,
 # the build time for the tests is rather small and not worth the trouble.
@@ -469,6 +518,9 @@ add_subdirectory(src/codegen)
 add_subdirectory(src/common)
 add_subdirectory(src/exec)
 add_subdirectory(src/exprs)
+add_subdirectory(src/kudu/security)
+add_subdirectory(src/kudu/rpc)
+add_subdirectory(src/kudu/util)
 add_subdirectory(src/runtime)
 add_subdirectory(src/scheduling)
 add_subdirectory(src/statestore)

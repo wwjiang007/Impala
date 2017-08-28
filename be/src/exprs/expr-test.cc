@@ -31,11 +31,12 @@
 #include "codegen/llvm-codegen.h"
 #include "common/init.h"
 #include "common/object-pool.h"
-#include "exprs/expr-context.h"
 #include "exprs/is-null-predicate.h"
 #include "exprs/like-predicate.h"
 #include "exprs/literal.h"
 #include "exprs/null-literal.h"
+#include "exprs/scalar-expr.h"
+#include "exprs/scalar-expr-evaluator.h"
 #include "exprs/string-functions.h"
 #include "exprs/timestamp-functions.h"
 #include "exprs/timezone_db.h"
@@ -48,6 +49,7 @@
 #include "runtime/mem-tracker.h"
 #include "runtime/raw-value.inline.h"
 #include "runtime/string-value.h"
+#include "runtime/timestamp-parse-util.h"
 #include "runtime/timestamp-value.h"
 #include "service/fe-support.h"
 #include "service/impala-server.h"
@@ -276,6 +278,59 @@ class ExprTest : public testing::Test {
     return results;
   }
 
+  void TestLastDayFunction() {
+    // Test common months (with and without time component).
+    TestTimestampValue("last_day('2003-01-02 04:24:04.1579')",
+      TimestampValue::Parse("2003-01-31 00:00:00", 19));
+    TestTimestampValue("last_day('2003-02-02')",
+      TimestampValue::Parse("2003-02-28 00:00:00"));
+    TestTimestampValue("last_day('2003-03-02 03:21:12.0058')",
+      TimestampValue::Parse("2003-03-31 00:00:00"));
+    TestTimestampValue("last_day('2003-04-02')",
+      TimestampValue::Parse("2003-04-30 00:00:00"));
+    TestTimestampValue("last_day('2003-05-02')",
+      TimestampValue::Parse("2003-05-31 00:00:00"));
+    TestTimestampValue("last_day('2003-06-02')",
+      TimestampValue::Parse("2003-06-30 00:00:00"));
+    TestTimestampValue("last_day('2003-07-02 00:01:01.125')",
+      TimestampValue::Parse("2003-07-31 00:00:00"));
+    TestTimestampValue("last_day('2003-08-02')",
+      TimestampValue::Parse("2003-08-31 00:00:00"));
+    TestTimestampValue("last_day('2003-09-02')",
+      TimestampValue::Parse("2003-09-30 00:00:00"));
+    TestTimestampValue("last_day('2003-10-02')",
+      TimestampValue::Parse("2003-10-31 00:00:00"));
+    TestTimestampValue("last_day('2003-11-02 12:30:16')",
+      TimestampValue::Parse("2003-11-30 00:00:00"));
+    TestTimestampValue("last_day('2003-12-02')",
+      TimestampValue::Parse("2003-12-31 00:00:00"));
+
+    // Test leap years and special cases.
+    TestTimestampValue("last_day('2004-02-13')",
+      TimestampValue::Parse("2004-02-29 00:00:00"));
+    TestTimestampValue("last_day('2008-02-13')",
+      TimestampValue::Parse("2008-02-29 00:00:00"));
+    TestTimestampValue("last_day('2000-02-13')",
+      TimestampValue::Parse("2000-02-29 00:00:00"));
+    TestTimestampValue("last_day('1900-02-13')",
+      TimestampValue::Parse("1900-02-28 00:00:00"));
+    TestTimestampValue("last_day('2100-02-13')",
+      TimestampValue::Parse("2100-02-28 00:00:00"));
+
+    // Test corner cases.
+    TestTimestampValue("last_day('1400-01-01 00:00:00')",
+      TimestampValue::Parse("1400-01-31 00:00:00"));
+    TestTimestampValue("last_day('9999-12-31 23:59:59')",
+      TimestampValue::Parse("9999-12-31 00:00:00"));
+
+    // Test invalid input.
+    TestIsNull("last_day('12202010')", TYPE_TIMESTAMP);
+    TestIsNull("last_day('')", TYPE_TIMESTAMP);
+    TestIsNull("last_day(NULL)", TYPE_TIMESTAMP);
+    TestIsNull("last_day('02-13-2014')", TYPE_TIMESTAMP);
+    TestIsNull("last_day('00:00:00')", TYPE_TIMESTAMP);
+  }
+
   void TestNextDayFunction() {
     // Sequential test cases
     TestTimestampValue("next_day('2016-05-01','Sunday')",
@@ -439,15 +494,15 @@ class ExprTest : public testing::Test {
     switch (expected_type.GetByteSize()) {
       case 4:
         EXPECT_EQ(expected_result.value(), StringParser::StringToDecimal<int32_t>(
-            &value[0], value.size(), expected_type, &result).value()) << query;
+            value.data(), value.size(), expected_type, &result).value()) << query;
         break;
       case 8:
         EXPECT_EQ(expected_result.value(), StringParser::StringToDecimal<int64_t>(
-            &value[0], value.size(), expected_type, &result).value()) << query;
+            value.data(), value.size(), expected_type, &result).value()) << query;
         break;
       case 16:
         EXPECT_EQ(expected_result.value(), StringParser::StringToDecimal<int128_t>(
-            &value[0], value.size(), expected_type, &result).value()) << query;
+            value.data(), value.size(), expected_type, &result).value()) << query;
         break;
       default:
         EXPECT_TRUE(false) << expected_type << " " << expected_type.GetByteSize();
@@ -959,6 +1014,20 @@ class ExprTest : public testing::Test {
   template<typename T>
   TimestampValue CreateTestTimestamp(T val);
 
+  // Parse the given string representation of a value into 'val' of type T.
+  // Returns false on parse failure.
+  template<class T>
+  bool ParseString(const string& str, T* val);
+
+  // Create a Literal expression out of 'str'.
+  Literal* CreateLiteral(const ColumnType& type, const string& str);
+
+  // Helper function for LiteralConstruction test. Creates a Literal expression
+  // of 'type' from 'str' and verifies it compares equally to 'value'.
+  template <typename T>
+  void TestSingleLiteralConstruction(
+      const ColumnType& type, const T& value, const string& string_val);
+
   // Test casting stmt to all types.  Expected result is val.
   template<typename T>
   void TestCast(const string& stmt, T val, bool timestamp_out_of_range = false) {
@@ -1041,30 +1110,30 @@ bool ExprTest::ConvertValue<bool>(const string& value) {
 template <>
 int8_t ExprTest::ConvertValue<int8_t>(const string& value) {
   StringParser::ParseResult result;
-  return StringParser::StringToInt<int8_t>(&value[0], value.size(), &result);
+  return StringParser::StringToInt<int8_t>(value.data(), value.size(), &result);
 }
 
 template <>
 int16_t ExprTest::ConvertValue<int16_t>(const string& value) {
   StringParser::ParseResult result;
-  return StringParser::StringToInt<int16_t>(&value[0], value.size(), &result);
+  return StringParser::StringToInt<int16_t>(value.data(), value.size(), &result);
 }
 
 template <>
 int32_t ExprTest::ConvertValue<int32_t>(const string& value) {
   StringParser::ParseResult result;
-  return StringParser::StringToInt<int32_t>(&value[0], value.size(), &result);
+  return StringParser::StringToInt<int32_t>(value.data(), value.size(), &result);
 }
 
 template <>
 int64_t ExprTest::ConvertValue<int64_t>(const string& value) {
   StringParser::ParseResult result;
-  return StringParser::StringToInt<int64_t>(&value[0], value.size(), &result);
+  return StringParser::StringToInt<int64_t>(value.data(), value.size(), &result);
 }
 
 template <>
 TimestampValue ExprTest::ConvertValue<TimestampValue>(const string& value) {
-  return TimestampValue::Parse(&value[0], value.size());
+  return TimestampValue::Parse(value.data(), value.size());
 }
 
 // We can't put this into TestValue() because GTest can't resolve
@@ -1081,34 +1150,112 @@ void ExprTest::TestValidTimestampValue(const string& expr) {
       ConvertValue<TimestampValue>(GetValue(expr, TYPE_TIMESTAMP)).HasDateOrTime());
 }
 
+template<class T>
+bool ExprTest::ParseString(const string& str, T* val) {
+  istringstream stream(str);
+  stream >> *val;
+  return !stream.fail();
+}
+
+template<>
+bool ExprTest::ParseString(const string& str, TimestampValue* val) {
+  boost::gregorian::date date;
+  boost::posix_time::time_duration time;
+  bool success = TimestampParser::Parse(str.data(), str.length(), &date, &time);
+  val->set_date(date);
+  val->set_time(time);
+  return success;
+}
+
+Literal* ExprTest::CreateLiteral(const ColumnType& type, const string& str) {
+  switch (type.type) {
+    case TYPE_BOOLEAN: {
+      bool v = false;
+      EXPECT_TRUE(ParseString<bool>(str, &v));
+      return new Literal(type, v);
+    }
+    case TYPE_TINYINT: {
+      int8_t v = 0;
+      EXPECT_TRUE(ParseString<int8_t>(str, &v));
+      return new Literal(type, v);
+    }
+    case TYPE_SMALLINT: {
+      int16_t v = 0;
+      EXPECT_TRUE(ParseString<int16_t>(str, &v));
+      return new Literal(type, v);
+    }
+    case TYPE_INT: {
+      int32_t v = 0;
+      EXPECT_TRUE(ParseString<int32_t>(str, &v));
+      return new Literal(type, v);
+    }
+    case TYPE_BIGINT: {
+      int64_t v = 0;
+      EXPECT_TRUE(ParseString<int64_t>(str, &v));
+      return new Literal(type, v);
+    }
+    case TYPE_FLOAT: {
+      float v = 0;
+      EXPECT_TRUE(ParseString<float>(str, &v));
+      return new Literal(type, v);
+    }
+    case TYPE_DOUBLE: {
+      double v = 0;
+      EXPECT_TRUE(ParseString<double>(str, &v));
+      return new Literal(type, v);
+    }
+    case TYPE_STRING:
+    case TYPE_VARCHAR:
+    case TYPE_CHAR:
+      return new Literal(type, str);
+    case TYPE_TIMESTAMP: {
+      TimestampValue v;
+      EXPECT_TRUE(ParseString<TimestampValue>(str, &v));
+      return new Literal(type, v);
+    }
+    case TYPE_DECIMAL: {
+      double v = 0;
+      EXPECT_TRUE(ParseString<double>(str, &v));
+      return new Literal(type, v);
+    }
+    default:
+      DCHECK(false) << "Invalid type: " << type.DebugString();
+      return nullptr;
+  }
+}
+
 template <typename T>
-void TestSingleLiteralConstruction(
+void ExprTest::TestSingleLiteralConstruction(
     const ColumnType& type, const T& value, const string& string_val) {
   ObjectPool pool;
-  RowDescriptor desc;
   RuntimeState state(TQueryCtx(), ExecEnv::GetInstance());
   MemTracker tracker;
+  MemPool mem_pool(&tracker);
 
-  Expr* expr = pool.Add(new Literal(type, value));
-  ExprContext ctx(expr);
-  EXPECT_OK(ctx.Prepare(&state, desc, &tracker));
-  EXPECT_OK(ctx.Open(&state));
-  EXPECT_EQ(0, RawValue::Compare(ctx.GetValue(NULL), &value, type))
+  Literal* expr = CreateLiteral(type, string_val);
+  ScalarExprEvaluator* eval;
+  EXPECT_OK(ScalarExprEvaluator::Create(*expr, &state, &pool, &mem_pool, &eval));
+  EXPECT_OK(eval->Open(&state));
+  EXPECT_EQ(0, RawValue::Compare(eval->GetValue(nullptr), &value, type))
       << "type: " << type << ", value: " << value;
-  ctx.Close(&state);
+  eval->Close(&state);
+  expr->Close();
   state.ReleaseResources();
 }
 
 TEST_F(ExprTest, NullLiteral) {
   for (int type = TYPE_BOOLEAN; type != TYPE_DATE; ++type) {
-    NullLiteral expr(static_cast<PrimitiveType>(type));
-    ExprContext ctx(&expr);
     RuntimeState state(TQueryCtx(), ExecEnv::GetInstance());
+    ObjectPool pool;
     MemTracker tracker;
-    EXPECT_OK(ctx.Prepare(&state, RowDescriptor(), &tracker));
-    EXPECT_OK(ctx.Open(&state));
-    EXPECT_TRUE(ctx.GetValue(NULL) == NULL);
-    ctx.Close(&state);
+    MemPool mem_pool(&tracker);
+
+    NullLiteral expr(static_cast<PrimitiveType>(type));
+    ScalarExprEvaluator* eval;
+    EXPECT_OK(ScalarExprEvaluator::Create(expr, &state, &pool, &mem_pool, &eval));
+    EXPECT_OK(eval->Open(&state));
+    EXPECT_TRUE(eval->GetValue(nullptr) == nullptr);
+    eval->Close(&state);
     state.ReleaseResources();
   }
 }
@@ -3168,10 +3315,12 @@ TEST_F(ExprTest, StringFunctions) {
       "                                                                             "
       "                        ", ColumnType::CreateCharType(255));
 
+  /*
   TestCharValue("CASE cast('1.1' as char(3)) when cast('1.1' as char(3)) then "
       "cast('1' as char(1)) when cast('2.22' as char(4)) then "
       "cast('2' as char(1)) else cast('3' as char(1)) end", "1",
       ColumnType::CreateCharType(3));
+  */
 
   // Test maximum VARCHAR value
   char query[ColumnType::MAX_VARCHAR_LENGTH + 1024];
@@ -3182,9 +3331,9 @@ TEST_F(ExprTest, StringFunctions) {
   big_str[ColumnType::MAX_VARCHAR_LENGTH] = '\0';
   sprintf(query, "cast('%sxxx' as VARCHAR(%d))", big_str, ColumnType::MAX_VARCHAR_LENGTH);
   TestStringValue(query, big_str);
+}
 
-  // base64{en,de}code
-
+TEST_F(ExprTest, StringBase64Coding) {
   // Test some known values of base64{en,de}code
   TestIsNull("base64encode(NULL)", TYPE_STRING);
   TestIsNull("base64decode(NULL)", TYPE_STRING);
@@ -3199,12 +3348,12 @@ TEST_F(ExprTest, StringFunctions) {
 
   // Test random short strings.
   srand(0);
-  for (int length = 1; length < 100; ++length) {
+  // Pick some 'interesting' (i.e. random, but include some powers of two, some primes,
+  // and edge-cases) lengths to test.
+  for (int length: {1, 2, 3, 5, 8, 32, 42, 50, 64, 71, 89, 99}) {
     for (int iteration = 0; iteration < 10; ++iteration) {
       string raw(length, ' ');
-      for (int j = 0; j < length; ++j) {
-        raw[j] = rand() % 128;
-      }
+      for (int j = 0; j < length; ++j) raw[j] = rand() % 128;
       const string as_octal = StringToOctalLiteral(raw);
       TestValue("length(base64encode('" + as_octal + "')) > length('" + as_octal + "')",
           TYPE_BOOLEAN, true);
@@ -3217,7 +3366,9 @@ TEST_F(ExprTest, StringFunctions) {
 TEST_F(ExprTest, LongReverse) {
   static const int MAX_LEN = 2048;
   string to_reverse(MAX_LEN, ' '), reversed(MAX_LEN, ' ');
-  for (int i = 0; i < MAX_LEN; ++i) {
+  // Pick some 'interesting' (i.e. random, but include some powers of two, some primes,
+  // and edge-cases) lengths to test.
+  for (int i: {1, 2, 3, 5, 8, 32, 42, 512, 1024, 1357, 1788, 2012, 2047}) {
     to_reverse[i] = reversed[MAX_LEN - 1 - i] = 'a' + (rand() % 26);
     TestStringValue("reverse('" + to_reverse.substr(0, i + 1) + "')",
         reversed.substr(MAX_LEN - 1 - i));
@@ -3715,6 +3866,7 @@ TEST_F(ExprTest, UtilityFunctions) {
   TestStringValue("typeOf(cast(10 as DOUBLE))", "DOUBLE");
   TestStringValue("typeOf(current_database())", "STRING");
   TestStringValue("typeOf(now())", "TIMESTAMP");
+  TestStringValue("typeOf(utc_timestamp())", "TIMESTAMP");
   TestStringValue("typeOf(cast(10 as DECIMAL))", "DECIMAL(9,0)");
   TestStringValue("typeOf(0.0)", "DECIMAL(1,1)");
   TestStringValue("typeOf(3.14)", "DECIMAL(3,2)");
@@ -3775,7 +3927,7 @@ TEST_F(ExprTest, SessionFunctions) {
 
   map<Session, map<Query, string>> results;
   for (Session session: {S1, S2}) {
-    executor_->Setup(); // Starts new session
+    ASSERT_OK(executor_->Setup()); // Starts new session
     results[session][Q1] = GetValue("current_session()", TYPE_STRING);
     results[session][Q2] = GetValue("current_sid()", TYPE_STRING);
   }
@@ -5080,6 +5232,7 @@ TEST_F(ExprTest, TimestampFunctions) {
 
   // Test functions with unknown expected value.
   TestValidTimestampValue("now()");
+  TestValidTimestampValue("utc_timestamp()");
   TestValidTimestampValue("current_timestamp()");
   TestValidTimestampValue("cast(unix_timestamp() as timestamp)");
 
@@ -5115,6 +5268,10 @@ TEST_F(ExprTest, TimestampFunctions) {
   timestamp_result = ConvertValue<TimestampValue>(GetValue("current_timestamp()",
       TYPE_TIMESTAMP));
   EXPECT_BETWEEN(start_time, timestamp_result, TimestampValue::LocalTime());
+  const TimestampValue utc_start_time = TimestampValue::UtcTime();
+  timestamp_result = ConvertValue<TimestampValue>(GetValue("utc_timestamp()",
+      TYPE_TIMESTAMP));
+  EXPECT_BETWEEN(utc_start_time, timestamp_result, TimestampValue::UtcTime());
   // UNIX_TIMESTAMP() has second precision so the comparison start time is shifted back
   // a second to ensure an earlier value.
   unix_start_time =
@@ -5123,6 +5280,31 @@ TEST_F(ExprTest, TimestampFunctions) {
       "cast(unix_timestamp() as timestamp)", TYPE_TIMESTAMP));
   EXPECT_BETWEEN(TimestampValue::FromUnixTime(unix_start_time - 1), timestamp_result,
       TimestampValue::LocalTime());
+
+  // Test that UTC and local time represent the same point in time
+  {
+    const string stmt = "select now(), utc_timestamp()";
+    vector<FieldSchema> result_types;
+    Status status = executor_->Exec(stmt, &result_types);
+    EXPECT_TRUE(status.ok()) << "stmt: " << stmt << "\nerror: " << status.GetDetail();
+    DCHECK(result_types.size() == 2);
+    EXPECT_EQ(TypeToOdbcString(TYPE_TIMESTAMP), result_types[0].type)
+        << "invalid type returned by now()";
+    EXPECT_EQ(TypeToOdbcString(TYPE_TIMESTAMP), result_types[1].type)
+        << "invalid type returned by utc_timestamp()";
+    string result_row;
+    status = executor_->FetchResult(&result_row);
+    EXPECT_TRUE(status.ok()) << "stmt: " << stmt << "\nerror: " << status.GetDetail();
+    vector<string> result_cols;
+    boost::split(result_cols, result_row, boost::is_any_of("\t"));
+    // To ensure this fails if columns are not tab separated
+    DCHECK(result_cols.size() == 2);
+    const TimestampValue local_time = ConvertValue<TimestampValue>(result_cols[0]);
+    const TimestampValue utc_timestamp = ConvertValue<TimestampValue>(result_cols[1]);
+    TimestampValue utc_converted_to_local(utc_timestamp);
+    utc_converted_to_local.UtcToLocal();
+    EXPECT_EQ(utc_converted_to_local, local_time);
+  }
 
   // Test alias
   TestValue("now() = current_timestamp()", TYPE_BOOLEAN, true);
@@ -5608,6 +5790,9 @@ TEST_F(ExprTest, TimestampFunctions) {
 
   // next_day udf test for IMPALA-2459
   TestNextDayFunction();
+
+  // last_day udf test for IMPALA-5316
+  TestLastDayFunction();
 }
 
 TEST_F(ExprTest, ConditionalFunctions) {
@@ -5627,6 +5812,24 @@ TEST_F(ExprTest, ConditionalFunctions) {
       "cast('1999-06-14 19:07:25' as timestamp))", then_val);
   TestTimestampValue("if(FALSE, cast('2011-01-01 09:01:01' as timestamp), "
       "cast('1999-06-14 19:07:25' as timestamp))", else_val);
+
+  // Test nvl2(), which is rewritten to if() before analysis.
+  // Returns 2nd arg if 1st arg is not NULL, otherwise it returns 3rd arg.
+  // Output of nvl2(x,y,z) should be identical to one of if(x is not null,y,z).
+  TestValue("nvl2(now(), FALSE, TRUE)", TYPE_BOOLEAN, false);
+  TestValue("nvl2(NULL, FALSE, TRUE)", TYPE_BOOLEAN, true);
+  TestValue("nvl2(now(), 10, 20)", TYPE_TINYINT, 10);
+  TestValue("nvl2(NULL, 10, 20)", TYPE_TINYINT, 20);
+  TestValue("nvl2(TRUE, cast(5.5 as double), cast(8.8 as double))", TYPE_DOUBLE, 5.5);
+  TestValue("nvl2(NULL, cast(5.5 as double), cast(8.8 as double))", TYPE_DOUBLE, 8.8);
+  TestStringValue("nvl2('some string', 'abc', 'defgh')", "abc");
+  TestStringValue("nvl2(NULL, 'abc', 'defgh')", "defgh");
+  TimestampValue first_val = TimestampValue::FromUnixTime(1293872461);
+  TimestampValue second_val = TimestampValue::FromUnixTime(929387245);
+  TestTimestampValue("nvl2(FALSE, cast('2011-01-01 09:01:01' as timestamp), "
+      "cast('1999-06-14 19:07:25' as timestamp))", first_val);
+  TestTimestampValue("nvl2(NULL, cast('2011-01-01 09:01:01' as timestamp), "
+      "cast('1999-06-14 19:07:25' as timestamp))", second_val);
 
   // Test nullif(). Return NULL if lhs equals rhs, lhs otherwise.
   TestIsNull("nullif(NULL, NULL)", TYPE_BOOLEAN);
@@ -5977,13 +6180,13 @@ TEST_F(ExprTest, ConditionalFunctionIsNotFalse) {
 //   - expected_var_begin: byte offset where variable length types begin
 //   - expected_offsets: mapping of byte sizes to a set valid offsets
 //     exprs that have the same byte size can end up in a number of locations
-void ValidateLayout(const vector<Expr*>& exprs, int expected_byte_size,
+void ValidateLayout(const vector<ScalarExpr*>& exprs, int expected_byte_size,
     int expected_var_begin, const map<int, set<int>>& expected_offsets) {
   vector<int> offsets;
   set<int> offsets_found;
 
   int var_begin;
-  int byte_size = Expr::ComputeResultsLayout(exprs, &offsets, &var_begin);
+  int byte_size = ScalarExpr::ComputeResultsLayout(exprs, &offsets, &var_begin);
 
   EXPECT_EQ(expected_byte_size, byte_size);
   EXPECT_EQ(expected_var_begin, var_begin);
@@ -6008,7 +6211,7 @@ void ValidateLayout(const vector<Expr*>& exprs, int expected_byte_size,
 TEST_F(ExprTest, ResultsLayoutTest) {
   ObjectPool pool;
 
-  vector<Expr*> exprs;
+  vector<ScalarExpr*> exprs;
   map<int, set<int>> expected_offsets;
 
   // Test empty exprs
@@ -6048,9 +6251,9 @@ TEST_F(ExprTest, ResultsLayoutTest) {
     // With one expr, all offsets should be 0.
     expected_offsets[t.GetByteSize()] = set<int>({0});
     if (t.type != TYPE_TIMESTAMP) {
-      exprs.push_back(pool.Add(Literal::CreateLiteral(t, "0")));
+      exprs.push_back(pool.Add(CreateLiteral(t, "0")));
     } else {
-      exprs.push_back(pool.Add(Literal::CreateLiteral(t, "2016-11-09")));
+      exprs.push_back(pool.Add(CreateLiteral(t, "2016-11-09")));
     }
     if (t.IsVarLenStringType()) {
       ValidateLayout(exprs, 16, 0, expected_offsets);
@@ -6066,28 +6269,28 @@ TEST_F(ExprTest, ResultsLayoutTest) {
 
   // Test layout adding a bunch of exprs.  This is designed to trigger padding.
   // The expected result is computed along the way
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_BOOLEAN, "0")));
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_TINYINT, "0")));
-  exprs.push_back(pool.Add(Literal::CreateLiteral(ColumnType::CreateCharType(1), "0")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_BOOLEAN, "0")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_TINYINT, "0")));
+  exprs.push_back(pool.Add(CreateLiteral(ColumnType::CreateCharType(1), "0")));
   expected_offsets[1].insert(expected_byte_size);
   expected_offsets[1].insert(expected_byte_size + 1);
   expected_offsets[1].insert(expected_byte_size + 2);
   expected_byte_size += 3 * 1 + 1;  // 1 byte of padding
 
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_SMALLINT, "0")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_SMALLINT, "0")));
   expected_offsets[2].insert(expected_byte_size);
   expected_byte_size += 2; // No padding before CHAR
 
-  exprs.push_back(pool.Add(Literal::CreateLiteral(ColumnType::CreateCharType(3), "0")));
+  exprs.push_back(pool.Add(CreateLiteral(ColumnType::CreateCharType(3), "0")));
   expected_offsets[3].insert(expected_byte_size);
   expected_byte_size += 3 + 3; // 3 byte of padding
   ASSERT_EQ(expected_byte_size % 4, 0);
 
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_INT, "0")));
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_FLOAT, "0")));
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_FLOAT, "0")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_INT, "0")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_FLOAT, "0")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_FLOAT, "0")));
   exprs.push_back(pool.Add(
-      Literal::CreateLiteral(ColumnType::CreateDecimalType(9, 0), "0")));
+      CreateLiteral(ColumnType::CreateDecimalType(9, 0), "0")));
   expected_offsets[4].insert(expected_byte_size);
   expected_offsets[4].insert(expected_byte_size + 4);
   expected_offsets[4].insert(expected_byte_size + 8);
@@ -6095,12 +6298,12 @@ TEST_F(ExprTest, ResultsLayoutTest) {
   expected_byte_size += 4 * 4 + 4;  // 4 bytes of padding
   ASSERT_EQ(expected_byte_size % 8, 0);
 
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_BIGINT, "0")));
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_BIGINT, "0")));
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_BIGINT, "0")));
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_DOUBLE, "0")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_BIGINT, "0")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_BIGINT, "0")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_BIGINT, "0")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_DOUBLE, "0")));
   exprs.push_back(pool.Add(
-      Literal::CreateLiteral(ColumnType::CreateDecimalType(18, 0), "0")));
+      CreateLiteral(ColumnType::CreateDecimalType(18, 0), "0")));
   expected_offsets[8].insert(expected_byte_size);
   expected_offsets[8].insert(expected_byte_size + 8);
   expected_offsets[8].insert(expected_byte_size + 16);
@@ -6109,20 +6312,20 @@ TEST_F(ExprTest, ResultsLayoutTest) {
   expected_byte_size += 5 * 8;      // No more padding
   ASSERT_EQ(expected_byte_size % 8, 0);
 
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_TIMESTAMP, "2016-11-09")));
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_TIMESTAMP, "2016-11-09")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_TIMESTAMP, "2016-11-09")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_TIMESTAMP, "2016-11-09")));
   exprs.push_back(pool.Add(
-      Literal::CreateLiteral(ColumnType::CreateDecimalType(20, 0), "0")));
+      CreateLiteral(ColumnType::CreateDecimalType(20, 0), "0")));
   expected_offsets[16].insert(expected_byte_size);
   expected_offsets[16].insert(expected_byte_size + 16);
   expected_offsets[16].insert(expected_byte_size + 32);
   expected_byte_size += 3 * 16;
   ASSERT_EQ(expected_byte_size % 8, 0);
 
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_STRING, "0")));
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_STRING, "0")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_STRING, "0")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_STRING, "0")));
   exprs.push_back(pool.Add(
-      Literal::CreateLiteral(ColumnType::CreateVarcharType(1), "0")));
+      CreateLiteral(ColumnType::CreateVarcharType(1), "0")));
   expected_offsets[0].insert(expected_byte_size);
   expected_offsets[0].insert(expected_byte_size + 16);
   expected_offsets[0].insert(expected_byte_size + 32);
@@ -7104,7 +7307,7 @@ int main(int argc, char **argv) {
   InitCommonRuntime(argc, argv, true, TestInfo::BE_TEST);
   ABORT_IF_ERROR(TimezoneDatabase::Initialize());
   InitFeSupport(false);
-  impala::LlvmCodeGen::InitializeLlvm();
+  ABORT_IF_ERROR(impala::LlvmCodeGen::InitializeLlvm());
 
   // Disable llvm optimization passes if the env var is no set to true. Running without
   // the optimizations makes the tests run much faster.
@@ -7122,7 +7325,9 @@ int main(int argc, char **argv) {
   FLAGS_abort_on_config_error = false;
   VLOG_CONNECTION << "creating test env";
   VLOG_CONNECTION << "starting backends";
-  InProcessImpalaServer* impala_server = InProcessImpalaServer::StartWithEphemeralPorts();
+  InProcessStatestore* ips = InProcessStatestore::StartWithEphemeralPorts();
+  InProcessImpalaServer* impala_server =
+      InProcessImpalaServer::StartWithEphemeralPorts("localhost", ips->port());
   executor_ = new ImpaladQueryExecutor(impala_server->hostname(),
       impala_server->beeswax_port());
   ABORT_IF_ERROR(executor_->Setup());
@@ -7145,6 +7350,7 @@ int main(int argc, char **argv) {
   executor_->PushExecOption("ENABLE_EXPR_REWRITES=0");
   executor_->PushExecOption("DISABLE_CODEGEN=0");
   executor_->PushExecOption("EXEC_SINGLE_NODE_ROWS_THRESHOLD=0");
+  executor_->PushExecOption("DISABLE_CODEGEN_ROWS_THRESHOLD=0");
   cout << endl << "Running with codegen" << endl;
   ret = RUN_ALL_TESTS();
   if (ret != 0) return ret;

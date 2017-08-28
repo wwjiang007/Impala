@@ -21,7 +21,13 @@
 // a main()), or flags that are referenced from multiple places and having them here
 // calms the linker errors that would otherwise ensue.
 
+#include <string>
+
+#include "common/constant-strings.h"
 #include "common/logging.h"
+#include "gutil/strings/substitute.h"
+
+#include "common/names.h"
 
 // This will be defaulted to the host name returned by the OS.
 // This name is used in the principal generated for Kerberos authorization.
@@ -41,10 +47,24 @@ DEFINE_string(krb5_conf, "", "Absolute path to Kerberos krb5.conf if in a non-st
     "location. Does not normally need to be set.");
 DEFINE_string(krb5_debug_file, "", "Turn on Kerberos debugging and output to this file");
 
-DEFINE_string(mem_limit, "80%", "Process memory limit specified as number of bytes "
-              "('<int>[bB]?'), megabytes ('<float>[mM]'), gigabytes ('<float>[gG]'), "
-              "or percentage of the physical memory ('<int>%'). "
-              "Defaults to bytes if no unit is given");
+static const string mem_limit_help_msg = "Limit on process memory consumption, "
+    "excluding the JVM's memory consumption. "
+    + Substitute(MEM_UNITS_HELP_MSG, "the physical memory");
+DEFINE_string(mem_limit, "80%",  mem_limit_help_msg.c_str());
+
+static const string buffer_pool_limit_help_msg = "(Advanced) Limit on buffer pool size. "
+     + Substitute(MEM_UNITS_HELP_MSG, "the process memory limit") + " "
+    "The default value and behaviour of this flag may change between releases.";
+DEFINE_string(buffer_pool_limit, "80%", buffer_pool_limit_help_msg.c_str());
+
+static const string buffer_pool_clean_pages_limit_help_msg = "(Advanced) Limit on bytes "
+    "of clean pages that will be accumulated in the buffer pool. "
+     + Substitute(MEM_UNITS_HELP_MSG, "the buffer pool limit") + ".";
+DEFINE_string(buffer_pool_clean_pages_limit, "10%",
+    buffer_pool_clean_pages_limit_help_msg.c_str());
+
+DEFINE_int64(min_buffer_size, 64 * 1024,
+    "(Advanced) The minimum buffer size to use in the buffer pool");
 
 DEFINE_bool(enable_process_lifetime_heap_profiling, false, "(Advanced) Enables heap "
     "profiling for the lifetime of the process. Profile output will be stored in the "
@@ -69,6 +89,9 @@ DEFINE_string(redaction_rules_file, "", "Absolute path to sensitive data redacti
     "rules. The rules will be applied to all log messages and query text shown in the "
     "Web UI and audit records. Query results will not be affected. Refer to the "
     "documentation for the rule file format.");
+
+DEFINE_bool(enable_minidumps, true, "Whether to enable minidump generation upon process "
+    "crash or SIGUSR1.");
 
 DEFINE_string(minidump_path, "minidumps", "Directory to write minidump files to. This "
     "can be either an absolute path or a path relative to log_dir. Each daemon will "
@@ -106,6 +129,9 @@ DEFINE_int32(fault_injection_rpc_delay_ms, 0, "A fault injection option that cau
     "Effective in debug builds only.");
 DEFINE_int32(fault_injection_rpc_type, 0, "A fault injection option that specifies "
     "which rpc call will be injected with the delay. Effective in debug builds only.");
+DEFINE_int32(fault_injection_rpc_exception_type, 0, "A fault injection option that "
+    "specifies the exception to be thrown in the caller side of an RPC call. Effective "
+    "in debug builds only");
 DEFINE_int32(stress_scratch_write_delay_ms, 0, "A stress option which causes writes to "
     "scratch files to be to be delayed to simulate slow writes.");
 #endif
@@ -135,3 +161,12 @@ DEFINE_int64(inc_stats_size_limit_bytes, 200 * (1LL<<20), "Maximum size of "
 DEFINE_bool(enable_stats_extrapolation, false,
     "If true, uses table statistics computed with COMPUTE STATS "
     "to extrapolate the row counts of partitions.");
+
+DEFINE_string(log_filename, "",
+    "Prefix of log filename - "
+    "full path is <log_dir>/<log_filename>.[INFO|WARN|ERROR|FATAL]");
+DEFINE_bool(redirect_stdout_stderr, true,
+    "If true, redirects stdout/stderr to INFO/ERROR log.");
+DEFINE_int32(max_log_files, 10, "Maximum number of log files to retain per severity "
+    "level. The most recent log files are retained. If set to 0, all log files are "
+    "retained.");

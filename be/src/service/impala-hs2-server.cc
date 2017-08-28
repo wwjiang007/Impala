@@ -33,7 +33,6 @@
 
 #include "common/logging.h"
 #include "common/version.h"
-#include "exprs/expr.h"
 #include "rpc/thrift-util.h"
 #include "runtime/raw-value.h"
 #include "runtime/exec-env.h"
@@ -41,6 +40,7 @@
 #include "service/client-request-state.h"
 #include "service/query-options.h"
 #include "service/query-result-set.h"
+#include "util/auth-util.h"
 #include "util/debug-util.h"
 #include "util/impalad-metrics.h"
 #include "util/runtime-profile-counters.h"
@@ -124,7 +124,8 @@ void ImpalaServer::ExecuteMetadataOp(const THandleIdentifier& session_handle,
 
   if (session == NULL) {
     status->__set_statusCode(thrift::TStatusCode::ERROR_STATUS);
-    status->__set_errorMessage("Invalid session ID");
+    status->__set_errorMessage(Substitute("Invalid session id: $0",
+        PrintId(session_id)));
     status->__set_sqlState(SQLSTATE_GENERAL_ERROR);
     return;
   }
@@ -153,7 +154,7 @@ void ImpalaServer::ExecuteMetadataOp(const THandleIdentifier& session_handle,
 
   Status exec_status = request_state->Exec(*request);
   if (!exec_status.ok()) {
-    (void) UnregisterQuery(request_state->query_id(), false, &exec_status);
+    discard_result(UnregisterQuery(request_state->query_id(), false, &exec_status));
     status->__set_statusCode(thrift::TStatusCode::ERROR_STATUS);
     status->__set_errorMessage(exec_status.GetDetail());
     status->__set_sqlState(SQLSTATE_GENERAL_ERROR);
@@ -164,7 +165,7 @@ void ImpalaServer::ExecuteMetadataOp(const THandleIdentifier& session_handle,
 
   Status inflight_status = SetQueryInflight(session, request_state);
   if (!inflight_status.ok()) {
-    (void) UnregisterQuery(request_state->query_id(), false, &inflight_status);
+    discard_result(UnregisterQuery(request_state->query_id(), false, &inflight_status));
     status->__set_statusCode(thrift::TStatusCode::ERROR_STATUS);
     status->__set_errorMessage(inflight_status.GetDetail());
     status->__set_sqlState(SQLSTATE_GENERAL_ERROR);
@@ -339,8 +340,8 @@ void ImpalaServer::OpenSession(TOpenSessionResp& return_val,
       } else {
         // Normal configuration key. Use it to set session default query options.
         // Ignore failure (failures will be logged in SetQueryOption()).
-        SetQueryOption(v.first, v.second, &state->default_query_options,
-            &state->set_query_options_mask);
+        discard_result(SetQueryOption(v.first, v.second, &state->default_query_options,
+            &state->set_query_options_mask));
       }
     }
   }
@@ -432,7 +433,8 @@ void ImpalaServer::ExecuteStatement(TExecuteStatementResp& return_val,
       SQLSTATE_GENERAL_ERROR);
   if (session == NULL) {
     HS2_RETURN_IF_ERROR(
-        return_val, Status("Invalid session ID"), SQLSTATE_GENERAL_ERROR);
+        return_val, Status(Substitute("Invalid session id: $0",
+            PrintId(session_id))), SQLSTATE_GENERAL_ERROR);
   }
 
   // Optionally enable result caching to allow restarting fetches.
@@ -463,7 +465,7 @@ void ImpalaServer::ExecuteStatement(TExecuteStatementResp& return_val,
             session->hs2_version, *request_state->result_metadata(), nullptr),
         cache_num_rows);
     if (!status.ok()) {
-      (void) UnregisterQuery(request_state->query_id(), false, &status);
+      discard_result(UnregisterQuery(request_state->query_id(), false, &status));
       HS2_RETURN_ERROR(return_val, status.GetDetail(), SQLSTATE_GENERAL_ERROR);
     }
   }
@@ -474,7 +476,7 @@ void ImpalaServer::ExecuteStatement(TExecuteStatementResp& return_val,
   // set of in-flight queries.
   status = SetQueryInflight(session, request_state);
   if (!status.ok()) {
-    (void) UnregisterQuery(request_state->query_id(), false, &status);
+    discard_result(UnregisterQuery(request_state->query_id(), false, &status));
     HS2_RETURN_ERROR(return_val, status.GetDetail(), SQLSTATE_GENERAL_ERROR);
   }
   return_val.__isset.operationHandle = true;
@@ -793,7 +795,7 @@ void ImpalaServer::FetchResults(TFetchResultsResp& return_val,
     if (status.IsRecoverableError()) {
       DCHECK(fetch_first);
     } else {
-      (void) UnregisterQuery(query_id, false, &status);
+      discard_result(UnregisterQuery(query_id, false, &status));
     }
     HS2_RETURN_ERROR(return_val, status.GetDetail(), SQLSTATE_GENERAL_ERROR);
   }
@@ -845,13 +847,17 @@ void ImpalaServer::GetExecSummary(TGetExecSummaryResp& return_val,
   shared_ptr<SessionState> session;
   HS2_RETURN_IF_ERROR(return_val, session_handle.WithSession(session_id, &session),
       SQLSTATE_GENERAL_ERROR);
+  if (session == NULL) {
+    HS2_RETURN_ERROR(return_val, Substitute("Invalid session id: $0",
+        PrintId(session_id)), SQLSTATE_GENERAL_ERROR);
+  }
 
   TUniqueId query_id;
   HS2_RETURN_IF_ERROR(return_val, THandleIdentifierToTUniqueId(
       request.operationHandle.operationId, &query_id, &secret), SQLSTATE_GENERAL_ERROR);
 
   TExecSummary summary;
-  Status status = GetExecSummary(query_id, &summary);
+  Status status = GetExecSummary(query_id, GetEffectiveUser(*session), &summary);
   HS2_RETURN_IF_ERROR(return_val, status, SQLSTATE_GENERAL_ERROR);
   return_val.__set_summary(summary);
   return_val.status.__set_statusCode(thrift::TStatusCode::SUCCESS_STATUS);
@@ -867,14 +873,18 @@ void ImpalaServer::GetRuntimeProfile(TGetRuntimeProfileResp& return_val,
   shared_ptr<SessionState> session;
   HS2_RETURN_IF_ERROR(return_val, session_handle.WithSession(session_id, &session),
       SQLSTATE_GENERAL_ERROR);
+  if (session == NULL) {
+    HS2_RETURN_ERROR(return_val, Substitute("Invalid session id: $0",
+        PrintId(session_id)), SQLSTATE_GENERAL_ERROR);
+  }
 
   TUniqueId query_id;
   HS2_RETURN_IF_ERROR(return_val, THandleIdentifierToTUniqueId(
       request.operationHandle.operationId, &query_id, &secret), SQLSTATE_GENERAL_ERROR);
 
   stringstream ss;
-  HS2_RETURN_IF_ERROR(return_val, GetRuntimeProfileStr(query_id, false, &ss),
-      SQLSTATE_GENERAL_ERROR);
+  HS2_RETURN_IF_ERROR(return_val, GetRuntimeProfileStr(query_id,
+      GetEffectiveUser(*session), false, &ss), SQLSTATE_GENERAL_ERROR);
   return_val.__set_profile(ss.str());
   return_val.status.__set_statusCode(thrift::TStatusCode::SUCCESS_STATUS);
 }

@@ -17,6 +17,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <numeric>
 
 #include <boost/filesystem.hpp>
 #include <boost/scoped_ptr.hpp>
@@ -145,6 +146,12 @@ class TmpFileMgrTest : public ::testing::Test {
     return bytes_allocated;
   }
 
+  /// Helpers to call WriteHandle methods.
+  void Cancel(TmpFileMgr::WriteHandle* handle) { handle->Cancel(); }
+  void WaitForWrite(TmpFileMgr::WriteHandle* handle) {
+    handle->WaitForWrite();
+  }
+
   // Write callback, which signals 'cb_cv_' and increments 'cb_counter_'.
   void SignalCallback(Status write_status) {
     {
@@ -233,7 +240,7 @@ TEST_F(TmpFileMgrTest, TestOneDirPerDevice) {
   TmpFileMgr::File* file = files[0];
   // Check the prefix is the expected temporary directory.
   EXPECT_EQ(0, file->path().find(tmp_dirs[0]));
-  FileSystemUtil::RemovePaths(tmp_dirs);
+  ASSERT_OK(FileSystemUtil::RemovePaths(tmp_dirs));
   file_group.Close();
   CheckMetrics(&tmp_file_mgr);
 }
@@ -260,7 +267,7 @@ TEST_F(TmpFileMgrTest, TestMultiDirsPerDevice) {
     // Check the prefix is the expected temporary directory.
     EXPECT_EQ(0, files[i]->path().find(tmp_dirs[i]));
   }
-  FileSystemUtil::RemovePaths(tmp_dirs);
+  ASSERT_OK(FileSystemUtil::RemovePaths(tmp_dirs));
   file_group.Close();
   CheckMetrics(&tmp_file_mgr);
 }
@@ -306,7 +313,7 @@ TEST_F(TmpFileMgrTest, TestReportError) {
   // Attempts to allocate new files on bad device should succeed.
   unique_ptr<TmpFileMgr::File> bad_file2;
   ASSERT_OK(NewFile(&tmp_file_mgr, &file_group, bad_device, &bad_file2));
-  FileSystemUtil::RemovePaths(tmp_dirs);
+  ASSERT_OK(FileSystemUtil::RemovePaths(tmp_dirs));
   file_group.Close();
   CheckMetrics(&tmp_file_mgr);
 }
@@ -337,7 +344,7 @@ TEST_F(TmpFileMgrTest, TestAllocateNonWritable) {
   ASSERT_OK(FileAllocateSpace(allocated_files[1], 1, &offset));
 
   chmod(scratch_subdirs[0].c_str(), S_IRWXU);
-  FileSystemUtil::RemovePaths(tmp_dirs);
+  ASSERT_OK(FileSystemUtil::RemovePaths(tmp_dirs));
   file_group.Close();
 }
 
@@ -470,7 +477,7 @@ TEST_F(TmpFileMgrTest, TestEncryptionDuringCancellation) {
   // Write out a string repeatedly. We don't want to see this written unencypted to disk.
   string plaintext("the quick brown fox jumped over the lazy dog");
   for (int pos = 0; pos + plaintext.size() < DATA_SIZE; pos += plaintext.size()) {
-    memcpy(&data[pos], &plaintext[0], plaintext.size());
+    memcpy(&data[pos], plaintext.data(), plaintext.size());
   }
 
   // Start a write in flight, which should encrypt the data and write it to disk.
@@ -481,8 +488,8 @@ TEST_F(TmpFileMgrTest, TestEncryptionDuringCancellation) {
   string file_path = handle->TmpFilePath();
 
   // Cancel the write - prior to the IMPALA-4820 fix decryption could race with the write.
-  handle->Cancel();
-  handle->WaitForWrite();
+  Cancel(handle.get());
+  WaitForWrite(handle.get());
   ASSERT_OK(file_group.RestoreData(move(handle), data_mem_range));
   WaitForCallbacks(1);
 
@@ -490,7 +497,7 @@ TEST_F(TmpFileMgrTest, TestEncryptionDuringCancellation) {
   FILE* file = fopen(file_path.c_str(), "r");
   ASSERT_EQ(DATA_SIZE, fread(&data[0], 1, DATA_SIZE, file));
   for (int pos = 0; pos + plaintext.size() < DATA_SIZE; pos += plaintext.size()) {
-    ASSERT_NE(0, memcmp(&data[pos], &plaintext[0], plaintext.size()))
+    ASSERT_NE(0, memcmp(&data[pos], plaintext.data(), plaintext.size()))
         << file_path << "@" << pos;
   }
   fclose(file);

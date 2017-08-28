@@ -17,6 +17,8 @@
 
 #include "exec/hdfs-text-scanner.h"
 
+#include <memory>
+
 #include "codegen/llvm-codegen.h"
 #include "exec/delimited-text-parser.h"
 #include "exec/delimited-text-parser.inline.h"
@@ -64,7 +66,6 @@ HdfsTextScanner::HdfsTextScanner(HdfsScanNodeBase* scan_node, RuntimeState* stat
       batch_start_ptr_(nullptr),
       error_in_row_(false),
       partial_tuple_(nullptr),
-      partial_tuple_empty_(true),
       parse_delimiter_timer_(nullptr) {
 }
 
@@ -152,22 +153,6 @@ Status HdfsTextScanner::IssueInitialRanges(HdfsScanNodeBase* scan_node,
   return Status::OK();
 }
 
-Status HdfsTextScanner::ProcessSplit() {
-  DCHECK(scan_node_->HasRowBatchQueue());
-  HdfsScanNode* scan_node = static_cast<HdfsScanNode*>(scan_node_);
-  do {
-    batch_ = new RowBatch(scan_node_->row_desc(), state_->batch_size(),
-        scan_node_->mem_tracker());
-    RETURN_IF_ERROR(GetNextInternal(batch_));
-    scan_node->AddMaterializedRowBatch(batch_);
-  } while (!eos_ && !scan_node_->ReachedLimit());
-
-  // Transfer the remaining resources to this new batch in Close().
-  batch_ = new RowBatch(scan_node_->row_desc(), state_->batch_size(),
-      scan_node_->mem_tracker());
-  return Status::OK();
-}
-
 void HdfsTextScanner::Close(RowBatch* row_batch) {
   DCHECK(!is_closed_);
   // Need to close the decompressor before transferring the remaining resources to
@@ -177,18 +162,18 @@ void HdfsTextScanner::Close(RowBatch* row_batch) {
     decompressor_->Close();
     decompressor_.reset();
   }
+  boundary_pool_->FreeAll();
   if (row_batch != nullptr) {
     row_batch->tuple_data_pool()->AcquireData(template_tuple_pool_.get(), false);
     row_batch->tuple_data_pool()->AcquireData(data_buffer_pool_.get(), false);
-    row_batch->tuple_data_pool()->AcquireData(boundary_pool_.get(), false);
     context_->ReleaseCompletedResources(row_batch, true);
     if (scan_node_->HasRowBatchQueue()) {
-      static_cast<HdfsScanNode*>(scan_node_)->AddMaterializedRowBatch(row_batch);
+      static_cast<HdfsScanNode*>(scan_node_)->AddMaterializedRowBatch(
+          unique_ptr<RowBatch>(row_batch));
     }
   } else {
-    if (template_tuple_pool_ != nullptr) template_tuple_pool_->FreeAll();
-    if (data_buffer_pool_ != nullptr) data_buffer_pool_->FreeAll();
-    if (boundary_pool_ != nullptr) boundary_pool_->FreeAll();
+    template_tuple_pool_->FreeAll();
+    data_buffer_pool_->FreeAll();
     context_->ReleaseCompletedResources(nullptr, true);
   }
 
@@ -201,7 +186,7 @@ void HdfsTextScanner::Close(RowBatch* row_batch) {
     scan_node_->RangeComplete(THdfsFileFormat::TEXT,
         stream_->file_desc()->file_compression);
   }
-  HdfsScanner::Close(row_batch);
+  CloseInternal();
 }
 
 Status HdfsTextScanner::InitNewRange() {
@@ -249,8 +234,7 @@ Status HdfsTextScanner::ResetScanner() {
   boundary_row_.Clear();
   delimited_text_parser_->ParserReset();
   byte_buffer_ptr_ = byte_buffer_end_ = nullptr;
-  partial_tuple_ = Tuple::Create(tuple_byte_size_, boundary_pool_.get());
-  partial_tuple_empty_ = true;
+  partial_tuple_ = nullptr;
 
   // Initialize codegen fn
   RETURN_IF_ERROR(InitializeWriteTuplesFn(
@@ -269,7 +253,7 @@ Status HdfsTextScanner::FinishScanRange(RowBatch* row_batch) {
     // of the next scan range. Nothing to do since we already fully parsed the previous
     // tuple.
     DCHECK(!delimited_text_parser_->HasUnfinishedTuple());
-    DCHECK(partial_tuple_empty_);
+    DCHECK(partial_tuple_ == nullptr);
     DCHECK(boundary_column_.IsEmpty());
     DCHECK(boundary_row_.IsEmpty());
     scan_state_ = DONE;
@@ -299,16 +283,21 @@ Status HdfsTextScanner::FinishScanRange(RowBatch* row_batch) {
            << ":" << stream_->file_offset() << endl << status.GetDetail();
         RETURN_IF_ERROR(state_->LogOrReturnError(
             ErrorMsg(TErrorCode::GENERAL, ss.str())));
-      } else if (!partial_tuple_empty_ || !boundary_column_.IsEmpty() ||
+      } else if (partial_tuple_ != nullptr || !boundary_column_.IsEmpty() ||
           !boundary_row_.IsEmpty() ||
           (delimited_text_parser_->HasUnfinishedTuple() &&
               (!scan_node_->materialized_slots().empty() ||
                   scan_node_->num_materialized_partition_keys() > 0))) {
-        // Missing columns or row delimiter at end of the file is ok, fill the row in.
-        char* col = boundary_column_.buffer();
+        // There is data in the partial column because there is a missing row delimiter
+        // at the end of the file. Copy the data into a new string buffer that gets
+        // memory from the row batch pool, so that the boundary pool could be freed.
+        StringBuffer sb(row_batch->tuple_data_pool());
+        RETURN_IF_ERROR(sb.Append(boundary_column_.buffer(), boundary_column_.len()));
+        boundary_column_.Clear();
+        char* col = sb.buffer();
         int num_fields = 0;
-        RETURN_IF_ERROR(delimited_text_parser_->FillColumns<true>(boundary_column_.len(),
-            &col, &num_fields, &field_locations_[0]));
+        RETURN_IF_ERROR(delimited_text_parser_->FillColumns<true>(sb.len(),
+            &col, &num_fields, field_locations_.data()));
 
         TupleRow* tuple_row_mem = row_batch->GetRow(row_batch->AddRow());
         int max_tuples = row_batch->capacity() - row_batch->num_rows();
@@ -321,14 +310,14 @@ Status HdfsTextScanner::FinishScanRange(RowBatch* row_batch) {
         DCHECK_LE(num_tuples, 1);
         DCHECK_GE(num_tuples, 0);
         COUNTER_ADD(scan_node_->rows_read_counter(), num_tuples);
-        RETURN_IF_ERROR(CommitRows(num_tuples, false, row_batch));
+        RETURN_IF_ERROR(CommitRows(num_tuples, row_batch));
       } else if (delimited_text_parser_->HasUnfinishedTuple()) {
         DCHECK(scan_node_->materialized_slots().empty());
         DCHECK_EQ(scan_node_->num_materialized_partition_keys(), 0);
-        // If no fields are materialized we do not update partial_tuple_empty_,
-        // boundary_column_, or boundary_row_. However, we still need to handle the case
-        // of partial tuple due to missing tuple delimiter at the end of file.
-        RETURN_IF_ERROR(CommitRows(1, false, row_batch));
+        // If no fields are materialized we do not update boundary_column_, or
+        // boundary_row_. However, we still need to handle the case of partial tuple due
+        // to missing tuple delimiter at the end of file.
+        RETURN_IF_ERROR(CommitRows(1, row_batch));
       }
       break;
     }
@@ -341,6 +330,7 @@ Status HdfsTextScanner::FinishScanRange(RowBatch* row_batch) {
     DCHECK_EQ(num_tuples, 0);
   }
 
+  DCHECK(boundary_column_.IsEmpty()) << "Must finish processing boundary column";
   scan_state_ = DONE;
   return Status::OK();
 }
@@ -376,8 +366,8 @@ Status HdfsTextScanner::ProcessRange(RowBatch* row_batch, int* num_tuples) {
       SCOPED_TIMER(parse_delimiter_timer_);
       RETURN_IF_ERROR(delimited_text_parser_->ParseFieldLocations(max_tuples,
           byte_buffer_end_ - byte_buffer_ptr_, &byte_buffer_ptr_,
-          &row_end_locations_[0],
-          &field_locations_[0], num_tuples, &num_fields, &col_start));
+          row_end_locations_.data(), field_locations_.data(), num_tuples,
+          &num_fields, &col_start));
     }
 
     // Materialize the tuples into the in memory format for this query
@@ -387,7 +377,7 @@ Status HdfsTextScanner::ProcessRange(RowBatch* row_batch, int* num_tuples) {
       // There can be one partial tuple which returned no more fields from this buffer.
       DCHECK_LE(*num_tuples, num_fields + 1);
       if (!boundary_column_.IsEmpty()) {
-        RETURN_IF_ERROR(CopyBoundaryField(&field_locations_[0], pool));
+        RETURN_IF_ERROR(CopyBoundaryField(field_locations_.data(), pool));
         boundary_column_.Clear();
       }
       num_tuples_materialized = WriteFields(num_fields, *num_tuples, pool, tuple_row_mem);
@@ -417,7 +407,7 @@ Status HdfsTextScanner::ProcessRange(RowBatch* row_batch, int* num_tuples) {
       }
       RETURN_IF_ERROR(boundary_row_.Append(last_row, byte_buffer_ptr_ - last_row));
     }
-    RETURN_IF_ERROR(CommitRows(num_tuples_materialized, false, row_batch));
+    RETURN_IF_ERROR(CommitRows(num_tuples_materialized, row_batch));
 
     // Already past the scan range and attempting to complete the last row.
     if (scan_state_ == PAST_SCAN_RANGE) break;
@@ -598,7 +588,8 @@ Status HdfsTextScanner::FillByteBufferCompressedFile(bool* eosr) {
   // For other compressed text: attempt to read and decompress the entire file, point
   // to the decompressed buffer, and then continue normal processing.
   DCHECK(decompression_type_ != THdfsCompression::SNAPPY);
-  HdfsFileDesc* desc = scan_node_->GetFileDesc(stream_->filename());
+  HdfsFileDesc* desc = scan_node_->GetFileDesc(
+      context_->partition_descriptor()->id(), stream_->filename());
   int64_t file_size = desc->file_length;
   DCHECK_GT(file_size, 0);
 
@@ -742,13 +733,13 @@ Status HdfsTextScanner::CheckForSplitDelimiter(bool* split_delimiter) {
 // codegen'd using the IRBuilder for the specific tuple description.  This function
 // is then injected into the cross-compiled driving function, WriteAlignedTuples().
 Status HdfsTextScanner::Codegen(HdfsScanNodeBase* node,
-    const vector<ExprContext*>& conjunct_ctxs, Function** write_aligned_tuples_fn) {
+    const vector<ScalarExpr*>& conjuncts, Function** write_aligned_tuples_fn) {
   *write_aligned_tuples_fn = nullptr;
   DCHECK(node->runtime_state()->ShouldCodegen());
   LlvmCodeGen* codegen = node->runtime_state()->codegen();
   DCHECK(codegen != nullptr);
   Function* write_complete_tuple_fn;
-  RETURN_IF_ERROR(CodegenWriteCompleteTuple(node, codegen, conjunct_ctxs,
+  RETURN_IF_ERROR(CodegenWriteCompleteTuple(node, codegen, conjuncts,
       &write_complete_tuple_fn));
   DCHECK(write_complete_tuple_fn != nullptr);
   RETURN_IF_ERROR(CodegenWriteAlignedTuples(node, codegen, write_complete_tuple_fn,
@@ -774,7 +765,7 @@ Status HdfsTextScanner::Open(ScannerContext* context) {
   return Status::OK();
 }
 
-// This function deals with tuples that straddle batches. There are two cases:
+// This function deals with tuples that straddle blocks. There are two cases:
 // 1. There is already a partial tuple in flight from the previous time around.
 //    This tuple can either be fully materialized (all the materialized columns have
 //    been processed but we haven't seen the tuple delimiter yet) or only partially
@@ -785,8 +776,9 @@ Status HdfsTextScanner::Open(ScannerContext* context) {
 int HdfsTextScanner::WriteFields(int num_fields, int num_tuples, MemPool* pool,
     TupleRow* row) {
   SCOPED_TIMER(scan_node_->materialize_tuple_timer());
+  DCHECK(boundary_column_.IsEmpty());
 
-  FieldLocation* fields = &field_locations_[0];
+  FieldLocation* fields = field_locations_.data();
 
   int num_tuples_processed = 0;
   int num_tuples_materialized = 0;
@@ -794,11 +786,8 @@ int HdfsTextScanner::WriteFields(int num_fields, int num_tuples, MemPool* pool,
   if (slot_idx_ != 0) {
     DCHECK(tuple_ != nullptr);
     int num_partial_fields = scan_node_->materialized_slots().size() - slot_idx_;
-    // Corner case where there will be no materialized tuples but at least one col
-    // worth of string data.  In this case, make a deep copy and reuse the byte buffer.
-    bool copy_strings = num_partial_fields > num_fields;
     num_partial_fields = min(num_partial_fields, num_fields);
-    WritePartialTuple(fields, num_partial_fields, copy_strings);
+    WritePartialTuple(fields, num_partial_fields);
 
     // This handles case 1.  If the tuple is complete and we've found a tuple delimiter
     // this time around (i.e. num_tuples > 0), add it to the row batch.  Otherwise,
@@ -813,10 +802,9 @@ int HdfsTextScanner::WriteFields(int num_fields, int num_tuples, MemPool* pool,
         if (!parse_status_.ok()) return 0;
         error_in_row_ = false;
       }
-      boundary_row_.Clear();
 
-      memcpy(tuple_, partial_tuple_, scan_node_->tuple_desc()->byte_size());
-      partial_tuple_empty_ = true;
+      CopyAndClearPartialTuple(pool);
+
       row->SetTuple(scan_node_->tuple_idx(), tuple_);
 
       slot_idx_ = 0;
@@ -867,12 +855,12 @@ int HdfsTextScanner::WriteFields(int num_fields, int num_tuples, MemPool* pool,
   // Write out the remaining slots (resulting in a partially materialized tuple)
   if (num_fields != 0) {
     DCHECK(tuple_ != nullptr);
+    partial_tuple_ = Tuple::Create(tuple_byte_size_, boundary_pool_.get());
     InitTuple(template_tuple_, partial_tuple_);
     // If there have been no materialized tuples at this point, copy string data
     // out of byte_buffer and reuse the byte_buffer.  The copied data can be at
     // most one tuple's worth.
-    WritePartialTuple(fields, num_fields, num_tuples_materialized == 0);
-    partial_tuple_empty_ = false;
+    WritePartialTuple(fields, num_fields);
   }
   DCHECK_LE(slot_idx_, scan_node_->materialized_slots().size());
   return num_tuples_materialized;
@@ -895,8 +883,7 @@ Status HdfsTextScanner::CopyBoundaryField(FieldLocation* data, MemPool* pool) {
   return Status::OK();
 }
 
-void HdfsTextScanner::WritePartialTuple(FieldLocation* fields,
-    int num_fields, bool copy_strings) {
+void HdfsTextScanner::WritePartialTuple(FieldLocation* fields, int num_fields) {
   for (int i = 0; i < num_fields; ++i) {
     bool need_escape = false;
     int len = fields[i].len;
@@ -907,10 +894,19 @@ void HdfsTextScanner::WritePartialTuple(FieldLocation* fields,
 
     const SlotDescriptor* desc = scan_node_->materialized_slots()[slot_idx_];
     if (!text_converter_->WriteSlot(desc, partial_tuple_,
-        fields[i].start, len, true, need_escape, data_buffer_pool_.get())) {
+        fields[i].start, len, true, need_escape, boundary_pool_.get())) {
       ReportColumnParseError(desc, fields[i].start, len);
       error_in_row_ = true;
     }
     ++slot_idx_;
   }
+}
+
+void HdfsTextScanner::CopyAndClearPartialTuple(MemPool* pool) {
+  DCHECK(tuple_ != nullptr);
+  partial_tuple_->DeepCopy(tuple_, *scan_node_->tuple_desc(), pool);
+  boundary_row_.Reset();
+  boundary_column_.Reset();
+  boundary_pool_->Clear();
+  partial_tuple_ = nullptr;
 }

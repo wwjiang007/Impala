@@ -26,7 +26,7 @@
 #include <boost/static_assert.hpp>
 
 #include "exprs/anyval-util.h"
-#include "exprs/expr.h"
+#include "exprs/scalar-expr.h"
 #include "runtime/string-value.inline.h"
 #include "runtime/tuple-row.h"
 #include "util/bit-util.h"
@@ -642,7 +642,7 @@ StringVal StringFunctions::RegexpExtract(FunctionContext* context, const StringV
   // TODO: fix this
   vector<re2::StringPiece> matches(max_matches);
   bool success =
-      re->Match(str_sp, 0, str.len, re2::RE2::UNANCHORED, &matches[0], max_matches);
+      re->Match(str_sp, 0, str.len, re2::RE2::UNANCHORED, matches.data(), max_matches);
   if (!success) return StringVal();
   // matches[0] is the whole string, matches[1] the first group, etc.
   const re2::StringPiece& match = matches[index.val];
@@ -814,7 +814,7 @@ IntVal StringFunctions::FindInSet(FunctionContext* context, const StringVal& str
   do {
     end = start;
     // Position end.
-    while(str_set.ptr[end] != ',' && end < str_set.len) ++end;
+    while (end < str_set.len && str_set.ptr[end] != ',') ++end;
     StringValue token(reinterpret_cast<char*>(str_set.ptr) + start, end - start);
     if (str_sv.Eq(token)) return IntVal(token_index);
 
@@ -979,7 +979,8 @@ StringVal StringFunctions::BTrimString(FunctionContext* ctx,
 // Similar to strstr() except that the strings are not null-terminated
 static char* LocateSubstring(char* haystack, int hay_len, const char* needle, int needle_len) {
   DCHECK_GT(needle_len, 0);
-  DCHECK(haystack != NULL && needle != NULL);
+  DCHECK(needle != NULL);
+  DCHECK(hay_len == 0 || haystack != NULL);
   for (int i = 0; i < hay_len - needle_len + 1; ++i) {
     char* possible_needle = haystack + i;
     if (strncmp(possible_needle, needle, needle_len) == 0) return possible_needle;

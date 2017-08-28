@@ -37,7 +37,7 @@
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/raw_ostream.h>
 
-#include "exprs/expr.h"
+#include "exprs/scalar-expr.h"
 #include "impala-ir/impala-ir-functions.h"
 #include "runtime/types.h"
 #include "util/runtime-profile.h"
@@ -154,8 +154,11 @@ class LlvmCodeGen {
   static Status CreateImpalaCodegen(RuntimeState* state, MemTracker* parent_mem_tracker,
       const std::string& id, boost::scoped_ptr<LlvmCodeGen>* codegen);
 
-  /// Removes all jit compiled dynamically linked functions from the process.
   ~LlvmCodeGen();
+
+  /// Releases all resources associated with the codegen object. It is invalid to call
+  /// any other API methods after calling close.
+  void Close();
 
   RuntimeProfile* runtime_profile() { return &profile_; }
   RuntimeProfile::Counter* codegen_timer() { return codegen_timer_; }
@@ -231,7 +234,11 @@ class LlvmCodeGen {
   /// Return a pointer to pointer type to 'type'.
   llvm::PointerType* GetPtrPtrType(llvm::Type* type);
 
-  /// Returns llvm type for the column type
+  /// Return a pointer to pointer type for 'name' type.
+  llvm::PointerType* GetPtrPtrType(const std::string& name);
+
+  /// Returns llvm type for Impala's internal representation of this column type,
+  /// i.e. the way Impala represents this type in a Tuple.
   llvm::Type* GetType(const ColumnType& type);
 
   /// Return a pointer type to 'type' (e.g. int16_t*)
@@ -407,8 +414,8 @@ class LlvmCodeGen {
   llvm::Function* GetFnvHashFunction(int num_bytes = -1);
   llvm::Function* GetMurmurHashFunction(int num_bytes = -1);
 
-  /// Set the NoInline attribute on 'function' and remove the AlwaysInline attribute if
-  /// present.
+  /// Set the NoInline attribute on 'function' and remove the AlwaysInline and InlineHint
+  /// attributes if present.
   void SetNoInline(llvm::Function* function) const;
 
   /// Allocate stack storage for local variables.  This is similar to traditional c, where
@@ -468,7 +475,6 @@ class LlvmCodeGen {
   llvm::Type* bigint_type() { return GetType(TYPE_BIGINT); }
   llvm::Type* float_type() { return GetType(TYPE_FLOAT); }
   llvm::Type* double_type() { return GetType(TYPE_DOUBLE); }
-  llvm::Type* string_val_type() { return string_val_type_; }
   llvm::PointerType* ptr_type() { return ptr_type_; }
   llvm::Type* void_type() { return void_type_; }
   llvm::Type* i128_type() { return llvm::Type::getIntNTy(context(), 128); }
@@ -570,6 +576,11 @@ class LlvmCodeGen {
   /// anyway (they must be explicitly invoked) so it is dead code.
   static void StripGlobalCtorsDtors(llvm::Module* module);
 
+  /// Set the "target-cpu" and "target-features" of 'function' to match the host's CPU's
+  /// features. Having consistent attributes for all materialized functions allows
+  /// generated IR to be inlined into cross-compiled functions' IR and vice versa.
+  static void SetCPUAttrs(llvm::Function* function);
+
   // Setup any JIT listeners to process generated machine code object, e.g. to generate
   // perf symbol map or disassembly.
   void SetupJITListeners();
@@ -640,6 +651,11 @@ class LlvmCodeGen {
   static std::string cpu_name_;
   static std::vector<std::string> cpu_attrs_;
 
+  /// Value of "target-features" attribute to be set on all IR functions. Derived from
+  /// 'cpu_attrs_'. Using a consistent value for this attribute among hand-crafted IR
+  /// and cross-compiled functions allow them to be inlined into each other.
+  static std::string target_features_attr_;
+
   /// A global shared call graph for all IR functions in the main module.
   /// Used for determining dependencies when materializing IR functions.
   static CodegenCallGraph shared_call_graph_;
@@ -655,8 +671,9 @@ class LlvmCodeGen {
   RuntimeProfile profile_;
 
   /// MemTracker used for tracking memory consumed by codegen. Connected to a parent
-  /// MemTracker if one was provided during initialization.
-  boost::scoped_ptr<MemTracker> mem_tracker_;
+  /// MemTracker if one was provided during initialization. Owned by the ObjectPool
+  /// provided in the constructor.
+  MemTracker* mem_tracker_;
 
   /// Time spent reading the .ir file from the file system.
   RuntimeProfile::Counter* load_module_timer_;
@@ -747,8 +764,8 @@ class LlvmCodeGen {
   /// llvm representation of a few common types.  Owned by context.
   llvm::PointerType* ptr_type_;             // int8_t*
   llvm::Type* void_type_;                   // void
-  llvm::Type* string_val_type_;             // StringValue
-  llvm::Type* timestamp_val_type_;          // TimestampValue
+  llvm::Type* string_value_type_;           // StringValue
+  llvm::Type* timestamp_value_type_;        // TimestampValue
 
   /// llvm constants to help with code gen verbosity
   llvm::Value* true_value_;
