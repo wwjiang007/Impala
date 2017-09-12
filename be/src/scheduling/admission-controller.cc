@@ -115,18 +115,19 @@ const string PROFILE_INFO_VAL_QUEUE_DETAIL = "waited $0 ms, reason: $1";
 // Error status string details
 const string REASON_MEM_LIMIT_TOO_LOW_FOR_RESERVATION =
     "minimum memory reservation is greater than memory available to the query "
-    "for buffer reservations. Mem available for buffer reservations based on mem_limit: "
-    "$0, memory reservation needed: $1. Set mem_limit to at least $2. See the query "
-    "profile for more information.";
+    "for buffer reservations. Memory reservation needed given the current plan: $0. Set "
+    "mem_limit to at least $1. Note that changing the mem_limit may also change the "
+    "plan. See the query profile for more information about the per-node memory "
+    "requirements.";
 const string REASON_BUFFER_LIMIT_TOO_LOW_FOR_RESERVATION =
     "minimum memory reservation is greater than memory available to the query "
-    "for buffer reservations. Mem available for buffer reservations based on "
-    "buffer_pool_limit: $0, memory reservation needed: $1. See the query profile for "
-    "more information.";
+    "for buffer reservations. Increase the buffer_pool_limit to $0. See the query "
+    "profile for more information about the per-node memory requirements.";
 const string REASON_MIN_RESERVATION_OVER_POOL_MEM =
-    "minimum memory reservation needed is greater than pool max mem resources. pool "
-    "max mem resources: $0, cluster-wide memory reservation needed: $1. See the query "
-    "profile for more information.";
+    "minimum memory reservation needed is greater than pool max mem resources. Pool "
+    "max mem resources: $0. Cluster-wide memory reservation needed: $1. Increase the "
+    "pool max mem resources. See the query profile for more information about the "
+    "per-node memory requirements.";
 const string REASON_DISABLED_MAX_MEM_RESOURCES =
     "disabled by pool max mem resources set to 0";
 const string REASON_DISABLED_REQUESTS_LIMIT = "disabled by requests limit set to 0";
@@ -217,12 +218,13 @@ AdmissionController::AdmissionController(StatestoreSubscriber* subscriber,
       metrics_group_(metrics),
       host_id_(TNetworkAddressToString(host_addr)),
       thrift_serializer_(false),
-      done_(false) {
-  dequeue_thread_.reset(new Thread("scheduling", "admission-thread",
-        &AdmissionController::DequeueLoop, this));
-}
+      done_(false) {}
 
 AdmissionController::~AdmissionController() {
+  // If the dequeue thread is not running (e.g. if Init() fails), then there is
+  // nothing to do.
+  if (dequeue_thread_ == nullptr) return;
+
   // The AdmissionController should live for the lifetime of the impalad, but
   // for unit tests we need to ensure that no thread is waiting on the
   // condition variable. This notifies the dequeue thread to stop and waits
@@ -237,6 +239,8 @@ AdmissionController::~AdmissionController() {
 }
 
 Status AdmissionController::Init() {
+  RETURN_IF_ERROR(Thread::Create("scheduling", "admission-thread",
+      &AdmissionController::DequeueLoop, this, &dequeue_thread_));
   StatestoreSubscriber::UpdateCallback cb =
     bind<void>(mem_fn(&AdmissionController::UpdatePoolStats), this, _1, _2);
   Status status = subscriber_->AddTopic(IMPALA_REQUEST_QUEUE_TOPIC, true, cb);
@@ -415,10 +419,9 @@ bool AdmissionController::RejectImmediately(QuerySchedule* schedule,
   // Checks related to the min buffer reservation against configured query memory limits:
   if (schedule->query_options().__isset.buffer_pool_limit &&
       schedule->query_options().buffer_pool_limit > 0) {
-    const int64_t buffer_pool_limit = schedule->query_options().buffer_pool_limit;
-    if (max_min_reservation_bytes > buffer_pool_limit) {
+    if (max_min_reservation_bytes > schedule->query_options().buffer_pool_limit) {
       *rejection_reason = Substitute(REASON_BUFFER_LIMIT_TOO_LOW_FOR_RESERVATION,
-          PrintBytes(buffer_pool_limit), PrintBytes(max_min_reservation_bytes));
+          PrintBytes(max_min_reservation_bytes));
       return true;
     }
   } else if (schedule->query_options().__isset.mem_limit &&
@@ -430,8 +433,7 @@ bool AdmissionController::RejectImmediately(QuerySchedule* schedule,
       const int64_t required_mem_limit =
           ReservationUtil::GetMinMemLimitFromReservation(max_min_reservation_bytes);
       *rejection_reason = Substitute(REASON_MEM_LIMIT_TOO_LOW_FOR_RESERVATION,
-          PrintBytes(mem_limit), PrintBytes(max_min_reservation_bytes),
-          PrintBytes(required_mem_limit));
+          PrintBytes(max_min_reservation_bytes), PrintBytes(required_mem_limit));
       return true;
     }
   }

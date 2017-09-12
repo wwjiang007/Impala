@@ -464,21 +464,16 @@ void ImpalaServer::ExecuteStatement(TExecuteStatementResp& return_val,
         QueryResultSet::CreateHS2ResultSet(
             session->hs2_version, *request_state->result_metadata(), nullptr),
         cache_num_rows);
-    if (!status.ok()) {
-      discard_result(UnregisterQuery(request_state->query_id(), false, &status));
-      HS2_RETURN_ERROR(return_val, status.GetDetail(), SQLSTATE_GENERAL_ERROR);
-    }
+    if (!status.ok()) goto return_error;
   }
   request_state->UpdateNonErrorQueryState(beeswax::QueryState::RUNNING);
   // Start thread to wait for results to become available.
-  request_state->WaitAsync();
+  status = request_state->WaitAsync();
+  if (!status.ok()) goto return_error;
   // Once the query is running do a final check for session closure and add it to the
   // set of in-flight queries.
   status = SetQueryInflight(session, request_state);
-  if (!status.ok()) {
-    discard_result(UnregisterQuery(request_state->query_id(), false, &status));
-    HS2_RETURN_ERROR(return_val, status.GetDetail(), SQLSTATE_GENERAL_ERROR);
-  }
+  if (!status.ok()) goto return_error;
   return_val.__isset.operationHandle = true;
   return_val.operationHandle.__set_operationType(TOperationType::EXECUTE_STATEMENT);
   return_val.operationHandle.__set_hasResultSet(request_state->returns_result_set());
@@ -489,6 +484,11 @@ void ImpalaServer::ExecuteStatement(TExecuteStatementResp& return_val,
       apache::hive::service::cli::thrift::TStatusCode::SUCCESS_STATUS);
 
   VLOG_QUERY << "ExecuteStatement(): return_val=" << ThriftDebugString(return_val);
+  return;
+
+ return_error:
+  discard_result(UnregisterQuery(request_state->query_id(), false, &status));
+  HS2_RETURN_ERROR(return_val, status.GetDetail(), SQLSTATE_GENERAL_ERROR);
 }
 
 void ImpalaServer::GetTypeInfo(TGetTypeInfoResp& return_val,
@@ -720,19 +720,6 @@ void ImpalaServer::GetResultSetMetadata(TGetResultSetMetadataResp& return_val,
       request.operationHandle.operationId, &query_id, &secret), SQLSTATE_GENERAL_ERROR);
   VLOG_QUERY << "GetResultSetMetadata(): query_id=" << PrintId(query_id);
 
-  // Look up the session ID (which takes session_state_map_lock_) before taking the query
-  // exec state lock.
-  TUniqueId session_id;
-  if (UNLIKELY(!GetSessionIdForQuery(query_id, &session_id))) {
-    // No handle was found
-    HS2_RETURN_ERROR(return_val,
-      Substitute("Unable to find session ID for query handle: $0", PrintId(query_id)),
-      SQLSTATE_GENERAL_ERROR);
-  }
-  ScopedSessionState session_handle(this);
-  HS2_RETURN_IF_ERROR(return_val, session_handle.WithSession(session_id),
-      SQLSTATE_GENERAL_ERROR);
-
   shared_ptr<ClientRequestState> request_state = GetClientRequestState(query_id);
   if (UNLIKELY(request_state.get() == nullptr)) {
     VLOG_QUERY << "GetResultSetMetadata(): invalid query handle";
@@ -740,6 +727,10 @@ void ImpalaServer::GetResultSetMetadata(TGetResultSetMetadataResp& return_val,
     HS2_RETURN_ERROR(return_val,
       Substitute("Invalid query handle: $0", PrintId(query_id)), SQLSTATE_GENERAL_ERROR);
   }
+  ScopedSessionState session_handle(this);
+  const TUniqueId session_id = request_state->session_id();
+  HS2_RETURN_IF_ERROR(return_val, session_handle.WithSession(session_id),
+      SQLSTATE_GENERAL_ERROR);
   {
     lock_guard<mutex> l(*request_state->lock());
 

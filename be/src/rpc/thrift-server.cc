@@ -77,11 +77,7 @@ namespace impala {
 // that one (e.g. TLSv1.1 enables v1.1 and v1.2). Specifying TLSv1.1_only enables only
 // v1.1.
 map<string, SSLProtocol> SSLProtoVersions::PROTO_MAP = {
-#if OPENSSL_VERSION_NUMBER >= 0x10001000L
-    {"tlsv1.2", TLSv1_2_plus}, {"tlsv1.2_only", TLSv1_2}, {"tlsv1.1", TLSv1_1_plus},
-    {"tlsv1.1_only", TLSv1_1},
-#endif
-    {"tlsv1", TLSv1_0_plus}, {"tlsv1_only", TLSv1_0}};
+    {"tlsv1.2", TLSv1_2_plus}, {"tlsv1.1", TLSv1_1_plus}, {"tlsv1", TLSv1_0_plus}};
 
 Status SSLProtoVersions::StringToProtocol(const string& in, SSLProtocol* protocol) {
   for (const auto& proto : SSLProtoVersions::PROTO_MAP) {
@@ -92,6 +88,16 @@ Status SSLProtoVersions::StringToProtocol(const string& in, SSLProtocol* protoco
   }
 
   return Status(Substitute("Unknown TLS version: '$0'", in));
+}
+
+#define OPENSSL_MIN_VERSION_WITH_TLS_1_1 0x10001000L
+
+bool SSLProtoVersions::IsSupported(const SSLProtocol& protocol) {
+  bool is_openssl_1_0_0_or_lower = (SSLeay() < OPENSSL_MIN_VERSION_WITH_TLS_1_1);
+  if (is_openssl_1_0_0_or_lower) return (protocol == TLSv1_0_plus);
+
+  // All other versions supported by OpenSSL 1.0.1 and later.
+  return true;
 }
 
 bool EnableInternalSslConnections() {
@@ -166,9 +172,9 @@ Status ThriftServer::ThriftServerEventProcessor::StartAndWaitForServer() {
 
   stringstream name;
   name << "supervise-" << thrift_server_->name_;
-  thrift_server_->server_thread_.reset(
-      new Thread("thrift-server", name.str(),
-                 &ThriftServer::ThriftServerEventProcessor::Supervise, this));
+  RETURN_IF_ERROR(Thread::Create("thrift-server", name.str(),
+      &ThriftServer::ThriftServerEventProcessor::Supervise, this,
+      &thrift_server_->server_thread_));
 
   system_time deadline = get_system_time() +
       posix_time::milliseconds(ThriftServer::ThriftServerEventProcessor::TIMEOUT_MS);
@@ -329,7 +335,6 @@ ThriftServer::ThriftServer(const string& name,
     num_worker_threads_(num_worker_threads),
     server_type_(server_type),
     name_(name),
-    server_thread_(NULL),
     server_(NULL),
     processor_(processor),
     connection_handler_(NULL),
@@ -374,6 +379,11 @@ class ImpalaSslSocketFactory : public TSSLSocketFactory {
 }
 Status ThriftServer::CreateSocket(boost::shared_ptr<TServerTransport>* socket) {
   if (ssl_enabled()) {
+    if (!SSLProtoVersions::IsSupported(version_)) {
+      return Status(TErrorCode::SSL_SOCKET_CREATION_FAILED,
+          Substitute("TLS ($0) version not supported (linked OpenSSL version is $1)",
+                        version_, SSLeay()));
+    }
     try {
       // This 'factory' is only called once, since CreateSocket() is only called from
       // Start(). The c'tor may throw if there is an error initializing the SSL context.

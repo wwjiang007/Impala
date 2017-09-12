@@ -55,10 +55,18 @@ Status QueryExecMgr::StartQuery(const TExecQueryFInstancesParams& params) {
   }
   // avoid blocking the rpc handler thread for too long by starting a new thread for
   // query startup (which takes ownership of the QueryState reference)
-  Thread t("query-exec-mgr",
+  unique_ptr<Thread> t;
+  status = Thread::Create("query-exec-mgr",
       Substitute("start-query-finstances-$0", PrintId(query_id)),
-      &QueryExecMgr::StartQueryHelper, this, qs);
-  t.Detach();
+          &QueryExecMgr::StartQueryHelper, this, qs, &t, true);
+  if (!status.ok()) {
+    // decrement refcount taken in QueryState::Init()
+    qs->ReleaseInitialReservationRefcount();
+    // decrement refcount taken in GetOrCreateQueryState()
+    ReleaseQueryState(qs);
+    return status;
+  }
+  t->Detach();
   return Status::OK();
 }
 
@@ -111,8 +119,8 @@ QueryState* QueryExecMgr::GetOrCreateQueryState(
 void QueryExecMgr::StartQueryHelper(QueryState* qs) {
   qs->StartFInstances();
 
-#ifndef ADDRESS_SANITIZER
-  // tcmalloc and address sanitizer cannot be used together
+#if !defined(ADDRESS_SANITIZER) && !defined(THREAD_SANITIZER)
+  // tcmalloc and address or thread sanitizer cannot be used together
   if (FLAGS_log_mem_usage_interval > 0) {
     uint64_t num_complete = ImpaladMetrics::IMPALA_SERVER_NUM_FRAGMENTS->value();
     if (num_complete % FLAGS_log_mem_usage_interval == 0) {

@@ -16,7 +16,6 @@
 // under the License.
 
 #include <algorithm>
-#include <boost/functional/hash.hpp>
 #include <gflags/gflags.h>
 #include <memory>
 #include <mutex>
@@ -24,10 +23,11 @@
 #include <unordered_set>
 #include <vector>
 
+#include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/walltime.h"
-#include "kudu/rpc/outbound_call.h"
 #include "kudu/rpc/constants.h"
+#include "kudu/rpc/outbound_call.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/rpc_introspection.pb.h"
 #include "kudu/rpc/rpc_sidecar.h"
@@ -45,6 +45,12 @@ DEFINE_int64(rpc_callback_max_cycles, 100 * 1000 * 1000,
              " (Advanced debugging option)");
 TAG_FLAG(rpc_callback_max_cycles, advanced);
 TAG_FLAG(rpc_callback_max_cycles, runtime);
+
+// Flag used in debug build for injecting cancellation at different code paths.
+DEFINE_int32(rpc_inject_cancellation_state, -1,
+             "If this flag is not -1, it is the state in which a cancellation request "
+             "will be injected. Should use values in OutboundCall::State only");
+TAG_FLAG(rpc_inject_cancellation_state, unsafe);
 
 using std::unique_ptr;
 
@@ -70,7 +76,8 @@ OutboundCall::OutboundCall(const ConnectionId& conn_id,
       conn_id_(conn_id),
       callback_(std::move(callback)),
       controller_(DCHECK_NOTNULL(controller)),
-      response_(DCHECK_NOTNULL(response_storage)) {
+      response_(DCHECK_NOTNULL(response_storage)),
+      cancellation_requested_(false) {
   DVLOG(4) << "OutboundCall " << this << " constructed with state_: " << StateName(state_)
            << " and RPC timeout: "
            << (controller->timeout().Initialized() ? controller->timeout().ToString() : "none");
@@ -92,7 +99,7 @@ OutboundCall::~OutboundCall() {
   DVLOG(4) << "OutboundCall " << this << " destroyed with state_: " << StateName(state_);
 }
 
-Status OutboundCall::SerializeTo(vector<Slice>* slices) {
+size_t OutboundCall::SerializeTo(TransferPayload* slices) {
   DCHECK_LT(0, request_buf_.size())
       << "Must call SetRequestPayload() before SerializeTo()";
 
@@ -109,10 +116,16 @@ Status OutboundCall::SerializeTo(vector<Slice>* slices) {
   serialization::SerializeHeader(
       header_, sidecar_byte_size_ + request_buf_.size(), &header_buf_);
 
-  slices->push_back(Slice(header_buf_));
-  slices->push_back(Slice(request_buf_));
-  for (const unique_ptr<RpcSidecar>& car : sidecars_) slices->push_back(car->AsSlice());
-  return Status::OK();
+  size_t n_slices = 2 + sidecars_.size();
+  DCHECK_LE(n_slices, slices->size());
+  auto slice_iter = slices->begin();
+  *slice_iter++ = Slice(header_buf_);
+  *slice_iter++ = Slice(request_buf_);
+  for (auto& sidecar : sidecars_) {
+    *slice_iter++ = sidecar->AsSlice();
+  }
+  DCHECK_EQ(slice_iter - slices->begin(), n_slices);
+  return n_slices;
 }
 
 void OutboundCall::SetRequestPayload(const Message& req,
@@ -120,6 +133,7 @@ void OutboundCall::SetRequestPayload(const Message& req,
   DCHECK_EQ(-1, sidecar_byte_size_);
 
   sidecars_ = move(sidecars);
+  DCHECK_LE(sidecars_.size(), TransferLimits::kMaxSidecars);
 
   // Compute total size of sidecar payload so that extra space can be reserved as part of
   // the request body.
@@ -157,6 +171,8 @@ string OutboundCall::StateName(State state) {
       return "NEGOTIATION_TIMED_OUT";
     case TIMED_OUT:
       return "TIMED_OUT";
+    case CANCELLED:
+      return "CANCELLED";
     case FINISHED_NEGOTIATION_ERROR:
       return "FINISHED_NEGOTIATION_ERROR";
     case FINISHED_ERROR:
@@ -201,6 +217,9 @@ void OutboundCall::set_state_unlocked(State new_state) {
     case TIMED_OUT:
       DCHECK(state_ == SENT || state_ == ON_OUTBOUND_QUEUE || state_ == SENDING);
       break;
+    case CANCELLED:
+      DCHECK(state_ == READY || state_ == ON_OUTBOUND_QUEUE || state_ == SENT);
+      break;
     case FINISHED_SUCCESS:
       DCHECK_EQ(state_, SENT);
       break;
@@ -212,7 +231,31 @@ void OutboundCall::set_state_unlocked(State new_state) {
   state_ = new_state;
 }
 
+void OutboundCall::Cancel() {
+  cancellation_requested_ = true;
+  // No lock needed as it's called from reactor thread
+  switch (state_) {
+    case READY:
+    case ON_OUTBOUND_QUEUE:
+    case SENT: {
+      SetCancelled();
+      break;
+    }
+    case SENDING:
+    case NEGOTIATION_TIMED_OUT:
+    case TIMED_OUT:
+    case CANCELLED:
+    case FINISHED_NEGOTIATION_ERROR:
+    case FINISHED_ERROR:
+    case FINISHED_SUCCESS:
+      break;
+  }
+}
+
 void OutboundCall::CallCallback() {
+  // Clear references to outbound sidecars before invoking callback.
+  sidecars_.clear();
+
   int64_t start_cycles = CycleClock::Now();
   {
     SCOPED_WATCH_STACK(100);
@@ -283,6 +326,11 @@ void OutboundCall::SetSent() {
   // request_buf_ is also done being used here, but since it was allocated by
   // the caller thread, we would rather let that thread free it whenever it
   // deletes the RpcController.
+
+  // If cancellation was requested, it's now a good time to do the actual cancellation.
+  if (cancellation_requested()) {
+    SetCancelled();
+  }
 }
 
 void OutboundCall::SetFailed(const Status &status,
@@ -325,6 +373,20 @@ void OutboundCall::SetTimedOut(Phase phase) {
   CallCallback();
 }
 
+void OutboundCall::SetCancelled() {
+  DCHECK(!IsFinished());
+  {
+    std::lock_guard<simple_spinlock> l(lock_);
+    status_ = Status::Aborted(
+        Substitute("$0 RPC to $1 is cancelled in state $2",
+                   remote_method_.method_name(),
+                   conn_id_.remote().ToString(),
+                   StateName(state_)));
+    set_state_unlocked(CANCELLED);
+  }
+  CallCallback();
+}
+
 bool OutboundCall::IsTimedOut() const {
   std::lock_guard<simple_spinlock> l(lock_);
   switch (state_) {
@@ -334,6 +396,11 @@ bool OutboundCall::IsTimedOut() const {
     default:
       return false;
   }
+}
+
+bool OutboundCall::IsCancelled() const {
+  std::lock_guard<simple_spinlock> l(lock_);
+  return state_ == CANCELLED;
 }
 
 bool OutboundCall::IsNegotiationError() const {
@@ -357,6 +424,7 @@ bool OutboundCall::IsFinished() const {
       return false;
     case NEGOTIATION_TIMED_OUT:
     case TIMED_OUT:
+    case CANCELLED:
     case FINISHED_NEGOTIATION_ERROR:
     case FINISHED_ERROR:
     case FINISHED_SUCCESS:
@@ -397,6 +465,9 @@ void OutboundCall::DumpPB(const DumpRunningRpcsRequestPB& req,
     case TIMED_OUT:
       resp->set_state(RpcCallInProgressPB::TIMED_OUT);
       break;
+    case CANCELLED:
+      resp->set_state(RpcCallInProgressPB::CANCELLED);
+      break;
     case FINISHED_NEGOTIATION_ERROR:
       resp->set_state(RpcCallInProgressPB::FINISHED_NEGOTIATION_ERROR);
       break;
@@ -407,65 +478,6 @@ void OutboundCall::DumpPB(const DumpRunningRpcsRequestPB& req,
       resp->set_state(RpcCallInProgressPB::FINISHED_SUCCESS);
       break;
   }
-}
-
-///
-/// ConnectionId
-///
-
-ConnectionId::ConnectionId() {}
-
-ConnectionId::ConnectionId(const ConnectionId& other) {
-  DoCopyFrom(other);
-}
-
-ConnectionId::ConnectionId(const Sockaddr& remote, UserCredentials user_credentials) {
-  remote_ = remote;
-  user_credentials_ = std::move(user_credentials);
-}
-
-void ConnectionId::set_remote(const Sockaddr& remote) {
-  remote_ = remote;
-}
-
-void ConnectionId::set_user_credentials(UserCredentials user_credentials) {
-  user_credentials_ = std::move(user_credentials);
-}
-
-void ConnectionId::CopyFrom(const ConnectionId& other) {
-  DoCopyFrom(other);
-}
-
-string ConnectionId::ToString() const {
-  // Does not print the password.
-  return StringPrintf("{remote=%s, user_credentials=%s}",
-      remote_.ToString().c_str(),
-      user_credentials_.ToString().c_str());
-}
-
-void ConnectionId::DoCopyFrom(const ConnectionId& other) {
-  remote_ = other.remote_;
-  user_credentials_ = other.user_credentials_;
-}
-
-size_t ConnectionId::HashCode() const {
-  size_t seed = 0;
-  boost::hash_combine(seed, remote_.HashCode());
-  boost::hash_combine(seed, user_credentials_.HashCode());
-  return seed;
-}
-
-bool ConnectionId::Equals(const ConnectionId& other) const {
-  return (remote() == other.remote()
-       && user_credentials().Equals(other.user_credentials()));
-}
-
-size_t ConnectionIdHash::operator() (const ConnectionId& conn_id) const {
-  return conn_id.HashCode();
-}
-
-bool ConnectionIdEqual::operator() (const ConnectionId& cid1, const ConnectionId& cid2) const {
-  return cid1.Equals(cid2);
 }
 
 ///

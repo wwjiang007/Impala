@@ -35,7 +35,10 @@ DEFINE_string(hostname, "", "Hostname to use for this daemon, also used as part 
               "the Kerberos principal, if enabled. If not set, the system default will be"
               " used");
 
-DEFINE_int32(be_port, 22000, "port on which ImpalaInternalService is exported");
+DEFINE_int32(be_port, 22000,
+    "port on which thrift based ImpalaInternalService is exported");
+DEFINE_int32_hidden(krpc_port, 29000,
+    "port on which KRPC based ImpalaInternalService is exported");
 
 // Kerberos is enabled if and only if principal is set.
 DEFINE_string(principal, "", "Kerberos principal. If set, both client and backend network"
@@ -134,6 +137,9 @@ DEFINE_int32(fault_injection_rpc_exception_type, 0, "A fault injection option th
     "in debug builds only");
 DEFINE_int32(stress_scratch_write_delay_ms, 0, "A stress option which causes writes to "
     "scratch files to be to be delayed to simulate slow writes.");
+DEFINE_bool(thread_creation_fault_injection, false, "A fault injection option that "
+    " causes calls to Thread::Create() to fail randomly 1% of the time on eligible "
+    " codepaths. Effective in debug builds only.");
 #endif
 
 // Used for testing the path where the Kudu client is stubbed.

@@ -333,7 +333,8 @@ void Messenger::Shutdown() {
   // Need to shut down negotiation pool before the reactors, since the
   // reactors close the Connection sockets, and may race against the negotiation
   // threads' blocking reads & writes.
-  negotiation_pool_->Shutdown();
+  client_negotiation_pool_->Shutdown();
+  server_negotiation_pool_->Shutdown();
 
   for (Reactor* reactor : reactors_) {
     reactor->Shutdown();
@@ -417,6 +418,11 @@ void Messenger::QueueInboundCall(gscoped_ptr<InboundCall> call) {
   WARN_NOT_OK((*service)->QueueInboundCall(std::move(call)), "Unable to handle RPC call");
 }
 
+void Messenger::QueueCancellation(const shared_ptr<OutboundCall> &call) {
+  Reactor *reactor = RemoteToReactor(call->conn_id().remote());
+  reactor->QueueCancellation(call);
+}
+
 void Messenger::RegisterInboundSocket(Socket *new_socket, const Sockaddr &remote) {
   Reactor *reactor = RemoteToReactor(remote);
   reactor->RegisterInboundSocket(new_socket, remote);
@@ -435,10 +441,14 @@ Messenger::Messenger(const MessengerBuilder &bld)
   for (int i = 0; i < bld.num_reactors_; i++) {
     reactors_.push_back(new Reactor(retain_self_, i, bld));
   }
-  CHECK_OK(ThreadPoolBuilder("negotiator")
-              .set_min_threads(bld.min_negotiation_threads_)
-              .set_max_threads(bld.max_negotiation_threads_)
-              .Build(&negotiation_pool_));
+  CHECK_OK(ThreadPoolBuilder("client-negotiator")
+      .set_min_threads(bld.min_negotiation_threads_)
+      .set_max_threads(bld.max_negotiation_threads_)
+      .Build(&client_negotiation_pool_));
+  CHECK_OK(ThreadPoolBuilder("server-negotiator")
+      .set_min_threads(bld.min_negotiation_threads_)
+      .set_max_threads(bld.max_negotiation_threads_)
+      .Build(&server_negotiation_pool_));
 }
 
 Messenger::~Messenger() {
@@ -501,6 +511,15 @@ const scoped_refptr<RpcService> Messenger::rpc_service(const string& service_nam
   } else {
     return scoped_refptr<RpcService>(nullptr);
   }
+}
+
+ThreadPool* Messenger::negotiation_pool(Connection::Direction dir) {
+  switch (dir) {
+    case Connection::CLIENT: return client_negotiation_pool_.get();
+    case Connection::SERVER: return server_negotiation_pool_.get();
+  }
+  DCHECK(false) << "Unknown Connection::Direction value: " << dir;
+  return nullptr;
 }
 
 } // namespace rpc

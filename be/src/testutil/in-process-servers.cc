@@ -35,6 +35,7 @@
 DECLARE_string(ssl_server_certificate);
 DECLARE_string(ssl_private_key);
 DECLARE_int32(be_port);
+DECLARE_int32(krpc_port);
 
 using namespace apache::thrift;
 using namespace impala;
@@ -49,6 +50,10 @@ InProcessImpalaServer* InProcessImpalaServer::StartWithEphemeralPorts(
     // backend interface.
     FLAGS_be_port = backend_port;
 
+    int krpc_port = FindUnusedEphemeralPort(&used_ports);
+    if (krpc_port == -1) continue;
+    FLAGS_krpc_port = krpc_port;
+
     int subscriber_port = FindUnusedEphemeralPort(&used_ports);
     if (subscriber_port == -1) continue;
 
@@ -62,7 +67,7 @@ InProcessImpalaServer* InProcessImpalaServer::StartWithEphemeralPorts(
     if (hs2_port == -1) continue;
 
     InProcessImpalaServer* impala =
-        new InProcessImpalaServer("localhost", backend_port, subscriber_port,
+        new InProcessImpalaServer("localhost", backend_port, krpc_port, subscriber_port,
             webserver_port, statestore_host, statestore_port);
     // Start the daemon and check if it works, if not delete the current server object and
     // pick a new set of ports
@@ -79,14 +84,14 @@ InProcessImpalaServer* InProcessImpalaServer::StartWithEphemeralPorts(
 }
 
 InProcessImpalaServer::InProcessImpalaServer(const string& hostname, int backend_port,
-    int subscriber_port, int webserver_port, const string& statestore_host,
+    int krpc_port, int subscriber_port, int webserver_port, const string& statestore_host,
     int statestore_port)
     : hostname_(hostname), backend_port_(backend_port),
       beeswax_port_(0),
       hs2_port_(0),
       impala_server_(NULL),
-      exec_env_(new ExecEnv(hostname, backend_port, subscriber_port, webserver_port,
-          statestore_host, statestore_port)) {
+      exec_env_(new ExecEnv(hostname, backend_port, krpc_port, subscriber_port,
+          webserver_port, statestore_host, statestore_port)) {
 }
 
 Status InProcessImpalaServer::SetCatalogInitialized() {
@@ -160,6 +165,7 @@ InProcessStatestore::InProcessStatestore(int statestore_port, int webserver_port
 }
 
 Status InProcessStatestore::Start() {
+  RETURN_IF_ERROR(statestore_->Init());
   RETURN_IF_ERROR(webserver_->Start());
   boost::shared_ptr<TProcessor> processor(
       new StatestoreServiceProcessor(statestore_->thrift_iface()));
@@ -172,8 +178,8 @@ Status InProcessStatestore::Start() {
   ThriftServer* server;
   ABORT_IF_ERROR(builder.metrics(metrics_.get()).Build(&server));
   statestore_server_.reset(server);
-  statestore_main_loop_.reset(
-      new Thread("statestore", "main-loop", &Statestore::MainLoop, statestore_.get()));
+  RETURN_IF_ERROR(Thread::Create("statestore", "main-loop",
+      &Statestore::MainLoop, statestore_.get(), &statestore_main_loop_));
 
   RETURN_IF_ERROR(statestore_server_->Start());
   return WaitForServer("localhost", statestore_port_, 10, 100);

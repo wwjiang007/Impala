@@ -350,7 +350,7 @@ struct TQueryCtx {
   // Process ID of the impalad to which the user is connected.
   5: required i32 pid
 
-  // Initiating coordinator.
+  // The initiating coordinator's address of its thrift based ImpalaInternalService.
   // TODO: determine whether we can get this somehow via the Thrift rpc mechanism.
   6: optional Types.TNetworkAddress coord_address
 
@@ -404,8 +404,11 @@ struct TPlanFragmentDestination {
   // the globally unique fragment instance id
   1: required Types.TUniqueId fragment_instance_id
 
-  // ... which is being executed on this server
+  // IP address + port of the thrift based ImpalaInteralService on the destination
   2: required Types.TNetworkAddress server
+
+  // IP address + port of the KRPC based ImpalaInternalService on the destination
+  3: optional Types.TNetworkAddress krpc_server
 }
 
 // Context to collect information, which is shared among all instances of that plan
@@ -621,6 +624,18 @@ struct TReportExecStatusParams {
   // New errors that have not been reported to the coordinator by any of the
   // instances included in instance_exec_status
   6: optional map<ErrorCodes.TErrorCode, TErrorLogEntry> error_log;
+
+  // Cumulative status for this backend. A backend can have an error from a specific
+  // fragment instance, or it can have a general error that is independent of any
+  // individual fragment. If reporting a single error, this status is always set to
+  // the error being reported. If reporting multiple errors, the status is set by the
+  // following rules:
+  // 1. A general error takes precedence over any fragment instance error.
+  // 2. Any fragment instance error takes precedence over any cancelled status.
+  // 3. If multiple fragments have errors, prefer the error that comes first in the
+  // 'instance_exec_status' list.
+  // This status is only OK if all fragment instances included are OK.
+  7: optional Status.TStatus status;
 }
 
 struct TReportExecStatusResult {

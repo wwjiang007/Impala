@@ -22,7 +22,7 @@
 #include <string>
 
 #include "kudu/gutil/atomicops.h"
-#include "kudu/rpc/outbound_call.h"
+#include "kudu/rpc/connection_id.h"
 #include "kudu/rpc/response_callback.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/rpc_header.pb.h"
@@ -55,8 +55,11 @@ class Messenger;
 // After initialization, multiple threads may make calls using the same proxy object.
 class Proxy {
  public:
-  Proxy(std::shared_ptr<Messenger> messenger, const Sockaddr& remote,
+  Proxy(std::shared_ptr<Messenger> messenger,
+        const Sockaddr& remote,
+        std::string hostname,
         std::string service_name);
+
   ~Proxy();
 
   // Call a remote method asynchronously.

@@ -110,6 +110,7 @@ DECLARE_string(authorized_proxy_user_config);
 DECLARE_string(authorized_proxy_user_config_delimiter);
 DECLARE_bool(abort_on_config_error);
 DECLARE_bool(disk_spill_encryption);
+DECLARE_bool(use_krpc);
 
 DEFINE_int32(beeswax_port, 21000, "port on which Beeswax client requests are served");
 DEFINE_int32(hs2_port, 21050, "port on which HiveServer2 client requests are served");
@@ -182,11 +183,7 @@ DEFINE_string(ssl_cipher_list, "",
 
 const string SSL_MIN_VERSION_HELP = "The minimum SSL/TLS version that Thrift "
     "services should use for both client and server connections. Supported versions are "
-#if OPENSSL_VERSION_NUMBER >= 0x10001000L
-    "TLSv1.0, TLSv1.1 and TLSv1.2";
-#else
-    "TLSv1.0";
-#endif
+    "TLSv1.0, TLSv1.1 and TLSv1.2 (as long as the system OpenSSL library supports them)";
 DEFINE_string(ssl_minimum_version, "tlsv1", SSL_MIN_VERSION_HELP.c_str());
 
 DEFINE_int32(idle_session_timeout, 0, "The time, in seconds, that a session may be idle"
@@ -386,15 +383,16 @@ ImpalaServer::ImpalaServer(ExecEnv* exec_env)
           "impala-server", "cancellation-worker",
       FLAGS_cancellation_thread_pool_size, MAX_CANCELLATION_QUEUE_SIZE,
       bind<void>(&ImpalaServer::CancelFromThreadPool, this, _1, _2)));
+  ABORT_IF_ERROR(cancellation_thread_pool_->Init());
 
   // Initialize a session expiry thread which blocks indefinitely until the first session
   // with non-zero timeout value is opened. Note that a session which doesn't specify any
   // idle session timeout value will use the default value FLAGS_idle_session_timeout.
-  session_timeout_thread_.reset(new Thread("impala-server", "session-expirer",
-      bind<void>(&ImpalaServer::ExpireSessions, this)));
+  ABORT_IF_ERROR(Thread::Create("impala-server", "session-expirer",
+      bind<void>(&ImpalaServer::ExpireSessions, this), &session_timeout_thread_));
 
-  query_expiration_thread_.reset(new Thread("impala-server", "query-expirer",
-      bind<void>(&ImpalaServer::ExpireQueries, this)));
+  ABORT_IF_ERROR(Thread::Create("impala-server", "query-expirer",
+      bind<void>(&ImpalaServer::ExpireQueries, this), &query_expiration_thread_));
 
   is_coordinator_ = FLAGS_is_coordinator;
   is_executor_ = FLAGS_is_executor;
@@ -451,8 +449,8 @@ Status ImpalaServer::InitLineageLogging() {
   lineage_logger_.reset(new SimpleLogger(FLAGS_lineage_event_log_dir,
       LINEAGE_LOG_FILE_PREFIX, FLAGS_max_lineage_log_file_size));
   RETURN_IF_ERROR(lineage_logger_->Init());
-  lineage_logger_flush_thread_.reset(new Thread("impala-server",
-        "lineage-log-flush", &ImpalaServer::LineageLoggerFlushThread, this));
+  RETURN_IF_ERROR(Thread::Create("impala-server", "lineage-log-flush",
+      &ImpalaServer::LineageLoggerFlushThread, this, &lineage_logger_flush_thread_));
   return Status::OK();
 }
 
@@ -543,8 +541,9 @@ Status ImpalaServer::InitAuditEventLogging() {
   audit_event_logger_.reset(new SimpleLogger(FLAGS_audit_event_log_dir,
      AUDIT_EVENT_LOG_FILE_PREFIX, FLAGS_max_audit_event_log_file_size));
   RETURN_IF_ERROR(audit_event_logger_->Init());
-  audit_event_logger_flush_thread_.reset(new Thread("impala-server",
-        "audit-event-log-flush", &ImpalaServer::AuditEventLoggerFlushThread, this));
+  RETURN_IF_ERROR(Thread::Create("impala-server", "audit-event-log-flush",
+      &ImpalaServer::AuditEventLoggerFlushThread, this,
+      &audit_event_logger_flush_thread_));
   return Status::OK();
 }
 
@@ -603,8 +602,8 @@ Status ImpalaServer::InitProfileLogging() {
       PROFILE_LOG_FILE_PREFIX, FLAGS_max_profile_log_file_size,
       FLAGS_max_profile_log_files));
   RETURN_IF_ERROR(profile_logger_->Init());
-  profile_log_file_flush_thread_.reset(new Thread("impala-server", "log-flush-thread",
-      &ImpalaServer::LogFileFlushThread, this));
+  RETURN_IF_ERROR(Thread::Create("impala-server", "log-flush-thread",
+      &ImpalaServer::LogFileFlushThread, this, &profile_log_file_flush_thread_));
 
   return Status::OK();
 }
@@ -921,7 +920,7 @@ void ImpalaServer::PrepareQueryContext(TQueryCtx* query_ctx) {
   local_timestamp.UtcToLocal();
   query_ctx->__set_now_string(local_timestamp.ToString());
   query_ctx->__set_start_unix_millis(UnixMillis());
-  query_ctx->__set_coord_address(MakeNetworkAddress(FLAGS_hostname, FLAGS_be_port));
+  query_ctx->__set_coord_address(ExecEnv::GetInstance()->backend_address());
 
   // Creating a random_generator every time is not free, but
   // benchmarks show it to be slightly cheaper than contending for a
@@ -1641,8 +1640,7 @@ void ImpalaServer::AddLocalBackendToStatestore(
   TBackendDescriptor local_backend_descriptor;
   local_backend_descriptor.__set_is_coordinator(FLAGS_is_coordinator);
   local_backend_descriptor.__set_is_executor(FLAGS_is_executor);
-  local_backend_descriptor.__set_address(
-      MakeNetworkAddress(FLAGS_hostname, FLAGS_be_port));
+  local_backend_descriptor.__set_address(exec_env_->backend_address());
   IpAddr ip;
   const Hostname& hostname = local_backend_descriptor.address.hostname;
   Status status = HostnameToIpAddr(hostname, &ip);
@@ -1653,6 +1651,10 @@ void ImpalaServer::AddLocalBackendToStatestore(
     return;
   }
   local_backend_descriptor.ip_address = ip;
+  if (FLAGS_use_krpc) {
+    TNetworkAddress krpc_address = MakeNetworkAddress(ip, exec_env_->krpc_port());
+    local_backend_descriptor.__set_krpc_address(krpc_address);
+  }
   subscriber_topic_updates->emplace_back(TTopicDelta());
   TTopicDelta& update = subscriber_topic_updates->back();
   update.topic_name = Scheduler::IMPALA_MEMBERSHIP_TOPIC;
@@ -2051,19 +2053,6 @@ Status CreateImpalaServer(ExecEnv* exec_env, int beeswax_port, int hs2_port, int
   LOG(INFO) << "Started coordinator/executor Impala server on "
             << ExecEnv::GetInstance()->backend_address();
   return Status::OK();
-}
-
-bool ImpalaServer::GetSessionIdForQuery(const TUniqueId& query_id,
-    TUniqueId* session_id) {
-  DCHECK(session_id != nullptr);
-  lock_guard<mutex> l(client_request_state_map_lock_);
-  ClientRequestStateMap::iterator i = client_request_state_map_.find(query_id);
-  if (i == client_request_state_map_.end()) {
-    return false;
-  } else {
-    *session_id = i->second->session_id();
-    return true;
-  }
 }
 
 shared_ptr<ClientRequestState> ImpalaServer::GetClientRequestState(

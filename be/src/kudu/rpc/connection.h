@@ -113,7 +113,8 @@ class Connection : public RefCountedThreadSafe<Connection> {
                 std::unique_ptr<ErrorStatusPB> rpc_error = {});
 
   // Queue a new call to be made. If the queueing fails, the call will be
-  // marked failed.
+  // marked failed. The caller is expected to check if 'call' has been cancelled
+  // before making the call.
   // Takes ownership of the 'call' object regardless of whether it succeeds or fails.
   void QueueOutboundCall(const std::shared_ptr<OutboundCall> &call);
 
@@ -122,19 +123,25 @@ class Connection : public RefCountedThreadSafe<Connection> {
   // This may be called from a non-reactor thread.
   void QueueResponseForCall(gscoped_ptr<InboundCall> call);
 
+  // Cancel an outbound call by removing any reference to it by CallAwaitingResponse
+  // in 'awaiting_responses_'.
+  void CancelOutboundCall(const std::shared_ptr<OutboundCall> &call);
+
   // The address of the remote end of the connection.
   const Sockaddr &remote() const { return remote_; }
 
   // Set the user credentials for an outbound connection.
-  void set_local_user_credentials(UserCredentials creds) {
+  void set_outbound_connection_id(ConnectionId conn_id) {
     DCHECK_EQ(direction_, CLIENT);
-    local_user_credentials_ = std::move(creds);
+    DCHECK(!outbound_connection_id_);
+    outbound_connection_id_ = std::move(conn_id);
   }
 
   // Get the user credentials which will be used to log in.
-  const UserCredentials& local_user_credentials() const {
+  const ConnectionId& outbound_connection_id() const {
     DCHECK_EQ(direction_, CLIENT);
-    return local_user_credentials_;
+    DCHECK(outbound_connection_id_);
+    return *outbound_connection_id_;
   }
 
   // Credentials policy to start connection negotiation.
@@ -216,6 +223,7 @@ class Connection : public RefCountedThreadSafe<Connection> {
  private:
   friend struct CallAwaitingResponse;
   friend class QueueTransferTask;
+  friend struct CallTransferCallbacks;
   friend struct ResponseTransferCallbacks;
 
   // A call which has been fully sent to the server, which we're waiting for
@@ -269,6 +277,10 @@ class Connection : public RefCountedThreadSafe<Connection> {
   // This must be called from the reactor thread.
   void QueueOutbound(gscoped_ptr<OutboundTransfer> transfer);
 
+  // Internal test function for injecting cancellation request when 'call'
+  // reaches state specified in 'FLAGS_rpc_inject_cancellation_state'.
+  void MaybeInjectCancellation(const std::shared_ptr<OutboundCall> &call);
+
   // The reactor thread that created this connection.
   ReactorThread* const reactor_thread_;
 
@@ -278,8 +290,9 @@ class Connection : public RefCountedThreadSafe<Connection> {
   // The socket we're communicating on.
   std::unique_ptr<Socket> socket_;
 
-  // The credentials of the user operating on this connection (if a client user).
-  UserCredentials local_user_credentials_;
+  // The ConnectionId that serves as a key into the client connection map
+  // within this reactor. Only set in the case of outbound connections.
+  boost::optional<ConnectionId> outbound_connection_id_;
 
   // The authenticated remote user (if this is an inbound connection on the server).
   RemoteUser remote_user_;
@@ -319,10 +332,6 @@ class Connection : public RefCountedThreadSafe<Connection> {
 
   // Starts as Status::OK, gets set to a shutdown status upon Shutdown().
   Status shutdown_status_;
-
-  // Temporary vector used when serializing - avoids an allocation
-  // when serializing calls.
-  std::vector<Slice> slices_tmp_;
 
   // RPC features supported by the remote end of the connection.
   std::set<RpcFeatureFlag> remote_features_;

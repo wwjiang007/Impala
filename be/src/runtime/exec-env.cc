@@ -76,7 +76,7 @@ DEFINE_int32(state_store_subscriber_port, 23000,
 DEFINE_int32(num_hdfs_worker_threads, 16,
     "(Advanced) The number of threads in the global HDFS operation pool");
 DEFINE_bool(disable_admission_control, false, "Disables admission control.");
-DEFINE_bool_hidden(use_krpc, false, "Used to indicate whether to use Kudu RPC for the "
+DEFINE_bool_hidden(use_krpc, false, "Used to indicate whether to use KRPC for the "
     "DataStream subsystem, or the Thrift RPC layer instead. Defaults to false. "
     "KRPC not yet supported");
 
@@ -84,6 +84,7 @@ DECLARE_int32(state_store_port);
 DECLARE_int32(num_threads_per_core);
 DECLARE_int32(num_cores);
 DECLARE_int32(be_port);
+DECLARE_int32(krpc_port);
 DECLARE_string(mem_limit);
 DECLARE_string(buffer_pool_limit);
 DECLARE_string(buffer_pool_clean_pages_limit);
@@ -136,11 +137,13 @@ struct ExecEnv::KuduClientPtr {
 ExecEnv* ExecEnv::exec_env_ = nullptr;
 
 ExecEnv::ExecEnv()
-  : ExecEnv(FLAGS_hostname, FLAGS_be_port, FLAGS_state_store_subscriber_port,
-        FLAGS_webserver_port, FLAGS_state_store_host, FLAGS_state_store_port) {}
+  : ExecEnv(FLAGS_hostname, FLAGS_be_port, FLAGS_krpc_port,
+        FLAGS_state_store_subscriber_port, FLAGS_webserver_port,
+        FLAGS_state_store_host, FLAGS_state_store_port) {}
 
-ExecEnv::ExecEnv(const string& hostname, int backend_port, int subscriber_port,
-    int webserver_port, const string& statestore_host, int statestore_port)
+ExecEnv::ExecEnv(const string& hostname, int backend_port, int krpc_port,
+    int subscriber_port, int webserver_port, const string& statestore_host,
+    int statestore_port)
   : obj_pool_(new ObjectPool),
     metrics_(new MetricGroup("impala-metrics")),
     impalad_client_cache_(
@@ -165,7 +168,8 @@ ExecEnv::ExecEnv(const string& hostname, int backend_port, int subscriber_port,
     async_rpc_pool_(new CallableThreadPool("rpc-pool", "async-rpc-sender", 8, 10000)),
     query_exec_mgr_(new QueryExecMgr()),
     enable_webserver_(FLAGS_enable_webserver && webserver_port > 0),
-    backend_address_(MakeNetworkAddress(hostname, backend_port)) {
+    backend_address_(MakeNetworkAddress(hostname, backend_port)),
+    krpc_port_(krpc_port) {
 
   if (FLAGS_use_krpc) {
     stream_mgr_.reset(new KrpcDataStreamMgr(metrics_.get()));
@@ -185,7 +189,7 @@ ExecEnv::ExecEnv(const string& hostname, int backend_port, int subscriber_port,
 
   if (FLAGS_is_coordinator) {
     scheduler_.reset(new Scheduler(statestore_subscriber_.get(),
-        statestore_subscriber_->id(), backend_address_, metrics_.get(), webserver_.get(),
+        statestore_subscriber_->id(), metrics_.get(), webserver_.get(),
         request_pool_service_.get()));
   }
 
@@ -212,12 +216,16 @@ Status ExecEnv::InitForFeTests() {
 Status ExecEnv::StartServices() {
   LOG(INFO) << "Starting global services";
 
+  // Initialize thread pools
+  RETURN_IF_ERROR(exec_rpc_thread_pool_->Init());
+  RETURN_IF_ERROR(async_rpc_pool_->Init());
+  RETURN_IF_ERROR(hdfs_op_thread_pool_->Init());
+
   // Initialize global memory limit.
   // Depending on the system configuration, we will have to calculate the process
   // memory limit either based on the available physical memory, or if overcommitting
   // is turned off, we use the memory commit limit from /proc/meminfo (see
   // IMPALA-1690).
-  // --mem_limit="" means no memory limit. TODO: IMPALA-5653: remove this mode
   int64_t bytes_limit = 0;
   bool is_percent;
   int64_t system_mem;
@@ -242,15 +250,11 @@ Status ExecEnv::StartServices() {
     system_mem = MemInfo::physical_mem();
     bytes_limit = ParseUtil::ParseMemSpec(FLAGS_mem_limit, &is_percent, system_mem);
   }
-  // ParseMemSpec returns 0 to mean unlimited.
-  bool no_process_mem_limit = bytes_limit == 0;
-  if (no_process_mem_limit) {
-    LOG(WARNING) << "Configured with unlimited process memory limit (--mem_limit='"
-                 << FLAGS_mem_limit << "'). Starting in the next Impala release, "
-                 << "a process memory limit must always be specified. See IMPALA-5653.";
-  }
-  if (bytes_limit < 0) {
-    return Status("Failed to parse mem limit from '" + FLAGS_mem_limit + "'.");
+  // ParseMemSpec() returns -1 for invalid input and 0 to mean unlimited. From Impala
+  // 2.11 onwards we do not support unlimited process memory limits.
+  if (bytes_limit <= 0) {
+    return Status(Substitute("The process memory limit (--mem_limit) must be a positive "
+          "bytes value or percentage: $0", FLAGS_mem_limit));
   }
 
   if (!BitUtil::IsPowerOf2(FLAGS_min_buffer_size)) {
@@ -258,10 +262,10 @@ Status ExecEnv::StartServices() {
         "--min_buffer_size must be a power-of-two: $0", FLAGS_min_buffer_size));
   }
   int64_t buffer_pool_limit = ParseUtil::ParseMemSpec(FLAGS_buffer_pool_limit,
-      &is_percent, no_process_mem_limit ? system_mem : bytes_limit);
+      &is_percent, bytes_limit);
   if (buffer_pool_limit <= 0) {
     return Status(Substitute("Invalid --buffer_pool_limit value, must be a percentage or "
-          "positive bytes value: $0", FLAGS_buffer_pool_limit));
+          "positive bytes value or percentage: $0", FLAGS_buffer_pool_limit));
   }
   buffer_pool_limit = BitUtil::RoundDown(buffer_pool_limit, FLAGS_min_buffer_size);
 
@@ -269,7 +273,7 @@ Status ExecEnv::StartServices() {
       &is_percent, buffer_pool_limit);
   if (clean_pages_limit <= 0) {
     return Status(Substitute("Invalid --buffer_pool_clean_pages_limit value, must be a percentage or "
-          "positive bytes value: $0", FLAGS_buffer_pool_clean_pages_limit));
+          "positive bytes value or percentage: $0", FLAGS_buffer_pool_clean_pages_limit));
   }
   InitBufferPool(FLAGS_min_buffer_size, buffer_pool_limit, clean_pages_limit);
 
@@ -279,9 +283,8 @@ Status ExecEnv::StartServices() {
   RETURN_IF_ERROR(RegisterMemoryMetrics(
       metrics_.get(), true, buffer_reservation_.get(), buffer_pool_.get()));
 
-  // Limit of -1 means no memory limit.
-  mem_tracker_.reset(new MemTracker(AggregateMemoryMetrics::TOTAL_USED,
-      no_process_mem_limit ? -1 : bytes_limit, "Process"));
+  mem_tracker_.reset(
+      new MemTracker(AggregateMemoryMetrics::TOTAL_USED, bytes_limit, "Process"));
   // Add BufferPool MemTrackers for cached memory that is not tracked against queries
   // but is included in process memory consumption.
   obj_pool_->Add(new MemTracker(BufferPoolMetric::FREE_BUFFER_BYTES, -1,
@@ -296,7 +299,7 @@ Status ExecEnv::StartServices() {
         BufferPoolMetric::UNUSED_RESERVATION_BYTES));
   obj_pool_->Add(new MemTracker(negated_unused_reservation, -1,
       "Buffer Pool: Unused Reservation", mem_tracker_.get()));
-#ifndef ADDRESS_SANITIZER
+#if !defined(ADDRESS_SANITIZER) && !defined(THREAD_SANITIZER)
   // Aggressive decommit is required so that unused pages in the TCMalloc page heap are
   // not backed by physical pages and do not contribute towards memory consumption.
   size_t aggressive_decommit_enabled = 0;
@@ -332,7 +335,9 @@ Status ExecEnv::StartServices() {
     LOG(INFO) << "Not starting webserver";
   }
 
-  if (scheduler_ != nullptr) RETURN_IF_ERROR(scheduler_->Init());
+  if (scheduler_ != nullptr) {
+    RETURN_IF_ERROR(scheduler_->Init(backend_address_, krpc_port_));
+  }
   if (admission_controller_ != nullptr) RETURN_IF_ERROR(admission_controller_->Init());
 
   // Get the fs.defaultFS value set in core-site.xml and assign it to

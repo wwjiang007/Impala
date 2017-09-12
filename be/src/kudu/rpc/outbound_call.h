@@ -25,18 +25,19 @@
 
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
+#include "kudu/rpc/connection_id.h"
 #include "kudu/rpc/constants.h"
-#include "kudu/rpc/rpc_header.pb.h"
-#include "kudu/rpc/rpc_sidecar.h"
 #include "kudu/rpc/remote_method.h"
 #include "kudu/rpc/response_callback.h"
+#include "kudu/rpc/rpc_header.pb.h"
+#include "kudu/rpc/rpc_sidecar.h"
 #include "kudu/rpc/transfer.h"
-#include "kudu/rpc/user_credentials.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/monotime.h"
-#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
+
+DECLARE_int32(rpc_inject_cancellation_state);
 
 namespace google {
 namespace protobuf {
@@ -54,59 +55,6 @@ class InboundTransfer;
 class RpcCallInProgressPB;
 class RpcController;
 class RpcSidecar;
-
-// Used to key on Connection information.
-// For use as a key in an unordered STL collection, use ConnectionIdHash and ConnectionIdEqual.
-// This class is copyable for STL compatibility, but not assignable (use CopyFrom() for that).
-class ConnectionId {
- public:
-  ConnectionId();
-
-  // Copy constructor required for use with STL unordered_map.
-  ConnectionId(const ConnectionId& other);
-
-  // Convenience constructor.
-  ConnectionId(const Sockaddr& remote, UserCredentials user_credentials);
-
-  // The remote address.
-  void set_remote(const Sockaddr& remote);
-  const Sockaddr& remote() const { return remote_; }
-
-  // The credentials of the user associated with this connection, if any.
-  void set_user_credentials(UserCredentials user_credentials);
-  const UserCredentials& user_credentials() const { return user_credentials_; }
-  UserCredentials* mutable_user_credentials() { return &user_credentials_; }
-
-  // Copy state from another object to this one.
-  void CopyFrom(const ConnectionId& other);
-
-  // Returns a string representation of the object, not including the password field.
-  std::string ToString() const;
-
-  size_t HashCode() const;
-  bool Equals(const ConnectionId& other) const;
-
- private:
-  // Remember to update HashCode() and Equals() when new fields are added.
-  Sockaddr remote_;
-  UserCredentials user_credentials_;
-
-  // Implementation of CopyFrom that can be shared with copy constructor.
-  void DoCopyFrom(const ConnectionId& other);
-
-  // Disable assignment operator.
-  void operator=(const ConnectionId&);
-};
-
-class ConnectionIdHash {
- public:
-  std::size_t operator() (const ConnectionId& conn_id) const;
-};
-
-class ConnectionIdEqual {
- public:
-  bool operator() (const ConnectionId& cid1, const ConnectionId& cid2) const;
-};
 
 // Tracks the status of a call on the client side.
 //
@@ -154,7 +102,15 @@ class OutboundCall {
 
   // Serialize the call for the wire. Requires that SetRequestPayload()
   // is called first. This is called from the Reactor thread.
-  Status SerializeTo(std::vector<Slice>* slices);
+  // Returns the number of slices in the serialized call.
+  size_t SerializeTo(TransferPayload* slices);
+
+  // Mark in the call that cancellation has been requested. If the call hasn't yet
+  // started sending or has finished sending the RPC request but is waiting for a
+  // response, cancel the RPC right away. Otherwise, wait until the RPC has finished
+  // sending before cancelling it. If the call is finished, it's a no-op.
+  // REQUIRES: must be called from the reactor thread.
+  void Cancel();
 
   // Callback after the call has been put on the outbound connection queue.
   void SetQueued();
@@ -180,6 +136,8 @@ class OutboundCall {
   bool IsTimedOut() const;
 
   bool IsNegotiationError() const;
+
+  bool IsCancelled() const;
 
   // Is the call finished?
   bool IsFinished() const;
@@ -215,8 +173,22 @@ class OutboundCall {
     return header_.call_id();
   }
 
+  // Returns true if cancellation has been requested. Must be called from
+  // reactor thread.
+  bool cancellation_requested() const {
+    return cancellation_requested_;
+  }
+
+  // Test function which returns true if a cancellation request should be injected
+  // at the current state.
+  bool ShouldInjectCancellation() const {
+    return FLAGS_rpc_inject_cancellation_state != -1 &&
+        FLAGS_rpc_inject_cancellation_state == state();
+  }
+
  private:
   friend class RpcController;
+  FRIEND_TEST(TestRpc, TestCancellation);
 
   // Various states the call propagates through.
   // NB: if adding another state, be sure to update OutboundCall::IsFinished()
@@ -228,12 +200,16 @@ class OutboundCall {
     SENT,
     NEGOTIATION_TIMED_OUT,
     TIMED_OUT,
+    CANCELLED,
     FINISHED_NEGOTIATION_ERROR,
     FINISHED_ERROR,
     FINISHED_SUCCESS
   };
 
   static std::string StateName(State state);
+
+  // Mark the call as cancelled. This also invokes the callback to notify the caller.
+  void SetCancelled();
 
   void set_state(State new_state);
   State state() const;
@@ -260,7 +236,9 @@ class OutboundCall {
   Status status_;
   gscoped_ptr<ErrorStatusPB> error_pb_;
 
-  // Call the user-provided callback.
+  // Call the user-provided callback. Note that entries in 'sidecars_' are cleared
+  // prior to invoking the callback so the client can assume that the call doesn't
+  // hold references to outbound sidecars.
   void CallCallback();
 
   // The RPC header.
@@ -294,6 +272,9 @@ class OutboundCall {
 
   // Total size in bytes of all sidecars in 'sidecars_'. Set in SetRequestPayload().
   int64_t sidecar_byte_size_ = -1;
+
+  // True if cancellation was requested on this call.
+  bool cancellation_requested_;
 
   DISALLOW_COPY_AND_ASSIGN(OutboundCall);
 };
