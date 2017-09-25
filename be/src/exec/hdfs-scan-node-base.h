@@ -23,6 +23,7 @@
 #include <memory>
 #include <unordered_set>
 #include <vector>
+#include <tuple>
 
 #include <boost/unordered_map.hpp>
 #include <boost/scoped_ptr.hpp>
@@ -252,11 +253,15 @@ class HdfsScanNodeBase : public ScanNode {
   /// Otherwise, scan nodes using a RowBatch queue may lose the last batch due
   /// to racing with shutting down the queue.
   void RangeComplete(const THdfsFileFormat::type& file_type,
-      const THdfsCompression::type& compression_type);
+      const THdfsCompression::type& compression_type, bool skipped = false);
+
   /// Same as above except for when multiple compression codecs were used
   /// in the file. The metrics are incremented for each compression_type.
+  /// 'skipped' is set to true in the following cases -
+  /// 1. when a scan range is filtered at runtime
+  /// 2. scan range is a metadata read only(e.x. count(*) on parquet files)
   virtual void RangeComplete(const THdfsFileFormat::type& file_type,
-      const std::vector<THdfsCompression::type>& compression_type);
+      const std::vector<THdfsCompression::type>& compression_type, bool skipped = false);
 
   /// Utility function to compute the order in which to materialize slots to allow for
   /// computing conjuncts as slots get materialized (on partial tuples).
@@ -469,6 +474,17 @@ class HdfsScanNodeBase : public ScanNode {
   /// Total number of file handle opens where the file handle was not in the cache
   RuntimeProfile::Counter* cached_file_handles_miss_count_ = nullptr;
 
+  /// The number of active hdfs reading threads reading for this node.
+  RuntimeProfile::Counter active_hdfs_read_thread_counter_;
+
+  /// Average number of active hdfs reading threads
+  /// This should be created in Open() and stopped when all the scanner threads are done.
+  RuntimeProfile::Counter* average_hdfs_read_thread_concurrency_ = nullptr;
+
+  /// HDFS read thread concurrency bucket: bucket[i] refers to the number of sample
+  /// taken where there are i concurrent hdfs read thread running. Created in Open().
+  std::vector<RuntimeProfile::Counter*>* hdfs_read_thread_concurrency_bucket_ = nullptr;
+
   /// Pool for allocating some amounts of memory that is shared between scanners.
   /// e.g. partition key tuple and their string buffers
   boost::scoped_ptr<MemPool> scan_node_pool_;
@@ -481,7 +497,8 @@ class HdfsScanNodeBase : public ScanNode {
   /// Mapping of file formats (file type, compression type) to the number of
   /// splits of that type and the lock protecting it.
   typedef std::map<
-      std::pair<THdfsFileFormat::type, THdfsCompression::type>, int> FileTypeCountsMap;
+     std::tuple<THdfsFileFormat::type, bool, THdfsCompression::type>,
+     int> FileTypeCountsMap;
   FileTypeCountsMap file_type_counts_;
 
   /// Performs dynamic partition pruning, i.e., applies runtime filters to files, and

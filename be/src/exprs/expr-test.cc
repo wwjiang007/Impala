@@ -2261,6 +2261,47 @@ TEST_F(ExprTest, DecimalArithmeticExprs) {
   }
 }
 
+// Tests for expressions that mix decimal and non-decimal arguments with DECIMAL_V2=false.
+TEST_F(ExprTest, DecimalV1MixedArithmeticExprs) {
+  executor_->PushExecOption("DECIMAL_V2=false");
+  // IMPALA-3437: decimal constants are implicitly converted to double.
+  TestValue("10.0 + 3", TYPE_DOUBLE, 13.0);
+  TestValue("10 + 3.0", TYPE_DOUBLE, 13.0);
+  TestValue("10.0 - 3", TYPE_DOUBLE, 7.0);
+  TestValue("10.0 * 3", TYPE_DOUBLE, 30.0);
+  TestValue("10.0 / 3", TYPE_DOUBLE, 10.0 / 3);
+  // Conversion to DOUBLE loses some precision.
+  TestValue("0.999999999999999999999999999999 = 1", TYPE_BOOLEAN, true);
+  TestValue("0.999999999999999999999999999999 != 1", TYPE_BOOLEAN, false);
+  TestValue("0.999999999999999999999999999999 < 1", TYPE_BOOLEAN, false);
+  TestValue("0.999999999999999999999999999999 >= 1", TYPE_BOOLEAN, true);
+  TestValue("0.999999999999999999999999999999 > 1", TYPE_BOOLEAN, false);
+  executor_->PopExecOption();
+}
+
+// Tests the same expressions as above with DECIMAL_V2=true.
+TEST_F(ExprTest, DecimalV2MixedArithmeticExprs) {
+  executor_->PushExecOption("DECIMAL_V2=true");
+  // IMPALA-3437: decimal constants remain decimal.
+  TestDecimalValue(
+      "10.0 + 3", Decimal4Value(130), ColumnType::CreateDecimalType(5, 1));
+  TestDecimalValue(
+      "10 + 3.0", Decimal4Value(130), ColumnType::CreateDecimalType(5, 1));
+  TestDecimalValue(
+      "10.0 - 3", Decimal4Value(70), ColumnType::CreateDecimalType(5, 1));
+  TestDecimalValue(
+      "10.0 * 3", Decimal4Value(300), ColumnType::CreateDecimalType(6, 1));
+  TestDecimalValue(
+      "10.0 / 3", Decimal4Value(3333333), ColumnType::CreateDecimalType(8, 6));
+  // Comparisons between DECIMAL values are precise.
+  TestValue("0.999999999999999999999999999999 = 1", TYPE_BOOLEAN, false);
+  TestValue("0.999999999999999999999999999999 != 1", TYPE_BOOLEAN, true);
+  TestValue("0.999999999999999999999999999999 < 1", TYPE_BOOLEAN, true);
+  TestValue("0.999999999999999999999999999999 >= 1", TYPE_BOOLEAN, false);
+  TestValue("0.999999999999999999999999999999 > 1", TYPE_BOOLEAN, false);
+  executor_->PopExecOption();
+}
+
 // There are two tests of ranges, the second of which requires a cast
 // of the second operand to a higher-resolution type.
 TEST_F(ExprTest, BinaryPredicates) {
@@ -2505,6 +2546,48 @@ TEST_F(ExprTest, IsNullPredicate) {
   TestValue("5 IS NOT NULL", TYPE_BOOLEAN, true);
   TestValue("NULL IS NULL", TYPE_BOOLEAN, true);
   TestValue("NULL IS NOT NULL", TYPE_BOOLEAN, false);
+}
+
+TEST_F(ExprTest, BoolTestExpr) {
+  // Tests against constants.
+  TestValue("TRUE IS TRUE", TYPE_BOOLEAN, true);
+  TestValue("TRUE IS FALSE", TYPE_BOOLEAN, false);
+  TestValue("TRUE IS UNKNOWN", TYPE_BOOLEAN, false);
+  TestValue("TRUE IS NOT TRUE", TYPE_BOOLEAN, false);
+  TestValue("TRUE IS NOT FALSE", TYPE_BOOLEAN, true);
+  TestValue("TRUE IS NOT UNKNOWN", TYPE_BOOLEAN, true);
+  TestValue("FALSE IS TRUE", TYPE_BOOLEAN, false);
+  TestValue("FALSE IS FALSE", TYPE_BOOLEAN, true);
+  TestValue("FALSE IS UNKNOWN", TYPE_BOOLEAN, false);
+  TestValue("FALSE IS NOT TRUE", TYPE_BOOLEAN, true);
+  TestValue("FALSE IS NOT FALSE", TYPE_BOOLEAN, false);
+  TestValue("FALSE IS NOT UNKNOWN", TYPE_BOOLEAN, true);
+  TestValue("NULL IS TRUE", TYPE_BOOLEAN, false);
+  TestValue("NULL IS FALSE", TYPE_BOOLEAN, false);
+  TestValue("NULL IS UNKNOWN", TYPE_BOOLEAN, true);
+  TestValue("NULL IS NOT TRUE", TYPE_BOOLEAN, true);
+  TestValue("NULL IS NOT FALSE", TYPE_BOOLEAN, true);
+  TestValue("NULL IS NOT UNKNOWN", TYPE_BOOLEAN, false);
+
+  // Tests against expressions
+  TestValue("(2>1) IS TRUE", TYPE_BOOLEAN, true);
+  TestValue("(2>1) IS FALSE", TYPE_BOOLEAN, false);
+  TestValue("(2>1) IS UNKNOWN", TYPE_BOOLEAN, false);
+  TestValue("(2>1) IS NOT TRUE", TYPE_BOOLEAN, false);
+  TestValue("(2>1) IS NOT FALSE", TYPE_BOOLEAN, true);
+  TestValue("(2>1) IS NOT UNKNOWN", TYPE_BOOLEAN, true);
+  TestValue("(1>2) IS TRUE", TYPE_BOOLEAN, false);
+  TestValue("(1>2) IS FALSE", TYPE_BOOLEAN, true);
+  TestValue("(1>2) IS UNKNOWN", TYPE_BOOLEAN, false);
+  TestValue("(1>2) IS NOT TRUE", TYPE_BOOLEAN, true);
+  TestValue("(1>2) IS NOT FALSE", TYPE_BOOLEAN, false);
+  TestValue("(1>2) IS NOT UNKNOWN", TYPE_BOOLEAN, true);
+  TestValue("(NULL = 1) IS TRUE", TYPE_BOOLEAN, false);
+  TestValue("(NULL = 1) IS FALSE", TYPE_BOOLEAN, false);
+  TestValue("(NULL = 1) IS UNKNOWN", TYPE_BOOLEAN, true);
+  TestValue("(NULL = 1) IS NOT TRUE", TYPE_BOOLEAN, true);
+  TestValue("(NULL = 1) IS NOT FALSE", TYPE_BOOLEAN, true);
+  TestValue("(NULL = 1) IS NOT UNKNOWN", TYPE_BOOLEAN, false);
 }
 
 TEST_F(ExprTest, LikePredicate) {
@@ -4212,6 +4295,21 @@ TEST_F(ExprTest, MathFunctions) {
   TestValue("e()", TYPE_DOUBLE, M_E);
   TestValue("abs(cast(-1.0 as double))", TYPE_DOUBLE, 1.0);
   TestValue("abs(cast(1.0 as double))", TYPE_DOUBLE, 1.0);
+  TestValue("abs(-127)", TYPE_SMALLINT, 127);
+  TestValue("abs(-128)", TYPE_SMALLINT, 128);
+  TestValue("abs(127)", TYPE_SMALLINT, 127);
+  TestValue("abs(128)", TYPE_INT, 128);
+  TestValue("abs(-32767)", TYPE_INT, 32767);
+  TestValue("abs(-32768)", TYPE_INT, 32768);
+  TestValue("abs(32767)", TYPE_INT, 32767);
+  TestValue("abs(32768)", TYPE_BIGINT, 32768);
+  TestValue("abs(-1 * cast(pow(2, 31) as int))", TYPE_BIGINT, 2147483648);
+  TestValue("abs(cast(pow(2, 31) as int))", TYPE_BIGINT, 2147483648);
+  TestValue("abs(2147483647)", TYPE_BIGINT, 2147483647);
+  TestValue("abs(2147483647)", TYPE_BIGINT, 2147483647);
+  TestValue("abs(-9223372036854775807)", TYPE_BIGINT,  9223372036854775807);
+  TestValue("abs(9223372036854775807)", TYPE_BIGINT,  9223372036854775807);
+  TestIsNull("abs(-9223372036854775808)", TYPE_BIGINT);
   TestValue("sign(0.0)", TYPE_FLOAT, 0.0f);
   TestValue("sign(-0.0)", TYPE_FLOAT, 0.0f);
   TestValue("sign(+0.0)", TYPE_FLOAT, 0.0f);
@@ -4480,7 +4578,7 @@ TEST_F(ExprTest, MathFunctions) {
 
   // NULL arguments. In some cases the NULL can match multiple overloads so the result
   // type depends on the order in which function overloads are considered.
-  TestIsNull("abs(NULL)", TYPE_TINYINT);
+  TestIsNull("abs(NULL)", TYPE_SMALLINT);
   TestIsNull("sign(NULL)", TYPE_FLOAT);
   TestIsNull("exp(NULL)", TYPE_DOUBLE);
   TestIsNull("ln(NULL)", TYPE_DOUBLE);

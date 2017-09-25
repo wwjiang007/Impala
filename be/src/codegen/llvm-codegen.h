@@ -62,10 +62,9 @@ namespace llvm {
     class PassManager;
   }
 
-  template<bool B, typename T, typename I>
+  template<typename T, typename I>
   class IRBuilder;
 
-  template<bool preserveName>
   class IRBuilderDefaultInserter;
 }
 
@@ -160,7 +159,7 @@ class LlvmCodeGen {
   /// any other API methods after calling close.
   void Close();
 
-  RuntimeProfile* runtime_profile() { return &profile_; }
+  RuntimeProfile* runtime_profile() { return profile_; }
   RuntimeProfile::Counter* codegen_timer() { return codegen_timer_; }
 
   /// Turns on/off optimization passes
@@ -310,7 +309,9 @@ class LlvmCodeGen {
       LibCacheEntry** cache_entry);
 
   /// Replaces all instructions in 'caller' that call 'target_name' with a call
-  /// instruction to 'new_fn'. Returns the number of call sites updated.
+  /// instruction to 'new_fn'. The argument types of 'new_fn' must exactly match
+  /// the argument types of the function to be replaced. Returns the number of
+  /// call sites updated.
   ///
   /// 'target_name' must be a substring of the mangled symbol of the function to be
   /// replaced. This usually means that the unmangled function name is sufficient.
@@ -668,7 +669,7 @@ class LlvmCodeGen {
   std::string id_;
 
   /// Codegen counters
-  RuntimeProfile profile_;
+  RuntimeProfile* const profile_;
 
   /// MemTracker used for tracking memory consumed by codegen. Connected to a parent
   /// MemTracker if one was provided during initialization. Owned by the ObjectPool
