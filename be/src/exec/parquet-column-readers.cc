@@ -46,6 +46,9 @@ DEFINE_bool(convert_legacy_hive_parquet_utc_timestamps, false,
     "When true, TIMESTAMPs read from files written by Parquet-MR (used by Hive) will "
     "be converted from UTC to local time. Writes are unaffected.");
 
+// Throttle deprecation warnings to - only print warning with this frequency.
+static const int BITPACKED_DEPRECATION_WARNING_FREQUENCY = 100;
+
 // Max data page header size in bytes. This is an estimate and only needs to be an upper
 // bound. It is theoretically possible to have a page header of any size due to string
 // value statistics, but in practice we'll have trouble reading string values this large.
@@ -100,6 +103,10 @@ Status ParquetLevelDecoder::Init(const string& filename,
     case parquet::Encoding::BIT_PACKED:
       num_bytes = BitUtil::Ceil(num_buffered_values, 8);
       bit_reader_.Reset(*data, num_bytes);
+      LOG_EVERY_N(WARNING, BITPACKED_DEPRECATION_WARNING_FREQUENCY)
+          << filename << " uses deprecated Parquet BIT_PACKED encoding for rep or def "
+          << "levels. This will be removed in the future - see IMPALA-6077. Warning "
+          << "every " << BITPACKED_DEPRECATION_WARNING_FREQUENCY << " occurrences.";
       break;
     default: {
       stringstream ss;
@@ -201,10 +208,13 @@ bool ParquetLevelDecoder::FillCache(int batch_size,
   return true;
 }
 
-/// Per column type reader. If MATERIALIZED is true, the column values are materialized
-/// into the slot described by slot_desc. If MATERIALIZED is false, the column values
-/// are not materialized, but the position can be accessed.
-template<typename T, bool MATERIALIZED>
+/// Per column type reader. InternalType is the datatype that Impala uses internally to
+/// store tuple data and PARQUET_TYPE is the corresponding primitive datatype (as defined
+/// in the parquet spec) that is used to store column values in parquet files.
+/// If MATERIALIZED is true, the column values are materialized into the slot described
+/// by slot_desc. If MATERIALIZED is false, the column values are not materialized, but
+/// the position can be accessed.
+template<typename InternalType, parquet::Type::type PARQUET_TYPE, bool MATERIALIZED>
 class ScalarColumnReader : public BaseScalarColumnReader {
  public:
   ScalarColumnReader(HdfsParquetScanner* parent, const SchemaNode& node,
@@ -221,8 +231,9 @@ class ScalarColumnReader : public BaseScalarColumnReader {
 
     DCHECK(slot_desc_ != NULL);
     DCHECK_NE(slot_desc_->type().type, TYPE_BOOLEAN);
-    if (slot_desc_->type().type == TYPE_DECIMAL) {
-      fixed_len_size_ = ParquetPlainEncoder::DecimalSize(slot_desc_->type());
+    if (slot_desc_->type().type == TYPE_DECIMAL
+        && PARQUET_TYPE == parquet::Type::FIXED_LEN_BYTE_ARRAY) {
+      fixed_len_size_ = node.element->type_length;
     } else if (slot_desc_->type().type == TYPE_VARCHAR) {
       fixed_len_size_ = slot_desc_->type().len;
     } else {
@@ -442,7 +453,7 @@ class ScalarColumnReader : public BaseScalarColumnReader {
 
   virtual Status CreateDictionaryDecoder(uint8_t* values, int size,
       DictDecoderBase** decoder) {
-    if (!dict_decoder_.Reset(values, size, fixed_len_size_)) {
+    if (!dict_decoder_.template Reset<PARQUET_TYPE>(values, size, fixed_len_size_)) {
         return Status(TErrorCode::PARQUET_CORRUPT_DICTIONARY, filename(),
             slot_desc_->type().DebugString(), "could not decode dictionary");
     }
@@ -498,8 +509,9 @@ class ScalarColumnReader : public BaseScalarColumnReader {
     void* slot = tuple->GetSlot(tuple_offset_);
     // Use an uninitialized stack allocation for temporary value to avoid running
     // constructors doing work unnecessarily, e.g. if T == StringValue.
-    alignas(T) uint8_t val_buf[sizeof(T)];
-    T* val_ptr = reinterpret_cast<T*>(NEEDS_CONVERSION ? val_buf : slot);
+    alignas(InternalType) uint8_t val_buf[sizeof(InternalType)];
+    InternalType* val_ptr = reinterpret_cast<InternalType*>(
+        NEEDS_CONVERSION ? val_buf : slot);
     if (IS_DICT_ENCODED) {
       DCHECK_EQ(page_encoding_, parquet::Encoding::PLAIN_DICTIONARY);
       if (UNLIKELY(!dict_decoder_.GetNextValue(val_ptr))) {
@@ -508,8 +520,8 @@ class ScalarColumnReader : public BaseScalarColumnReader {
       }
     } else {
       DCHECK_EQ(page_encoding_, parquet::Encoding::PLAIN);
-      int encoded_len =
-          ParquetPlainEncoder::Decode<T>(data_, data_end_, fixed_len_size_, val_ptr);
+      int encoded_len = ParquetPlainEncoder::Decode<InternalType, PARQUET_TYPE>(
+          data_,data_end_,fixed_len_size_, val_ptr);
       if (UNLIKELY(encoded_len < 0)) {
         SetPlainDecodeError();
         return false;
@@ -544,14 +556,14 @@ class ScalarColumnReader : public BaseScalarColumnReader {
   }
 
   /// Converts and writes 'src' into 'slot' based on desc_->type()
-  bool ConvertSlot(const T* src, void* slot, MemPool* pool) {
+  bool ConvertSlot(const InternalType* src, void* slot, MemPool* pool) {
     DCHECK(false);
     return false;
   }
 
   /// Sets error message and returns false if the slot value is invalid, e.g., due to
   /// being out of the valid value range.
-  bool ValidateSlot(T* src, Tuple* tuple) const {
+  bool ValidateSlot(InternalType* src, Tuple* tuple) const {
     DCHECK(false);
     return false;
   }
@@ -567,7 +579,7 @@ class ScalarColumnReader : public BaseScalarColumnReader {
   }
 
   /// Dictionary decoder for decoding column values.
-  DictDecoder<T> dict_decoder_;
+  DictDecoder<InternalType> dict_decoder_;
 
   /// True if dict_decoder_ has been initialized with a dictionary page.
   bool dict_decoder_init_;
@@ -581,12 +593,13 @@ class ScalarColumnReader : public BaseScalarColumnReader {
 };
 
 template<>
-inline bool ScalarColumnReader<StringValue, true>::NeedsConversionInline() const {
+inline bool ScalarColumnReader<StringValue, parquet::Type::BYTE_ARRAY, true>
+::NeedsConversionInline() const {
   return needs_conversion_;
 }
 
 template<>
-bool ScalarColumnReader<StringValue, true>::ConvertSlot(
+bool ScalarColumnReader<StringValue, parquet::Type::BYTE_ARRAY, true>::ConvertSlot(
     const StringValue* src, void* slot, MemPool* pool) {
   DCHECK(slot_desc() != NULL);
   DCHECK(slot_desc()->type().type == TYPE_CHAR);
@@ -599,12 +612,13 @@ bool ScalarColumnReader<StringValue, true>::ConvertSlot(
 }
 
 template<>
-inline bool ScalarColumnReader<TimestampValue, true>::NeedsConversionInline() const {
+inline bool ScalarColumnReader<TimestampValue, parquet::Type::INT96, true>
+::NeedsConversionInline() const {
   return needs_conversion_;
 }
 
 template<>
-bool ScalarColumnReader<TimestampValue, true>::ConvertSlot(
+bool ScalarColumnReader<TimestampValue, parquet::Type::INT96, true>::ConvertSlot(
     const TimestampValue* src, void* slot, MemPool* pool) {
   // Conversion should only happen when this flag is enabled.
   DCHECK(FLAGS_convert_legacy_hive_parquet_utc_timestamps);
@@ -615,14 +629,15 @@ bool ScalarColumnReader<TimestampValue, true>::ConvertSlot(
 }
 
 template<>
-inline bool ScalarColumnReader<TimestampValue, true>::NeedsValidationInline() const {
+inline bool ScalarColumnReader<TimestampValue, parquet::Type::INT96, true>
+::NeedsValidationInline() const {
   return true;
 }
 
 template<>
-bool ScalarColumnReader<TimestampValue, true>::ValidateSlot(
+bool ScalarColumnReader<TimestampValue, parquet::Type::INT96, true>::ValidateSlot(
     TimestampValue* src, Tuple* tuple) const {
-  if (UNLIKELY(!src->IsValidDate())) {
+  if (UNLIKELY(!TimestampValue::IsValidDate(src->date()))) {
     ErrorMsg msg(TErrorCode::PARQUET_TIMESTAMP_OUT_OF_RANGE,
         filename(), node_.element->name);
     Status status = parent_->state_->LogOrReturnError(msg);
@@ -801,8 +816,8 @@ Status BaseScalarColumnReader::ReadPageHeader(bool peek,
     DCHECK(stream_->eosr());
     DCHECK_LT(num_values_read_, metadata_->num_values);
     // TODO for 2.3: node_.element->name isn't necessarily useful
-    ErrorMsg msg(TErrorCode::PARQUET_COLUMN_METADATA_INVALID,
-                 metadata_->num_values, num_values_read_, node_.element->name, filename());
+    ErrorMsg msg(TErrorCode::PARQUET_COLUMN_METADATA_INVALID, metadata_->num_values,
+        num_values_read_, node_.element->name, filename());
     RETURN_IF_ERROR(parent_->state_->LogOrReturnError(msg));
     *eos = true;
     return Status::OK();
@@ -974,12 +989,14 @@ Status BaseScalarColumnReader::ReadDataPage() {
   // We're about to move to the next data page.  The previous data page is
   // now complete, free up any memory allocated for it. If the data page contained
   // strings we need to attach it to the returned batch.
-  if (CurrentPageContainsTupleData()) {
-    parent_->scratch_batch_->aux_mem_pool.AcquireData(
-        decompressed_data_pool_.get(), false);
+  if (PageContainsTupleData(page_encoding_)) {
+    parent_->scratch_batch_->aux_mem_pool.AcquireData(data_page_pool_.get(), false);
   } else {
-    decompressed_data_pool_->FreeAll();
+    data_page_pool_->FreeAll();
   }
+  // We don't hold any pointers to earlier pages in the stream - we can safely free
+  // any accumulated I/O or boundary buffers.
+  stream_->ReleaseCompletedResources(false);
 
   // Read the next data page, skipping page types we don't care about.
   // We break out of this loop on the non-error case (a data page was found or we read all
@@ -1043,14 +1060,9 @@ Status BaseScalarColumnReader::ReadDataPage() {
     int uncompressed_size = current_page_header_.uncompressed_page_size;
     if (decompressor_.get() != NULL) {
       SCOPED_TIMER(parent_->decompress_timer_);
-      uint8_t* decompressed_buffer =
-          decompressed_data_pool_->TryAllocate(uncompressed_size);
-      if (UNLIKELY(decompressed_buffer == NULL)) {
-        string details = Substitute(PARQUET_COL_MEM_LIMIT_EXCEEDED, "ReadDataPage",
-            uncompressed_size, "decompressed data");
-        return decompressed_data_pool_->mem_tracker()->MemLimitExceeded(
-            parent_->state_, details, uncompressed_size);
-      }
+      uint8_t* decompressed_buffer;
+      RETURN_IF_ERROR(AllocateUncompressedDataPage(
+            uncompressed_size, "decompressed data", &decompressed_buffer));
       RETURN_IF_ERROR(decompressor_->ProcessBlock32(true,
           current_page_header_.compressed_page_size, data_, &uncompressed_size,
           &decompressed_buffer));
@@ -1070,6 +1082,17 @@ Status BaseScalarColumnReader::ReadDataPage() {
         return Status(Substitute("Error reading data page in file '$0'. "
             "Expected $1 bytes but got $2", filename(),
             current_page_header_.compressed_page_size, uncompressed_size));
+      }
+      if (PageContainsTupleData(current_page_header_.data_page_header.encoding)) {
+        // In this case returned batches will have pointers into the data page itself.
+        // We don't transfer disk I/O buffers out of the scanner so we need to copy
+        // the page data so that it can be attached to output batches.
+        uint8_t* copy_buffer;
+        RETURN_IF_ERROR(AllocateUncompressedDataPage(
+              uncompressed_size, "uncompressed variable-length data", &copy_buffer));
+        memcpy(copy_buffer, data_, uncompressed_size);
+        data_ = copy_buffer;
+        data_end_ = data_ + uncompressed_size;
       }
     }
 
@@ -1091,6 +1114,18 @@ Status BaseScalarColumnReader::ReadDataPage() {
     break;
   }
 
+  return Status::OK();
+}
+
+Status BaseScalarColumnReader::AllocateUncompressedDataPage(int64_t size,
+    const char* err_ctx, uint8_t** buffer) {
+  *buffer = data_page_pool_->TryAllocate(size);
+  if (*buffer == nullptr) {
+    string details =
+        Substitute(PARQUET_COL_MEM_LIMIT_EXCEEDED, "ReadDataPage", size, err_ctx);
+    return data_page_pool_->mem_tracker()->MemLimitExceeded(
+        parent_->state_, details, size);
+  }
   return Status::OK();
 }
 
@@ -1221,8 +1256,46 @@ void CollectionColumnReader::UpdateDerivedState() {
   }
 }
 
+/// Returns a column reader for decimal types based on its size and parquet type.
+static ParquetColumnReader* GetDecimalColumnReader(const SchemaNode& node,
+    const SlotDescriptor* slot_desc, HdfsParquetScanner* parent) {
+  switch (node.element->type) {
+    case parquet::Type::FIXED_LEN_BYTE_ARRAY:
+      switch (slot_desc->type().GetByteSize()) {
+      case 4:
+        return new ScalarColumnReader<Decimal4Value, parquet::Type::FIXED_LEN_BYTE_ARRAY,
+            true>(parent, node, slot_desc);
+      case 8:
+        return new ScalarColumnReader<Decimal8Value, parquet::Type::FIXED_LEN_BYTE_ARRAY,
+            true>(parent, node, slot_desc);
+      case 16:
+        return new ScalarColumnReader<Decimal16Value, parquet::Type::FIXED_LEN_BYTE_ARRAY,
+            true>(parent, node, slot_desc);
+      }
+      break;
+    case parquet::Type::BYTE_ARRAY:
+      switch (slot_desc->type().GetByteSize()) {
+      case 4:
+        return new ScalarColumnReader<Decimal4Value, parquet::Type::BYTE_ARRAY, true>(
+            parent, node, slot_desc);
+      case 8:
+        return new ScalarColumnReader<Decimal8Value, parquet::Type::BYTE_ARRAY, true>(
+            parent, node, slot_desc);
+      case 16:
+        return new ScalarColumnReader<Decimal16Value, parquet::Type::BYTE_ARRAY, true>(
+            parent, node, slot_desc);
+      }
+      break;
+    default:
+      DCHECK(false) << "Invalid decimal primitive type";
+  }
+  DCHECK(false) << "Invalid decimal type";
+  return nullptr;
+}
+
 ParquetColumnReader* ParquetColumnReader::Create(const SchemaNode& node,
-    bool is_collection_field, const SlotDescriptor* slot_desc, HdfsParquetScanner* parent) {
+    bool is_collection_field, const SlotDescriptor* slot_desc,
+    HdfsParquetScanner* parent) {
   ParquetColumnReader* reader = NULL;
   if (is_collection_field) {
     // Create collection reader (note this handles both NULL and non-NULL 'slot_desc')
@@ -1234,46 +1307,41 @@ ParquetColumnReader* ParquetColumnReader::Create(const SchemaNode& node,
         reader = new BoolColumnReader(parent, node, slot_desc);
         break;
       case TYPE_TINYINT:
-        reader = new ScalarColumnReader<int8_t, true>(parent, node, slot_desc);
+        reader = new ScalarColumnReader<int8_t, parquet::Type::INT32, true>(parent, node,
+            slot_desc);
         break;
       case TYPE_SMALLINT:
-        reader = new ScalarColumnReader<int16_t, true>(parent, node, slot_desc);
+        reader = new ScalarColumnReader<int16_t, parquet::Type::INT32, true>(parent, node,
+            slot_desc);
         break;
       case TYPE_INT:
-        reader = new ScalarColumnReader<int32_t, true>(parent, node, slot_desc);
+        reader = new ScalarColumnReader<int32_t, parquet::Type::INT32, true>(parent, node,
+            slot_desc);
         break;
       case TYPE_BIGINT:
-        reader = new ScalarColumnReader<int64_t, true>(parent, node, slot_desc);
+        reader = new ScalarColumnReader<int64_t, parquet::Type::INT64, true>(parent, node,
+            slot_desc);
         break;
       case TYPE_FLOAT:
-        reader = new ScalarColumnReader<float, true>(parent, node, slot_desc);
+        reader = new ScalarColumnReader<float, parquet::Type::FLOAT, true>(parent, node,
+            slot_desc);
         break;
       case TYPE_DOUBLE:
-        reader = new ScalarColumnReader<double, true>(parent, node, slot_desc);
+        reader = new ScalarColumnReader<double, parquet::Type::DOUBLE, true>(parent, node,
+            slot_desc);
         break;
       case TYPE_TIMESTAMP:
-        reader = new ScalarColumnReader<TimestampValue, true>(parent, node, slot_desc);
+        reader = new ScalarColumnReader<TimestampValue, parquet::Type::INT96, true>(
+            parent, node, slot_desc);
         break;
       case TYPE_STRING:
       case TYPE_VARCHAR:
       case TYPE_CHAR:
-        reader = new ScalarColumnReader<StringValue, true>(parent, node, slot_desc);
+        reader = new ScalarColumnReader<StringValue, parquet::Type::BYTE_ARRAY, true>(
+            parent, node, slot_desc);
         break;
       case TYPE_DECIMAL:
-        switch (slot_desc->type().GetByteSize()) {
-          case 4:
-            reader = new ScalarColumnReader<Decimal4Value, true>(
-                parent, node, slot_desc);
-            break;
-          case 8:
-            reader = new ScalarColumnReader<Decimal8Value, true>(
-                parent, node, slot_desc);
-            break;
-          case 16:
-            reader = new ScalarColumnReader<Decimal16Value, true>(
-                parent, node, slot_desc);
-            break;
-        }
+        reader = GetDecimalColumnReader(node, slot_desc, parent);
         break;
       default:
         DCHECK(false) << slot_desc->type().DebugString();
@@ -1282,7 +1350,8 @@ ParquetColumnReader* ParquetColumnReader::Create(const SchemaNode& node,
     // Special case for counting scalar values (e.g. count(*), no materialized columns in
     // the file, only materializing a position slot). We won't actually read any values,
     // only the rep and def levels, so it doesn't matter what kind of reader we make.
-    reader = new ScalarColumnReader<int8_t, false>(parent, node, slot_desc);
+    reader = new ScalarColumnReader<int8_t, parquet::Type::INT32, false>(parent, node,
+        slot_desc);
   }
   return parent->obj_pool_.Add(reader);
 }

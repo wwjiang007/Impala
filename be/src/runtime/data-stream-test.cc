@@ -307,7 +307,8 @@ class DataStreamTest : public testing::Test {
     ordering_exprs_.push_back(lhs_slot);
     less_than_ = obj_pool_.Add(new TupleRowComparator(ordering_exprs_,
         is_asc_, nulls_first_));
-    ASSERT_OK(less_than_->Open(&obj_pool_, runtime_state_.get(), mem_pool_.get()));
+    ASSERT_OK(less_than_->Open(
+        &obj_pool_, runtime_state_.get(), mem_pool_.get(), mem_pool_.get()));
   }
 
   // Create batch_, but don't fill it with data yet. Assumes we created row_desc_.
@@ -424,8 +425,8 @@ class DataStreamTest : public testing::Test {
         } else if (stream_type == TPartitionType::HASH_PARTITIONED) {
           // hash-partitioned streams send values to the right partition
           int64_t value = *j;
-          uint32_t hash_val =
-              RawValue::GetHashValueFnv(&value, TYPE_BIGINT, HashUtil::FNV_SEED);
+          uint64_t hash_val = RawValue::GetHashValueFastHash(&value, TYPE_BIGINT,
+              DataStreamSender::EXCHANGE_HASH_SEED);
           EXPECT_EQ(hash_val % receiver_info_.size(), info.receiver_num);
         }
       }

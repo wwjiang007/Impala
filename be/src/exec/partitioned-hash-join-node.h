@@ -111,7 +111,6 @@ class PartitionedHashJoinNode : public BlockingJoinNode {
   virtual void Close(RuntimeState* state) override;
 
  protected:
-  virtual Status QueryMaintenance(RuntimeState* state) override;
   virtual void AddToDebugString(
       int indentation_level, std::stringstream* out) const override;
 
@@ -423,6 +422,11 @@ class PartitionedHashJoinNode : public BlockingJoinNode {
   /// and probing of the hash tables.
   boost::scoped_ptr<HashTableCtx> ht_ctx_;
 
+  /// MemPool that stores allocations that hold results from evaluation of probe
+  /// exprs by 'ht_ctx_'. Cached probe expression values may reference memory in this
+  /// pool.
+  boost::scoped_ptr<MemPool> probe_expr_results_pool_;
+
   /// The iterator that corresponds to the look up of current_probe_row_.
   HashTable::Iterator hash_tbl_iterator_;
 
@@ -474,9 +478,8 @@ class PartitionedHashJoinNode : public BlockingJoinNode {
   /// This list is populated at CleanUpHashPartitions().
   std::list<PhjBuilder::Partition*> output_build_partitions_;
 
-  /// Used while processing null_aware_partition_. It contains all the build tuple rows
-  /// with a NULL when evaluating the hash table expr.
-  boost::scoped_ptr<RowBatch> nulls_build_batch_;
+  /// Whether this join is in a state outputting rows from OutputNullAwareProbeRows().
+  bool output_null_aware_probe_rows_running_;
 
   /// Partition used if 'null_aware_' is set. During probing, rows from the probe
   /// side that did not have a match in the hash table are appended to this partition.

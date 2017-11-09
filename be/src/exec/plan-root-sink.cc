@@ -73,7 +73,7 @@ Status PlanRootSink::Send(RuntimeState* state, RowBatch* batch) {
   // written clients may not cope correctly with them. See IMPALA-4335.
   while (current_batch_row < batch->num_rows()) {
     unique_lock<mutex> l(lock_);
-    while (results_ == nullptr && !consumer_done_) sender_cv_.wait(l);
+    while (results_ == nullptr && !consumer_done_) sender_cv_.Wait(l);
     if (consumer_done_ || batch == nullptr) {
       eos_ = true;
       return Status::OK();
@@ -97,10 +97,11 @@ Status PlanRootSink::Send(RuntimeState* state, RowBatch* batch) {
       RETURN_IF_ERROR(results_->AddOneRow(result_row, scales));
       ++current_batch_row;
     }
+    // Prevent expr result allocations from accumulating.
+    expr_results_pool_->Clear();
     // Signal the consumer.
     results_ = nullptr;
-    ScalarExprEvaluator::FreeLocalAllocations(output_expr_evals_);
-    consumer_cv_.notify_all();
+    consumer_cv_.NotifyAll();
   }
   return Status::OK();
 }
@@ -109,7 +110,7 @@ Status PlanRootSink::FlushFinal(RuntimeState* state) {
   unique_lock<mutex> l(lock_);
   sender_done_ = true;
   eos_ = true;
-  consumer_cv_.notify_all();
+  consumer_cv_.NotifyAll();
   return Status::OK();
 }
 
@@ -118,17 +119,17 @@ void PlanRootSink::Close(RuntimeState* state) {
   // No guarantee that FlushFinal() has been called, so need to mark sender_done_ here as
   // well.
   sender_done_ = true;
-  consumer_cv_.notify_all();
+  consumer_cv_.NotifyAll();
   // Wait for consumer to be done, in case sender tries to tear-down this sink while the
   // sender is still reading from it.
-  while (!consumer_done_) sender_cv_.wait(l);
+  while (!consumer_done_) sender_cv_.Wait(l);
   DataSink::Close(state);
 }
 
 void PlanRootSink::CloseConsumer() {
   unique_lock<mutex> l(lock_);
   consumer_done_ = true;
-  sender_cv_.notify_all();
+  sender_cv_.NotifyAll();
 }
 
 Status PlanRootSink::GetNext(
@@ -137,9 +138,9 @@ Status PlanRootSink::GetNext(
 
   results_ = results;
   num_rows_requested_ = num_results;
-  sender_cv_.notify_all();
+  sender_cv_.NotifyAll();
 
-  while (!eos_ && results_ != nullptr && !sender_done_) consumer_cv_.wait(l);
+  while (!eos_ && results_ != nullptr && !sender_done_) consumer_cv_.Wait(l);
 
   *eos = eos_;
   return state->GetQueryStatus();

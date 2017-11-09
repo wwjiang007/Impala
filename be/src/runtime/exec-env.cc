@@ -28,6 +28,7 @@
 #include "common/object-pool.h"
 #include "exec/kudu-util.h"
 #include "gen-cpp/ImpalaInternalService.h"
+#include "rpc/rpc-mgr.h"
 #include "runtime/backend-client.h"
 #include "runtime/bufferpool/buffer-pool.h"
 #include "runtime/bufferpool/reservation-tracker.h"
@@ -159,19 +160,17 @@ ExecEnv::ExecEnv(const string& hostname, int backend_port, int krpc_port,
     webserver_(new Webserver(webserver_port)),
     pool_mem_trackers_(new PoolMemTrackerRegistry),
     thread_mgr_(new ThreadResourceMgr),
-    hdfs_op_thread_pool_(
-        CreateHdfsOpThreadPool("hdfs-worker-pool", FLAGS_num_hdfs_worker_threads, 1024)),
     tmp_file_mgr_(new TmpFileMgr),
     frontend_(new Frontend()),
-    exec_rpc_thread_pool_(new CallableThreadPool("exec-rpc-pool", "worker",
-        FLAGS_coordinator_rpc_threads, numeric_limits<int32_t>::max())),
     async_rpc_pool_(new CallableThreadPool("rpc-pool", "async-rpc-sender", 8, 10000)),
     query_exec_mgr_(new QueryExecMgr()),
     enable_webserver_(FLAGS_enable_webserver && webserver_port > 0),
-    backend_address_(MakeNetworkAddress(hostname, backend_port)),
-    krpc_port_(krpc_port) {
+    backend_address_(MakeNetworkAddress(hostname, backend_port)) {
 
   if (FLAGS_use_krpc) {
+    // KRPC relies on resolved IP address. It's set in StartServices().
+    krpc_address_.__set_port(krpc_port);
+    rpc_mgr_.reset(new RpcMgr());
     stream_mgr_.reset(new KrpcDataStreamMgr(metrics_.get()));
   } else {
     stream_mgr_.reset(new DataStreamMgr(metrics_.get()));
@@ -188,6 +187,10 @@ ExecEnv::ExecEnv(const string& hostname, int backend_port, int krpc_port,
       subscriber_address, statestore_address, metrics_.get()));
 
   if (FLAGS_is_coordinator) {
+    hdfs_op_thread_pool_.reset(
+        CreateHdfsOpThreadPool("hdfs-worker-pool", FLAGS_num_hdfs_worker_threads, 1024));
+    exec_rpc_thread_pool_.reset(new CallableThreadPool("exec-rpc-pool", "worker",
+        FLAGS_coordinator_rpc_threads, numeric_limits<int32_t>::max()));
     scheduler_.reset(new Scheduler(statestore_subscriber_.get(),
         statestore_subscriber_->id(), metrics_.get(), webserver_.get(),
         request_pool_service_.get()));
@@ -204,6 +207,7 @@ ExecEnv::ExecEnv(const string& hostname, int backend_port, int krpc_port,
 
 ExecEnv::~ExecEnv() {
   if (buffer_reservation_ != nullptr) buffer_reservation_->Close();
+  if (rpc_mgr_ != nullptr) rpc_mgr_->Shutdown();
   disk_io_mgr_.reset(); // Need to tear down before mem_tracker_.
 }
 
@@ -213,13 +217,13 @@ Status ExecEnv::InitForFeTests() {
   return Status::OK();
 }
 
-Status ExecEnv::StartServices() {
-  LOG(INFO) << "Starting global services";
-
+Status ExecEnv::Init() {
   // Initialize thread pools
-  RETURN_IF_ERROR(exec_rpc_thread_pool_->Init());
+  if (FLAGS_is_coordinator) {
+    RETURN_IF_ERROR(exec_rpc_thread_pool_->Init());
+    RETURN_IF_ERROR(hdfs_op_thread_pool_->Init());
+  }
   RETURN_IF_ERROR(async_rpc_pool_->Init());
-  RETURN_IF_ERROR(hdfs_op_thread_pool_->Init());
 
   // Initialize global memory limit.
   // Depending on the system configuration, we will have to calculate the process
@@ -283,6 +287,15 @@ Status ExecEnv::StartServices() {
   RETURN_IF_ERROR(RegisterMemoryMetrics(
       metrics_.get(), true, buffer_reservation_.get(), buffer_pool_.get()));
 
+  // Resolve hostname to IP address.
+  RETURN_IF_ERROR(HostnameToIpAddr(backend_address_.hostname, &ip_address_));
+
+  // Initialize the RPCMgr before allowing services registration.
+  if (FLAGS_use_krpc) {
+    krpc_address_.__set_hostname(ip_address_);
+    RETURN_IF_ERROR(rpc_mgr_->Init());
+  }
+
   mem_tracker_.reset(
       new MemTracker(AggregateMemoryMetrics::TOTAL_USED, bytes_limit, "Process"));
   // Add BufferPool MemTrackers for cached memory that is not tracked against queries
@@ -336,12 +349,11 @@ Status ExecEnv::StartServices() {
   }
 
   if (scheduler_ != nullptr) {
-    RETURN_IF_ERROR(scheduler_->Init(backend_address_, krpc_port_));
+    RETURN_IF_ERROR(scheduler_->Init(backend_address_, krpc_address_, ip_address_));
   }
   if (admission_controller_ != nullptr) RETURN_IF_ERROR(admission_controller_->Init());
 
-  // Get the fs.defaultFS value set in core-site.xml and assign it to
-  // configured_defaultFs
+  // Get the fs.defaultFS value set in core-site.xml and assign it to configured_defaultFs
   TGetHadoopConfigRequest config_request;
   config_request.__set_name(DEFAULT_FS);
   TGetHadoopConfigResponse config_response;
@@ -351,6 +363,13 @@ Status ExecEnv::StartServices() {
   } else {
     default_fs_ = "hdfs://";
   }
+
+  return Status::OK();
+}
+
+Status ExecEnv::StartServices() {
+  LOG(INFO) << "Starting global services";
+
   // Must happen after all topic registrations / callbacks are done
   if (statestore_subscriber_.get() != nullptr) {
     Status status = statestore_subscriber_->Start();
@@ -360,6 +379,8 @@ Status ExecEnv::StartServices() {
     }
   }
 
+  // Start this last so everything is in place before accepting the first call.
+  if (FLAGS_use_krpc) RETURN_IF_ERROR(rpc_mgr_->StartServices(krpc_address_));
   return Status::OK();
 }
 
@@ -398,4 +419,4 @@ KrpcDataStreamMgr* ExecEnv::KrpcStreamMgr() {
   return dynamic_cast<KrpcDataStreamMgr*>(stream_mgr_.get());
 }
 
-}
+} // namespace impala

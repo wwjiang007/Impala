@@ -47,6 +47,7 @@ namespace llvm {
   class AllocaInst;
   class BasicBlock;
   class ConstantFolder;
+  class DiagnosticInfo;
   class ExecutionEngine;
   class Function;
   class LLVMContext;
@@ -192,6 +193,9 @@ class LlvmCodeGen {
     /// Returns name of function
     const std::string& name() const { return name_; }
 
+    /// (Re-)sets name of function
+    void SetName(const std::string& name) { name_ = name; }
+
     /// Add argument
     void AddArgument(const NamedVariable& var) {
       args_.push_back(var);
@@ -261,6 +265,12 @@ class LlvmCodeGen {
   /// which cannot be represented with primitive types (e.g. struct).
   llvm::Constant* ConstantToGVPtr(llvm::Type* type, llvm::Constant* ir_constant,
       const std::string& name);
+
+  /// Creates a global value 'name' that is an array with element type 'element_type'
+  /// containing 'ir_constants'. Returns a pointer to the global value, i.e. a pointer
+  /// to a constant array of 'element_type'.
+  llvm::Constant* ConstantsToGVArrayPtr(llvm::Type* element_type,
+      llvm::ArrayRef<llvm::Constant*> ir_constants, const std::string& name);
 
   /// Returns reference to llvm context object.  Each LlvmCodeGen has its own
   /// context to allow multiple threads to be calling into llvm at the same time.
@@ -569,9 +579,13 @@ class LlvmCodeGen {
   Status LoadModuleFromMemory(std::unique_ptr<llvm::MemoryBuffer> module_ir_buf,
       std::string module_name, std::unique_ptr<llvm::Module>* module);
 
-  /// Loads a module at 'file' and links it to the module associated with
-  /// this LlvmCodeGen object. The module must be on the local filesystem.
-  Status LinkModule(const std::string& file);
+  /// Loads a module at 'file' and links it to the module associated with this
+  /// LlvmCodeGen object. The 'file' must be on the local filesystem.
+  Status LinkModuleFromLocalFs(const std::string& file);
+
+  /// Same as 'LinkModuleFromLocalFs', but takes an hdfs file location instead and makes
+  /// sure that the same hdfs file is not linked twice.
+  Status LinkModuleFromHdfs(const std::string& hdfs_file);
 
   /// Strip global constructors and destructors from an LLVM module. We never run them
   /// anyway (they must be explicitly invoked) so it is dead code.
@@ -751,8 +765,8 @@ class LlvmCodeGen {
   /// we can codegen a loop unrolled hash function.
   std::map<int, llvm::Function*> hash_fns_;
 
-  /// The locations of modules that have been linked. Used to avoid linking the same module
-  /// twice, which causes symbol collision errors.
+  /// The locations of modules that have been linked. Uses hdfs file location as the key.
+  /// Used to avoid linking the same module twice, which causes symbol collision errors.
   std::set<std::string> linked_modules_;
 
   /// The vector of functions to automatically JIT compile after FinalizeModule().
@@ -776,6 +790,29 @@ class LlvmCodeGen {
   /// 'symbol_emitter_' are called by 'execution_engine_' when code is emitted or freed.
   /// The lifetime of the symbol emitter must be longer than 'execution_engine_'.
   boost::scoped_ptr<CodegenSymbolEmitter> symbol_emitter_;
+
+  /// Provides an implementation of a LLVM diagnostic handler and maintains the error
+  /// information from its callbacks.
+  class DiagnosticHandler {
+   public:
+    /// Returns the last error that was reported via DiagnosticHandlerFn() and then
+    /// clears it. Returns an empty string otherwise. This should be called after any
+    /// LLVM API call that can fail but returns error info via this mechanism.
+    /// TODO: IMPALA-6038: use this to check and handle errors wherever needed.
+    std::string GetErrorString();
+
+    /// Handler function that sets the state on an instance of this class which is
+    /// accessible via the LlvmCodeGen object passed to it using the 'context'
+    /// input parameter.
+    static void DiagnosticHandlerFn(const llvm::DiagnosticInfo &info, void *context);
+
+   private:
+    /// Contains the last error that was reported via DiagnosticHandlerFn().
+    /// Is cleared by a call to GetErrorString().
+    std::string error_str_;
+  };
+
+  DiagnosticHandler diagnostic_handler_;
 
   /// Very rough estimate of memory in bytes that the IR and the intermediate data
   /// structures used by the optimizer may consume per LLVM IR instruction to be

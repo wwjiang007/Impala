@@ -88,7 +88,8 @@ ClientRequestState::ClientRequestState(
     fetched_rows_(false),
     frontend_(frontend),
     parent_server_(server),
-    start_time_(TimestampValue::LocalTime()) {
+    start_time_us_(UnixMicros()),
+    end_time_us_(0LL) {
 #ifndef NDEBUG
   profile_->AddInfoString("DEBUG MODE WARNING", "Query profile created while running a "
       "DEBUG build of Impala. Use RELEASE builds to measure query performance.");
@@ -106,7 +107,7 @@ ClientRequestState::ClientRequestState(
     summary_profile_->AddInfoString("HiveServer2 Protocol Version",
         Substitute("V$0", 1 + session->hs2_version));
   }
-  summary_profile_->AddInfoString("Start Time", start_time().ToString());
+  summary_profile_->AddInfoString("Start Time", ToStringFromUnixMicros(start_time_us()));
   summary_profile_->AddInfoString("End Time", "");
   summary_profile_->AddInfoString("Query Type", "N/A");
   summary_profile_->AddInfoString("Query State", PrintQueryState(query_state_));
@@ -199,14 +200,14 @@ Status ClientRequestState::Exec(TExecRequest* exec_request) {
         RETURN_IF_ERROR(SetQueryOption(
             exec_request_.set_query_option_request.key,
             exec_request_.set_query_option_request.value,
-            &session_->default_query_options,
+            &session_->set_query_options,
             &session_->set_query_options_mask));
         SetResultSet({}, {});
       } else {
         // "SET" returns a table of all query options.
         map<string, string> config;
         TQueryOptionsToMap(
-            session_->default_query_options, &config);
+            session_->QueryOptions(), &config);
         vector<string> keys, values;
         map<string, string>::const_iterator itr = config.begin();
         for (; itr != config.end(); ++itr) {
@@ -564,8 +565,8 @@ void ClientRequestState::Done() {
   }
 
   unique_lock<mutex> l(lock_);
-  end_time_ = TimestampValue::LocalTime();
-  summary_profile_->AddInfoString("End Time", end_time().ToString());
+  end_time_us_ = UnixMicros();
+  summary_profile_->AddInfoString("End Time", ToStringFromUnixMicros(end_time_us()));
   query_events_->MarkEvent("Unregister query");
 
   // Update result set cache metrics, and update mem limit accounting before tearing
@@ -612,12 +613,12 @@ void ClientRequestState::BlockOnWait() {
     l.lock();
     is_block_on_wait_joining_ = false;
     wait_thread_.reset();
-    block_on_wait_cv_.notify_all();
+    block_on_wait_cv_.NotifyAll();
   } else {
     // Another thread is already joining with wait_thread_.  Block on the cond-var
     // until the Join() executed in the other thread has completed.
     do {
-      block_on_wait_cv_.wait(l);
+      block_on_wait_cv_.Wait(l);
     } while (is_block_on_wait_joining_);
   }
 }
@@ -824,8 +825,7 @@ Status ClientRequestState::FetchRowsInternal(const int32_t max_rows,
     // Count the cached rows towards the mem limit.
     if (UNLIKELY(!query_mem_tracker->TryConsume(delta_bytes))) {
       string details("Failed to allocate memory for result cache.");
-      return query_mem_tracker->MemLimitExceeded(coord_->runtime_state(), details,
-          delta_bytes);
+      return query_mem_tracker->MemLimitExceeded(nullptr, details, delta_bytes);
     }
     // Append all rows fetched from the coordinator into the cache.
     int num_rows_added = result_cache_->AddRows(

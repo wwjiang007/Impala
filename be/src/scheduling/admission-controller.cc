@@ -233,7 +233,7 @@ AdmissionController::~AdmissionController() {
     // Lock to ensure the dequeue thread will see the update to done_
     lock_guard<mutex> l(admission_ctrl_lock_);
     done_ = true;
-    dequeue_cv_.notify_one();
+    dequeue_cv_.NotifyOne();
   }
   dequeue_thread_->Join();
 }
@@ -620,7 +620,7 @@ Status AdmissionController::ReleaseQuery(QuerySchedule* schedule) {
     VLOG_RPC << "Released query id=" << schedule->query_id() << " "
              << stats->DebugString();
   }
-  dequeue_cv_.notify_one();
+  dequeue_cv_.NotifyOne();
   return Status::OK();
 }
 
@@ -646,11 +646,10 @@ void AdmissionController::UpdatePoolStats(
         }
       }
       HandleTopicUpdates(delta.topic_entries);
-      HandleTopicDeletions(delta.topic_deletions);
     }
     UpdateClusterAggregates();
   }
-  dequeue_cv_.notify_one(); // Dequeue and admit queries on the dequeue thread
+  dequeue_cv_.NotifyOne(); // Dequeue and admit queries on the dequeue thread
 }
 
 void AdmissionController::PoolStats::UpdateRemoteStats(const string& host_id,
@@ -684,6 +683,10 @@ void AdmissionController::HandleTopicUpdates(const vector<TTopicItem>& topic_upd
     // The topic entry from this subscriber is handled specially; the stats coming
     // from the statestore are likely already outdated.
     if (topic_backend_id == host_id_) continue;
+    if (item.deleted) {
+      GetPoolStats(pool_name)->UpdateRemoteStats(topic_backend_id, nullptr);
+      continue;
+    }
     TPoolStats remote_update;
     uint32_t len = item.value.size();
     Status status = DeserializeThriftMsg(reinterpret_cast<const uint8_t*>(
@@ -696,18 +699,7 @@ void AdmissionController::HandleTopicUpdates(const vector<TTopicItem>& topic_upd
   }
 }
 
-void AdmissionController::HandleTopicDeletions(const vector<string>& topic_deletions) {
-  for (const string& topic_key: topic_deletions) {
-    string pool_name;
-    string topic_backend_id;
-    if (!ParsePoolTopicKey(topic_key, &pool_name, &topic_backend_id)) continue;
-    if (topic_backend_id == host_id_) continue;
-    GetPoolStats(pool_name)->UpdateRemoteStats(topic_backend_id, nullptr);
-  }
-}
-
-void AdmissionController::PoolStats::UpdateAggregates(
-    HostMemMap* host_mem_reserved) {
+void AdmissionController::PoolStats::UpdateAggregates(HostMemMap* host_mem_reserved) {
   const string& coord_id = parent_->host_id_;
   int64_t num_running = 0;
   int64_t num_queued = 0;
@@ -830,7 +822,7 @@ void AdmissionController::DequeueLoop() {
   while (true) {
     unique_lock<mutex> lock(admission_ctrl_lock_);
     if (done_) break;
-    dequeue_cv_.wait(lock);
+    dequeue_cv_.Wait(lock);
     for (const PoolConfigMap::value_type& entry: pool_config_map_) {
       const string& pool_name = entry.first;
       const TPoolConfig& pool_config = entry.second;

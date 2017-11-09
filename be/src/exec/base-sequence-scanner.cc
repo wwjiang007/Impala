@@ -68,6 +68,12 @@ Status BaseSequenceScanner::IssueInitialRanges(HdfsScanNodeBase* scan_node,
   return Status::OK();
 }
 
+bool BaseSequenceScanner::FileFormatIsSequenceBased(THdfsFileFormat::type format) {
+  return format == THdfsFileFormat::SEQUENCE_FILE ||
+         format == THdfsFileFormat::RC_FILE ||
+         format == THdfsFileFormat::AVRO;
+}
+
 BaseSequenceScanner::BaseSequenceScanner(HdfsScanNodeBase* node, RuntimeState* state)
   : HdfsScanner(node, state) {
 }
@@ -92,9 +98,6 @@ Status BaseSequenceScanner::Open(ScannerContext* context) {
     only_parsing_header_ = true;
     return Status::OK();
   }
-
-  // If the file is compressed, the buffers in the stream_ are not used directly.
-  if (header_->is_compressed) stream_->set_contains_tuple_data(false);
   RETURN_IF_ERROR(InitNewRange());
 
   // Skip to the first record
@@ -122,7 +125,6 @@ void BaseSequenceScanner::Close(RowBatch* row_batch) {
   if (row_batch != nullptr) {
     row_batch->tuple_data_pool()->AcquireData(data_buffer_pool_.get(), false);
     row_batch->tuple_data_pool()->AcquireData(template_tuple_pool_.get(), false);
-    context_->ReleaseCompletedResources(row_batch, true);
     if (scan_node_->HasRowBatchQueue()) {
       static_cast<HdfsScanNode*>(scan_node_)->AddMaterializedRowBatch(
         unique_ptr<RowBatch>(row_batch));
@@ -130,8 +132,8 @@ void BaseSequenceScanner::Close(RowBatch* row_batch) {
   } else {
     data_buffer_pool_->FreeAll();
     template_tuple_pool_->FreeAll();
-    context_->ReleaseCompletedResources(nullptr, true);
   }
+  context_->ReleaseCompletedResources(true);
 
   // Verify all resources (if any) have been transferred.
   DCHECK_EQ(template_tuple_pool_.get()->total_allocated_bytes(), 0);

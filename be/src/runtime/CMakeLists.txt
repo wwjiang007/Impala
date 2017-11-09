@@ -38,7 +38,6 @@ add_library(Runtime
   disk-io-mgr-scan-range.cc
   disk-io-mgr-stress.cc
   exec-env.cc
-  free-pool.cc
   fragment-instance-state.cc
   hbase-table.cc
   hbase-table-factory.cc
@@ -50,7 +49,6 @@ add_library(Runtime
   mem-tracker.cc
   mem-pool.cc
   multi-precision.cc
-  parallel-executor.cc
   query-exec-mgr.cc
   query-state.cc
   test-env.cc
@@ -69,6 +67,7 @@ add_library(Runtime
   timestamp-parse-util.cc
   timestamp-value.cc
   tuple.cc
+  tuple-ir.cc
   tuple-row.cc
   tmp-file-mgr.cc
 )
@@ -84,7 +83,6 @@ ADD_BE_TEST(string-buffer-test)
 ADD_BE_TEST(data-stream-test)
 ADD_BE_TEST(timestamp-test)
 ADD_BE_TEST(disk-io-mgr-test)
-ADD_BE_TEST(parallel-executor-test)
 ADD_BE_TEST(raw-value-test)
 ADD_BE_TEST(string-compare-test)
 ADD_BE_TEST(string-search-test)

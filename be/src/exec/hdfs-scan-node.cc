@@ -21,6 +21,7 @@
 #include <sstream>
 
 #include "common/logging.h"
+#include "exec/base-sequence-scanner.h"
 #include "exec/hdfs-scanner.h"
 #include "exec/scanner-context.h"
 #include "runtime/descriptors.h"
@@ -114,7 +115,6 @@ Status HdfsScanNode::GetNextInternal(
   *eos = false;
   unique_ptr<RowBatch> materialized_batch = materialized_row_batches_->GetBatch();
   if (materialized_batch != NULL) {
-    num_owned_io_buffers_.Add(-materialized_batch->num_io_buffers());
     row_batch->AcquireState(materialized_batch.get());
     // Update the number of materialized rows now instead of when they are materialized.
     // This means that scanners might process and queue up more rows than are necessary
@@ -132,7 +132,6 @@ Status HdfsScanNode::GetNextInternal(
       *eos = true;
       SetDone();
     }
-    DCHECK_EQ(materialized_batch->num_io_buffers(), 0);
     materialized_batch.reset();
     return Status::OK();
   }
@@ -228,16 +227,11 @@ Status HdfsScanNode::Open(RuntimeState* state) {
 void HdfsScanNode::Close(RuntimeState* state) {
   if (is_closed()) return;
   SetDone();
-
   if (thread_avail_cb_id_ != -1) {
     state->resource_pool()->RemoveThreadAvailableCb(thread_avail_cb_id_);
   }
-
   scanner_threads_.JoinAll();
-
-  num_owned_io_buffers_.Add(-materialized_row_batches_->Cleanup());
-  DCHECK_EQ(num_owned_io_buffers_.Load(), 0) << "ScanNode has leaked io buffers";
-
+  materialized_row_batches_->Cleanup();
   HdfsScanNodeBase::Close(state);
 }
 
@@ -386,16 +380,20 @@ void HdfsScanNode::ScannerThread() {
   // contexts as the embedded expression evaluators may allocate from it and MemPool
   // is not thread safe.
   MemPool filter_mem_pool(expr_mem_tracker());
+  MemPool expr_results_pool(expr_mem_tracker());
   vector<FilterContext> filter_ctxs;
   Status filter_status = Status::OK();
   for (auto& filter_ctx: filter_ctxs_) {
     FilterContext filter;
-    filter_status = filter.CloneFrom(filter_ctx, pool_, runtime_state_, &filter_mem_pool);
+    filter_status = filter.CloneFrom(filter_ctx, pool_, runtime_state_, &filter_mem_pool,
+        &expr_results_pool);
     if (!filter_status.ok()) break;
     filter_ctxs.push_back(filter);
   }
 
   while (!done_) {
+    // Prevent memory accumulating across scan ranges.
+    expr_results_pool.Clear();
     {
       // Check if we have enough resources (thread token and memory) to keep using
       // this thread.
@@ -435,7 +433,7 @@ void HdfsScanNode::ScannerThread() {
     if (status.ok() && scan_range != NULL) {
       // Got a scan range. Process the range end to end (in this thread).
       status = ProcessSplit(filter_status.ok() ? filter_ctxs : vector<FilterContext>(),
-          scan_range);
+          &expr_results_pool, scan_range);
     }
 
     if (!status.ok()) {
@@ -477,23 +475,11 @@ exit:
   runtime_state_->resource_pool()->ReleaseThreadToken(false);
   for (auto& ctx: filter_ctxs) ctx.expr_eval->Close(runtime_state_);
   filter_mem_pool.FreeAll();
-}
-
-namespace {
-
-// Returns true if 'format' uses a scanner derived from BaseSequenceScanner. Used to
-// workaround IMPALA-3798.
-bool FileFormatIsSequenceBased(THdfsFileFormat::type format) {
-  return format == THdfsFileFormat::SEQUENCE_FILE ||
-      format == THdfsFileFormat::RC_FILE ||
-      format == THdfsFileFormat::AVRO;
-}
-
+  expr_results_pool.FreeAll();
 }
 
 Status HdfsScanNode::ProcessSplit(const vector<FilterContext>& filter_ctxs,
-    DiskIoMgr::ScanRange* scan_range) {
-
+    MemPool* expr_results_pool, DiskIoMgr::ScanRange* scan_range) {
   DCHECK(scan_range != NULL);
 
   ScanRangeMetadata* metadata = static_cast<ScanRangeMetadata*>(scan_range->meta_data());
@@ -508,7 +494,7 @@ Status HdfsScanNode::ProcessSplit(const vector<FilterContext>& filter_ctxs,
   // process the header split, the remaining scan ranges in the file will not be marked as
   // done. See FilePassesFilterPredicates() for the correct logic to mark all splits in a
   // file as done; the correct fix here is to do that for every file in a thread-safe way.
-  if (!FileFormatIsSequenceBased(partition->file_format())) {
+  if (!BaseSequenceScanner::FileFormatIsSequenceBased(partition->file_format())) {
     if (!PartitionPassesFilters(partition_id, FilterStats::SPLITS_KEY, filter_ctxs)) {
       // Avoid leaking unread buffers in scan_range.
       scan_range->Cancel(Status::CANCELLED);
@@ -519,7 +505,8 @@ Status HdfsScanNode::ProcessSplit(const vector<FilterContext>& filter_ctxs,
     }
   }
 
-  ScannerContext context(runtime_state_, this, partition, scan_range, filter_ctxs);
+  ScannerContext context(
+      runtime_state_, this, partition, scan_range, filter_ctxs, expr_results_pool);
   scoped_ptr<HdfsScanner> scanner;
   Status status = CreateAndOpenScanner(partition, &context, &scanner);
   if (!status.ok()) {

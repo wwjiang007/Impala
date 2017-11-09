@@ -35,7 +35,7 @@
 #include "kudu/util/trace.h"
 
 
-DEFINE_bool(rpc_dump_all_traces, false,
+DEFINE_bool_hidden(rpc_dump_all_traces, false,
             "If true, dump all RPC traces at INFO level");
 TAG_FLAG(rpc_dump_all_traces, advanced);
 TAG_FLAG(rpc_dump_all_traces, runtime);
@@ -149,7 +149,7 @@ void MethodSampler::SampleCall(InboundCall* call) {
       std::swap(bucket->sample, new_sample);
       bucket->last_sample_time.Store(now);
     }
-    VLOG(1) << "Sampled call " << call->ToString();
+    VLOG(2) << "Sampled call " << call->ToString();
   }
 }
 

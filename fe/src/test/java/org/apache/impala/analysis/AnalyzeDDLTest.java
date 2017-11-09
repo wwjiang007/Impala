@@ -44,7 +44,6 @@ import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.FrontendTestBase;
 import org.apache.impala.common.RuntimeEnv;
-import org.apache.impala.service.CatalogOpExecutor;
 import org.apache.impala.testutil.TestUtils;
 import org.apache.impala.thrift.TDescribeTableParams;
 import org.apache.impala.util.MetaStoreUtil;
@@ -305,24 +304,6 @@ public class AnalyzeDDLTest extends FrontendTestBase {
           " 'file:///test-warehouse/alltypes/y2050m12' uncached",
           "The specified cache pool does not exist: nonExistentTestPool");
     }
-
-    // Test the limit for the number of partitions
-    StringBuilder stmt = new StringBuilder("alter table functional.alltypes add");
-    int year;
-    int month;
-    for (int i = 0; i < CatalogOpExecutor.MAX_PARTITION_UPDATES_PER_RPC; ++i) {
-      year = i/12 + 2050;
-      month = i%12 + 1;
-      stmt.append(String.format(" partition(year=%d, month=%d)", year, month));
-    }
-    AnalyzesOk(stmt.toString());
-    // Over the limit by one partition
-    year = CatalogOpExecutor.MAX_PARTITION_UPDATES_PER_RPC/12 + 2050;
-    month = CatalogOpExecutor.MAX_PARTITION_UPDATES_PER_RPC%12 + 1;
-    stmt.append(String.format(" partition(year=%d, month=%d)", year, month));
-    AnalysisError(stmt.toString(),
-        String.format("One ALTER TABLE ADD PARTITION cannot add more than %d partitions.",
-        CatalogOpExecutor.MAX_PARTITION_UPDATES_PER_RPC));
 
     // If 'IF NOT EXISTS' is not used, ALTER TABLE ADD PARTITION cannot add a preexisting
     // partition to a table.
@@ -2236,7 +2217,7 @@ public class AnalyzeDDLTest extends FrontendTestBase {
     // Test unsupported Kudu types
     List<String> unsupportedTypes = Lists.newArrayList(
         "DECIMAL(9,0)", "VARCHAR(20)", "CHAR(20)",
-        "STRUCT<F1:INT,F2:STRING>", "ARRAY<INT>", "MAP<STRING,STRING>");
+        "STRUCT<f1:INT,f2:STRING>", "ARRAY<INT>", "MAP<STRING,STRING>");
     for (String t: unsupportedTypes) {
       String expectedError = String.format(
           "Cannot create table 'tab': Type %s is not supported in Kudu", t);

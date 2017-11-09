@@ -327,6 +327,43 @@ class TestParquet(ImpalaTestSuite):
     assert len(result.data) == 1
     assert "4294967294" in result.data
 
+  @SkipIfADLS.hive
+  @SkipIfIsilon.hive
+  @SkipIfLocal.hive
+  @SkipIfS3.hive
+  def test_multi_compression_types(self, vector, unique_database):
+    """IMPALA-5448: Tests that parquet splits with multi compression types are counted
+    correctly. Cases tested:
+    - parquet file with columns using the same compression type
+    - parquet files using snappy and gzip compression types
+    """
+    self.client.execute("create table %s.alltypes_multi_compression like"
+        " functional_parquet.alltypes" % unique_database)
+    hql_format = "set parquet.compression={codec};" \
+        "insert into table %s.alltypes_multi_compression" \
+        "  partition (year = {year}, month = {month})" \
+        "  select id, bool_col, tinyint_col, smallint_col, int_col, bigint_col," \
+        "    float_col, double_col,date_string_col,string_col,timestamp_col" \
+        "  from functional_parquet.alltypes" \
+        "  where year = {year} and month = {month}" % unique_database
+    check_call(['hive', '-e', hql_format.format(codec="snappy", year=2010, month=1)])
+    check_call(['hive', '-e', hql_format.format(codec="gzip", year=2010, month=2)])
+
+    self.client.execute("create table %s.multi_compression (a string, b string)"
+        " stored as parquet" % unique_database)
+    multi_compression_tbl_loc =\
+        get_fs_path("/test-warehouse/%s.db/%s" % (unique_database, "multi_compression"))
+    check_call(['hdfs', 'dfs', '-copyFromLocal', os.environ['IMPALA_HOME'] +
+        "/testdata/multi_compression_parquet_data/tinytable_0_gzip_snappy.parq",
+        multi_compression_tbl_loc])
+    check_call(['hdfs', 'dfs', '-copyFromLocal', os.environ['IMPALA_HOME'] +
+        "/testdata/multi_compression_parquet_data/tinytable_1_snappy_gzip.parq",
+        multi_compression_tbl_loc])
+
+    vector.get_value('exec_option')['num_nodes'] = 1
+    self.run_test_case('QueryTest/hdfs_parquet_scan_node_profile',
+                       vector, unique_database)
+
   def test_corrupt_rle_counts(self, vector, unique_database):
     """IMPALA-3646: Tests that a certain type of file corruption for plain
     dictionary encoded values is gracefully handled. Cases tested:
@@ -551,6 +588,24 @@ class TestParquet(ImpalaTestSuite):
   def test_resolution_by_name(self, vector, unique_database):
     self.run_test_case('QueryTest/parquet-resolution-by-name', vector,
                        use_db=unique_database)
+
+  def test_decimal_encodings(self, vector, unique_database):
+    # Create a table using an existing data file with dictionary-encoded, variable-length
+    # physical encodings for decimals.
+    TABLE_NAME = "decimal_encodings"
+    self.client.execute('''create table if not exists %s.%s
+    (small_dec decimal(9,2), med_dec decimal(18,2), large_dec decimal(38,2))
+    STORED AS PARQUET''' % (unique_database, TABLE_NAME))
+
+    table_loc = get_fs_path(
+      "/test-warehouse/%s.db/%s" % (unique_database, TABLE_NAME))
+    for file_name in ["binary_decimal_dictionary.parquet",
+                      "binary_decimal_no_dictionary.parquet"]:
+      data_file_path = os.path.join(os.environ['IMPALA_HOME'],
+                                    "testdata/data/", file_name)
+      check_call(['hdfs', 'dfs', '-copyFromLocal', data_file_path, table_loc])
+
+    self.run_test_case('QueryTest/parquet-decimal-formats', vector, unique_database)
 
 # We use various scan range lengths to exercise corner cases in the HDFS scanner more
 # thoroughly. In particular, it will exercise:

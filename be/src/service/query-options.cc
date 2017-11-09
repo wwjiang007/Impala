@@ -58,7 +58,7 @@ void impala::OverlayQueryOptions(const TQueryOptions& src, const QueryOptionsMas
   DCHECK_GT(mask.size(), _TImpalaQueryOptions_VALUES_TO_NAMES.size()) <<
       "Size of QueryOptionsMask must be increased.";
 #define QUERY_OPT_FN(NAME, ENUM)\
-  if (src.__isset.NAME && mask[TImpalaQueryOptions::ENUM]) dst->NAME = src.NAME;
+  if (src.__isset.NAME && mask[TImpalaQueryOptions::ENUM]) dst->__set_##NAME(src.NAME);
   QUERY_OPTS_TABLE
 #undef QUERY_OPT_FN
 }
@@ -67,12 +67,30 @@ void impala::TQueryOptionsToMap(const TQueryOptions& query_options,
     map<string, string>* configuration) {
 #define QUERY_OPT_FN(NAME, ENUM)\
   {\
-    stringstream val;\
-    val << query_options.NAME;\
-    (*configuration)[#ENUM] = val.str();\
+    if (query_options.__isset.NAME) { \
+      stringstream val;\
+      val << query_options.NAME;\
+      (*configuration)[#ENUM] = val.str();\
+    } else { \
+      (*configuration)[#ENUM] = ""; \
+    }\
   }
   QUERY_OPTS_TABLE
 #undef QUERY_OPT_FN
+}
+
+// Resets query_options->option to its default value.
+static void ResetQueryOption(const int option, TQueryOptions* query_options) {
+  const static TQueryOptions defaults;
+  switch (option) {
+#define QUERY_OPT_FN(NAME, ENUM)\
+    case TImpalaQueryOptions::ENUM:\
+      query_options->__isset.NAME = defaults.__isset.NAME;\
+      query_options->NAME = defaults.NAME;\
+      break;
+  QUERY_OPTS_TABLE
+#undef QUERY_OPT_FN
+  }
 }
 
 string impala::DebugQueryOptions(const TQueryOptions& query_options) {
@@ -92,7 +110,7 @@ string impala::DebugQueryOptions(const TQueryOptions& query_options) {
 
 // Returns the TImpalaQueryOptions enum for the given "key". Input is case insensitive.
 // Return -1 if the input is an invalid option.
-int GetQueryOptionForKey(const string& key) {
+static int GetQueryOptionForKey(const string& key) {
   map<int, const char*>::const_iterator itr =
       _TImpalaQueryOptions_VALUES_TO_NAMES.begin();
   for (; itr != _TImpalaQueryOptions_VALUES_TO_NAMES.end(); ++itr) {
@@ -111,6 +129,12 @@ Status impala::SetQueryOption(const string& key, const string& value,
   int option = GetQueryOptionForKey(key);
   if (option < 0) {
     return Status(Substitute("Invalid query option: $0", key));
+  } else if (value == "") {
+    ResetQueryOption(option, query_options);
+    if (set_query_options_mask != nullptr) {
+      DCHECK_LT(option, set_query_options_mask->size());
+      set_query_options_mask->reset(option);
+    }
   } else {
     switch (option) {
       case TImpalaQueryOptions::ABORT_ON_ERROR:
@@ -124,9 +148,17 @@ Status impala::SetQueryOption(const string& key, const string& value,
         query_options->__set_disable_codegen(
             iequals(value, "true") || iequals(value, "1"));
         break;
-      case TImpalaQueryOptions::BATCH_SIZE:
-        query_options->__set_batch_size(atoi(value.c_str()));
+      case TImpalaQueryOptions::BATCH_SIZE: {
+        StringParser::ParseResult status;
+        int val = StringParser::StringToInt<int>(value.c_str(),
+            static_cast<int>(value.size()), &status);
+        if (status != StringParser::PARSE_SUCCESS || val < 0 || val > 65536) {
+          return Status(Substitute("Invalid batch size '$0'. Valid sizes are in"
+              "[0, 65536]", value));
+        }
+        query_options->__set_batch_size(val);
         break;
+      }
       case TImpalaQueryOptions::MEM_LIMIT: {
         // Parse the mem limit spec and validate it.
         int64_t bytes_limit;
@@ -172,7 +204,6 @@ Status impala::SetQueryOption(const string& key, const string& value,
         break;
       }
       case TImpalaQueryOptions::COMPRESSION_CODEC: {
-        if (value.empty()) break;
         if (iequals(value, "none")) {
           query_options->__set_compression_codec(THdfsCompression::NONE);
         } else if (iequals(value, "gzip")) {
@@ -353,7 +384,7 @@ Status impala::SetQueryOption(const string& key, const string& value,
         if (result != StringParser::PARSE_SUCCESS || time_ms < 0) {
           return Status(
               Substitute("$0 is not a valid wait time. Valid sizes are in [0, $1].",
-                  value, 0, numeric_limits<int32_t>::max()));
+                  value, numeric_limits<int32_t>::max()));
         }
         query_options->__set_runtime_filter_wait_time_ms(time_ms);
         break;

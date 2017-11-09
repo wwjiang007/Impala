@@ -17,32 +17,18 @@
 
 #include "exec/hdfs-parquet-scanner.h"
 
-#include <limits> // for std::numeric_limits
 #include <queue>
 
-#include <gflags/gflags.h>
 #include <gutil/strings/substitute.h>
 
 #include "codegen/codegen-anyval.h"
-#include "codegen/llvm-codegen.h"
-#include "common/logging.h"
-#include "exec/hdfs-scanner.h"
 #include "exec/hdfs-scan-node.h"
 #include "exec/parquet-column-readers.h"
 #include "exec/parquet-column-stats.h"
 #include "exec/scanner-context.inline.h"
-#include "exprs/scalar-expr.h"
 #include "runtime/collection-value-builder.h"
-#include "runtime/descriptors.h"
 #include "runtime/runtime-state.h"
-#include "runtime/mem-pool.h"
-#include "runtime/row-batch.h"
 #include "runtime/runtime-filter.inline.h"
-#include "runtime/tuple-row.h"
-#include "runtime/tuple.h"
-#include "runtime/string-value.h"
-#include "util/debug-util.h"
-#include "util/error-util.h"
 #include "rpc/thrift-util.h"
 
 #include "common/names.h"
@@ -178,7 +164,6 @@ HdfsParquetScanner::HdfsParquetScanner(HdfsScanNodeBase* scan_node, RuntimeState
 
 Status HdfsParquetScanner::Open(ScannerContext* context) {
   RETURN_IF_ERROR(HdfsScanner::Open(context));
-  stream_->set_contains_tuple_data(false);
   metadata_range_ = stream_->scan_range();
   num_cols_counter_ =
       ADD_COUNTER(scan_node_->runtime_profile(), "NumColumns", TUnit::UNIT);
@@ -217,8 +202,8 @@ Status HdfsParquetScanner::Open(ScannerContext* context) {
 
   // Clone the min/max statistics conjuncts.
   RETURN_IF_ERROR(ScalarExprEvaluator::Clone(&obj_pool_, state_,
-      expr_mem_pool_.get(), scan_node_->min_max_conjunct_evals(),
-      &min_max_conjunct_evals_));
+      expr_perm_pool_.get(), context_->expr_results_pool(),
+      scan_node_->min_max_conjunct_evals(), &min_max_conjunct_evals_));
 
   for (int i = 0; i < context->filter_ctxs().size(); ++i) {
     const FilterContext* ctx = &context->filter_ctxs()[i];
@@ -242,7 +227,7 @@ Status HdfsParquetScanner::Open(ScannerContext* context) {
 
   // Release I/O buffers immediately to make sure they are cleaned up
   // in case we return a non-OK status anywhere below.
-  context_->ReleaseCompletedResources(NULL, true);
+  context_->ReleaseCompletedResources(true);
   RETURN_IF_ERROR(footer_status);
 
   // Parse the file schema into an internal representation for schema resolution.
@@ -279,7 +264,7 @@ void HdfsParquetScanner::Close(RowBatch* row_batch) {
   } else {
     template_tuple_pool_->FreeAll();
     dictionary_pool_.get()->FreeAll();
-    context_->ReleaseCompletedResources(nullptr, true);
+    context_->ReleaseCompletedResources(true);
     for (ParquetColumnReader* col_reader : column_readers_) col_reader->Close(nullptr);
     // The scratch batch may still contain tuple data. We can get into this case if
     // Open() fails or if the query is cancelled.
@@ -409,9 +394,13 @@ Status HdfsParquetScanner::ProcessSplit() {
   DCHECK(scan_node_->HasRowBatchQueue());
   HdfsScanNode* scan_node = static_cast<HdfsScanNode*>(scan_node_);
   do {
-    unique_ptr<RowBatch> batch = unique_ptr<RowBatch>(
-        new RowBatch(scan_node_->row_desc(), state_->batch_size(),
-        scan_node_->mem_tracker()));
+    if (FilterContext::CheckForAlwaysFalse(FilterStats::SPLITS_KEY,
+        context_->filter_ctxs())) {
+      eos_ = true;
+      break;
+    }
+    unique_ptr<RowBatch> batch = std::make_unique<RowBatch>(scan_node_->row_desc(),
+        state_->batch_size(), scan_node_->mem_tracker());
     Status status = GetNextInternal(batch.get());
     // Always add batch to the queue because it may contain data referenced by previously
     // appended batches.
@@ -605,8 +594,8 @@ Status HdfsParquetScanner::EvaluateStatsConjuncts(
     }
   }
 
-  // Free any local allocations accumulated during conjunct evaluation.
-  ScalarExprEvaluator::FreeLocalAllocations(min_max_conjunct_evals_);
+  // Free any expr result allocations accumulated during conjunct evaluation.
+  context_->expr_results_pool()->Clear();
   return Status::OK();
 }
 
@@ -738,10 +727,10 @@ Status HdfsParquetScanner::NextRowGroup() {
 }
 
 void HdfsParquetScanner::FlushRowGroupResources(RowBatch* row_batch) {
-  DCHECK(row_batch != NULL);
+  DCHECK(row_batch != nullptr);
   row_batch->tuple_data_pool()->AcquireData(dictionary_pool_.get(), false);
   scratch_batch_->ReleaseResources(row_batch->tuple_data_pool());
-  context_->ReleaseCompletedResources(row_batch, true);
+  context_->ReleaseCompletedResources(true);
   for (ParquetColumnReader* col_reader : column_readers_) {
     col_reader->Close(row_batch);
   }
@@ -918,9 +907,9 @@ Status HdfsParquetScanner::EvalDictionaryFilters(const parquet::RowGroup& row_gr
     bool column_has_match = false;
     for (int dict_idx = 0; dict_idx < dictionary->num_entries(); ++dict_idx) {
       if (dict_idx % 1024 == 0) {
-        // Don't let local allocations accumulate too much for large dictionaries or
+        // Don't let expr result allocations accumulate too much for large dictionaries or
         // many row groups.
-        ScalarExprEvaluator::FreeLocalAllocations(dict_filter_conjunct_evals);
+        context_->expr_results_pool()->Clear();
       }
       dictionary->GetValue(dict_idx, slot);
 
@@ -934,8 +923,8 @@ Status HdfsParquetScanner::EvalDictionaryFilters(const parquet::RowGroup& row_gr
         break;
       }
     }
-    // Free all local allocations now that we're done with the filter.
-    ScalarExprEvaluator::FreeLocalAllocations(dict_filter_conjunct_evals);
+    // Free all expr result allocations now that we're done with the filter.
+    context_->expr_results_pool()->Clear();
 
     if (!column_has_match) {
       // The column contains no value that matches the conjunct. The row group
@@ -1028,32 +1017,15 @@ Status HdfsParquetScanner::CommitRows(RowBatch* dst_batch, int num_rows) {
   DCHECK(dst_batch != NULL);
   dst_batch->CommitRows(num_rows);
 
-  // We need to pass the row batch to the scan node if there is too much memory attached,
-  // which can happen if the query is very selective. We need to release memory even
-  // if no rows passed predicates. We should only do this when all rows have been copied
-  // from the scratch batch, since those rows may reference completed I/O buffers in
-  // 'context_'.
-  if (scratch_batch_->AtEnd()
-      && (dst_batch->AtCapacity() || context_->num_completed_io_buffers() > 0)) {
-    context_->ReleaseCompletedResources(dst_batch, /* done */ false);
-  }
   if (context_->cancelled()) return Status::CANCELLED;
   // TODO: It's a really bad idea to propagate UDF error via the global RuntimeState.
   // Store UDF error in thread local storage or make UDF return status so it can merge
   // with parse_status_.
   RETURN_IF_ERROR(state_->GetQueryStatus());
-  // Free local expr allocations made when evaluating conjuncts for this batch.
-  FreeLocalAllocationsForConjuncts();
+  // Clear expr result allocations for this thread to avoid accumulating too much
+  // memory from evaluating the scanner conjuncts.
+  context_->expr_results_pool()->Clear();
   return Status::OK();
-}
-
-void HdfsParquetScanner::FreeLocalAllocationsForConjuncts() {
-  for (const auto& kv: conjunct_evals_map_) {
-    ScalarExprEvaluator::FreeLocalAllocations(kv.second);
-  }
-  for (const FilterContext* filter_ctx : filter_ctxs_) {
-    filter_ctx->expr_eval->FreeLocalAllocations();
-  }
 }
 
 int HdfsParquetScanner::TransferScratchTuples(RowBatch* dst_batch) {
@@ -1512,6 +1484,9 @@ Status HdfsParquetScanner::CreateColumnReaders(const TupleDescriptor& tuple_desc
       continue;
     }
 
+    RETURN_IF_ERROR(ParquetMetadataUtils::ValidateColumn(filename(), *node->element,
+        slot_desc, state_));
+
     ParquetColumnReader* col_reader = ParquetColumnReader::Create(
         *node, slot_desc->type().IsCollectionType(), slot_desc, this);
     column_readers->push_back(col_reader);
@@ -1647,9 +1622,9 @@ Status HdfsParquetScanner::InitColumns(
           col_chunk.meta_data.num_values, num_values, filename());
     }
 
-    RETURN_IF_ERROR(ParquetMetadataUtils::ValidateColumn(file_metadata_, filename(),
-        row_group_idx, scalar_reader->col_idx(), scalar_reader->schema_element(),
-        scalar_reader->slot_desc_, state_));
+    RETURN_IF_ERROR(ParquetMetadataUtils::ValidateRowGroupColumn(file_metadata_,
+        filename(), row_group_idx, scalar_reader->col_idx(),
+        scalar_reader->schema_element(), state_));
 
     if (col_chunk.meta_data.__isset.dictionary_page_offset) {
       // Already validated in ValidateColumnOffsets()
@@ -1700,15 +1675,6 @@ Status HdfsParquetScanner::InitColumns(
     DCHECK(stream != NULL);
 
     RETURN_IF_ERROR(scalar_reader->Reset(&col_chunk.meta_data, stream));
-
-    const SlotDescriptor* slot_desc = scalar_reader->slot_desc();
-    if (slot_desc == NULL || !slot_desc->type().IsStringType() ||
-        col_chunk.meta_data.codec != parquet::CompressionCodec::UNCOMPRESSED) {
-      // Non-string types are always compact.  Compressed columns don't reference data in
-      // the io buffers after tuple materialization.  In both cases, we can set compact to
-      // true and recycle buffers more promptly.
-      stream->set_contains_tuple_data(false);
-    }
   }
   DCHECK_EQ(col_ranges.size(), num_scalar_readers);
 

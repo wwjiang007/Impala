@@ -49,15 +49,15 @@ QUERY = "select * from alltypes where id != %s"# limit %s"
 # heartbeat is 500ms, so the lower the delay the more we can submit before the global
 # state is updated. When the delay is at least the statestore heartbeat frequency, all
 # state should be visible by every impalad by the time the next query is submitted.
-SUBMISSION_DELAY_MS = [0, 50, 100, 600]
+SUBMISSION_DELAY_MS = [50]
 
 # The number of queries to submit. The test does not support fewer queries than
 # MAX_NUM_CONCURRENT_QUERIES + MAX_NUM_QUEUED_QUERIES to keep some validation logic
 # simple.
-NUM_QUERIES = [15, 30, 50]
+NUM_QUERIES = [50]
 
 # Whether we will submit queries to all available impalads (in a round-robin fashion)
-ROUND_ROBIN_SUBMISSION = [True, False]
+ROUND_ROBIN_SUBMISSION = [True]
 
 # The query pool to use. The impalads should be configured to recognize this
 # pool with the parameters below.
@@ -156,8 +156,10 @@ class TestAdmissionController(TestAdmissionControllerBase, HS2TestSuite):
     assert len(confs) == len(expected_query_options)
     confs = map(str.lower, confs)
     for expected in expected_query_options:
-      assert expected.lower() in confs,\
-          "Expected query options '%s' to be set" % (",".join(expected_query_options))
+      if expected.lower() not in confs:
+        expected = ",".join(sorted(expected_query_options))
+        actual = ",".join(sorted(confs))
+        assert False, "Expected query options %s, got %s." % (expected, actual)
 
   def __check_hs2_query_opts(self, pool_name, mem_limit=None, expected_options=None):
     """ Submits a query via HS2 (optionally with a mem_limit in the confOverlay)
@@ -254,6 +256,18 @@ class TestAdmissionController(TestAdmissionControllerBase, HS2TestSuite):
       self.__check_query_options(result.runtime_profile,\
           ['MEM_LIMIT=12345', 'QUERY_TIMEOUT_S=5', 'REQUEST_POOL=root.queueA',\
            'ABORT_ON_ERROR=1', 'MAX_IO_BUFFERS=100'])
+
+      # Once options are reset to their defaults, the queue
+      # configuration should kick back in. We'll see the
+      # queue-configured mem_limit, and we won't see
+      # abort on error, because it's back to being the default.
+      client.execute('set mem_limit=""')
+      client.execute('set abort_on_error=""')
+      client.set_configuration({ 'request_pool': 'root.queueA' })
+      result = client.execute("select 1")
+      self.__check_query_options(result.runtime_profile,
+            [queueA_mem_limit, 'REQUEST_POOL=root.queueA', 'QUERY_TIMEOUT_S=5'])
+
     finally:
       client.close()
 

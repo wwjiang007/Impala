@@ -27,6 +27,7 @@
 #include "runtime/test-env.h"
 #include "service/fe-support.h"
 #include "util/cpu-info.h"
+#include "util/filesystem-util.h"
 #include "util/hash-util.h"
 #include "util/path-builder.h"
 #include "util/scope-exit-trigger.h"
@@ -95,6 +96,14 @@ class LlvmCodeGenTest : public testing:: Test {
   }
 
   static Status FinalizeModule(LlvmCodeGen* codegen) { return codegen->FinalizeModule(); }
+
+  static Status LinkModuleFromLocalFs(LlvmCodeGen* codegen, const string& file) {
+    return codegen->LinkModuleFromLocalFs(file);
+  }
+
+  static Status LinkModuleFromHdfs(LlvmCodeGen* codegen, const string& hdfs_file) {
+    return codegen->LinkModuleFromHdfs(hdfs_file);
+  }
 };
 
 // Simple test to just make and destroy llvmcodegen objects.  LLVM
@@ -454,6 +463,31 @@ TEST_F(LlvmCodeGenTest, HashTest) {
 
   // Restore hardware feature for next test
   CpuInfo::EnableFeature(CpuInfo::SSE4_2, restore_sse_support);
+}
+
+// Test that an error propagating through codegen's diagnostic handler is
+// captured by impala. An error is induced by asking Llvm to link the same lib twice.
+TEST_F(LlvmCodeGenTest, HandleLinkageError) {
+  string ir_file_path("llvm-ir/test-loop.bc");
+  string module_file;
+  PathBuilder::GetFullPath(ir_file_path, &module_file);
+  scoped_ptr<LlvmCodeGen> codegen;
+  ASSERT_OK(CreateFromFile(module_file.c_str(), &codegen));
+  EXPECT_TRUE(codegen.get() != nullptr);
+  Status status = LinkModuleFromLocalFs(codegen.get(), module_file);
+  EXPECT_STR_CONTAINS(status.GetDetail(), "symbol multiply defined");
+  codegen->Close();
+}
+
+// Test that Impala does not return error when trying to link the same lib file twice.
+TEST_F(LlvmCodeGenTest, LinkageTest) {
+  scoped_ptr<LlvmCodeGen> codegen;
+  ASSERT_OK(LlvmCodeGen::CreateImpalaCodegen(runtime_state_, nullptr, "test", &codegen));
+  EXPECT_TRUE(codegen.get() != nullptr);
+  string hdfs_file_path("/test-warehouse/test-udfs.ll");
+  ASSERT_OK(LinkModuleFromHdfs(codegen.get(), hdfs_file_path));
+  ASSERT_OK(LinkModuleFromHdfs(codegen.get(), hdfs_file_path));
+  codegen->Close();
 }
 
 }

@@ -96,7 +96,6 @@ ir_functions = [
   ["SCALAR_EXPR_GET_DECIMAL_VAL",
    "_ZN6impala10ScalarExpr13GetDecimalValEPS0_PNS_19ScalarExprEvaluatorEPKNS_8TupleRowE"],
   ["HASH_CRC", "IrCrcHash"],
-  ["HASH_FNV", "IrFnvHash"],
   ["HASH_MURMUR", "IrMurmurHash"],
   ["PHJ_PROCESS_BUILD_BATCH",
    "_ZN6impala10PhjBuilder17ProcessBuildBatchEPNS_8RowBatchEPNS_12HashTableCtxEbb"],
@@ -170,10 +169,12 @@ ir_functions = [
    "_ZN6impala15HdfsAvroScanner12ReadAvroCharENS_13PrimitiveTypeEiPPhS2_bPvPNS_7MemPoolE"],
   ["READ_AVRO_DECIMAL",
    "_ZN6impala15HdfsAvroScanner15ReadAvroDecimalEiPPhS1_bPvPNS_7MemPoolE"],
-  ["HDFS_SCANNER_WRITE_ALIGNED_TUPLES",
-   "_ZN6impala11HdfsScanner18WriteAlignedTuplesEPNS_7MemPoolEPNS_8TupleRowEiPNS_13FieldLocationEiiii"],
   ["HDFS_SCANNER_GET_CONJUNCT_EVALUATOR",
    "_ZNK6impala11HdfsScanner15GetConjunctEvalEi"],
+  ["HDFS_SCANNER_INIT_TUPLE",
+   "_ZN6impala11HdfsScanner9InitTupleEPNS_5TupleES2_"],
+  ["HDFS_SCANNER_WRITE_ALIGNED_TUPLES",
+   "_ZN6impala11HdfsScanner18WriteAlignedTuplesEPNS_7MemPoolEPNS_8TupleRowEPNS_13FieldLocationEiiiib"],
   ["PROCESS_SCRATCH_BATCH",
    "_ZN6impala18HdfsParquetScanner19ProcessScratchBatchEPNS_8RowBatchE"],
   ["PARQUET_SCANNER_EVAL_RUNTIME_FILTER",
@@ -193,6 +194,8 @@ ir_functions = [
   ["GENERIC_IS_NULL_STRING", "IrGenericIsNullString"],
   ["RAW_VALUE_COMPARE",
    "_ZN6impala8RawValue7CompareEPKvS2_RKNS_10ColumnTypeE"],
+  ["RAW_VALUE_GET_HASH_VALUE",
+   "_ZN6impala8RawValue12GetHashValueEPKvRKNS_10ColumnTypeEj"],
   ["TOPN_NODE_INSERT_BATCH",
    "_ZN6impala8TopNNode11InsertBatchEPNS_8RowBatchE"],
   ["MEMPOOL_ALLOCATE",
@@ -201,8 +204,13 @@ ir_functions = [
    "_ZN6impala7MemPool8AllocateILb1EEEPhli"],
   ["RUNTIME_FILTER_EVAL",
    "_ZNK6impala13RuntimeFilter4EvalEPvRKNS_10ColumnTypeE"],
+  ["TUPLE_COPY_STRINGS",
+   "_ZN6impala5Tuple11CopyStringsEPKcPNS_12RuntimeStateEPKNS_11SlotOffsetsEiPNS_7MemPoolEPNS_6StatusE"],
   ["UNION_MATERIALIZE_BATCH",
-  "_ZN6impala9UnionNode16MaterializeBatchEPNS_8RowBatchEPPh"]
+  "_ZN6impala9UnionNode16MaterializeBatchEPNS_8RowBatchEPPh"],
+  ["BLOOM_FILTER_INSERT_NO_AVX2", "_ZN6impala11BloomFilter12InsertNoAvx2Ej"],
+  ["BLOOM_FILTER_INSERT_AVX2", "_ZN6impala11BloomFilter10InsertAvx2Ej"],
+  ["SELECT_NODE_COPY_ROWS", "_ZN6impala10SelectNode8CopyRowsEPNS_8RowBatchE"]
 ]
 
 enums_preamble = '\

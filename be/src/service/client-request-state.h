@@ -25,6 +25,7 @@
 #include "service/child-query.h"
 #include "service/impala-server.h"
 #include "util/auth-util.h"
+#include "util/condition-variable.h"
 #include "util/runtime-profile.h"
 #include "gen-cpp/Frontend_types.h"
 #include "gen-cpp/Frontend_types.h"
@@ -186,8 +187,8 @@ class ClientRequestState {
   }
   const RuntimeProfile* profile() const { return profile_; }
   const RuntimeProfile* summary_profile() const { return summary_profile_; }
-  const TimestampValue& start_time() const { return start_time_; }
-  const TimestampValue& end_time() const { return end_time_; }
+  int64_t start_time_us() const { return start_time_us_; }
+  int64_t end_time_us() const { return end_time_us_; }
   const std::string& sql_stmt() const { return query_ctx_.client_request.stmt; }
   const TQueryOptions& query_options() const {
     return query_ctx_.client_request.query_options;
@@ -254,7 +255,7 @@ class ClientRequestState {
 
   /// Condition variable to make BlockOnWait() thread-safe. One thread joins
   /// wait_thread_, and all other threads block on this cv. Used with lock_.
-  boost::condition_variable block_on_wait_cv_;
+  ConditionVariable block_on_wait_cv_;
 
   /// Used in conjunction with block_on_wait_cv_ to make BlockOnWait() thread-safe.
   bool is_block_on_wait_joining_;
@@ -338,8 +339,11 @@ class ClientRequestState {
   /// catalog update request. Not owned.
   ImpalaServer* parent_server_;
 
-  /// Start/end time of the query
-  TimestampValue start_time_, end_time_;
+  /// Start/end time of the query, in Unix microseconds.
+  /// end_time_us_ is initialized to 0 in the constructor, which is used to indicate
+  /// that the query is not yet done. It is assinged the final value in
+  /// ClientRequestState::Done().
+  int64_t start_time_us_, end_time_us_;
 
   /// Executes a local catalog operation (an operation that does not need to execute
   /// against the catalog service). Includes USE, SHOW, DESCRIBE, and EXPLAIN statements.

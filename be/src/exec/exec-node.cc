@@ -103,21 +103,14 @@ unique_ptr<RowBatch> ExecNode::RowBatchQueue::GetBatch() {
   return unique_ptr<RowBatch>();
 }
 
-int ExecNode::RowBatchQueue::Cleanup() {
-  int num_io_buffers = 0;
-
+void ExecNode::RowBatchQueue::Cleanup() {
   unique_ptr<RowBatch> batch = NULL;
   while ((batch = GetBatch()) != NULL) {
-    num_io_buffers += batch->num_io_buffers();
     batch.reset();
   }
 
   lock_guard<SpinLock> l(lock_);
-  for (const unique_ptr<RowBatch>& row_batch: cleanup_queue_) {
-    num_io_buffers += row_batch->num_io_buffers();
-  }
   cleanup_queue_.clear();
-  return num_io_buffers;
 }
 
 ExecNode::ExecNode(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs)
@@ -155,16 +148,16 @@ Status ExecNode::Prepare(RuntimeState* state) {
   mem_tracker_.reset(new MemTracker(runtime_profile_, -1, runtime_profile_->name(),
       state->instance_mem_tracker()));
   expr_mem_tracker_.reset(new MemTracker(-1, "Exprs", mem_tracker_.get(), false));
-  expr_mem_pool_.reset(new MemPool(expr_mem_tracker_.get()));
+  expr_perm_pool_.reset(new MemPool(expr_mem_tracker_.get()));
+  expr_results_pool_.reset(new MemPool(expr_mem_tracker_.get()));
   rows_returned_counter_ = ADD_COUNTER(runtime_profile_, "RowsReturned", TUnit::UNIT);
   rows_returned_rate_ = runtime_profile()->AddDerivedCounter(
       ROW_THROUGHPUT_COUNTER, TUnit::UNIT_PER_SECOND,
       bind<int64_t>(&RuntimeProfile::UnitsPerSecond, rows_returned_counter_,
           runtime_profile()->total_time_counter()));
-  RETURN_IF_ERROR(ScalarExprEvaluator::Create(conjuncts_, state, pool_, expr_mem_pool(),
-      &conjunct_evals_));
+  RETURN_IF_ERROR(ScalarExprEvaluator::Create(conjuncts_, state, pool_, expr_perm_pool(),
+      expr_results_pool(), &conjunct_evals_));
   DCHECK_EQ(conjunct_evals_.size(), conjuncts_.size());
-  AddEvaluatorsToFree(conjunct_evals_);
   for (int i = 0; i < children_.size(); ++i) {
     RETURN_IF_ERROR(children_[i]->Prepare(state));
   }
@@ -206,7 +199,8 @@ void ExecNode::Close(RuntimeState* state) {
 
   ScalarExprEvaluator::Close(conjunct_evals_, state);
   ScalarExpr::Close(conjuncts_);
-  if (expr_mem_pool() != nullptr) expr_mem_pool_->FreeAll();
+  if (expr_perm_pool() != nullptr) expr_perm_pool_->FreeAll();
+  if (expr_results_pool() != nullptr) expr_results_pool_->FreeAll();
   if (buffer_pool_client_.is_registered()) {
     VLOG_FILE << id_ << " returning reservation " << resource_profile_.min_reservation;
     state->query_state()->initial_reservations()->Return(
@@ -501,16 +495,8 @@ bool ExecNode::EvalConjuncts(
 }
 
 Status ExecNode::QueryMaintenance(RuntimeState* state) {
-  ScalarExprEvaluator::FreeLocalAllocations(evals_to_free_);
+  expr_results_pool_->Clear();
   return state->CheckQueryState();
-}
-
-void ExecNode::AddEvaluatorToFree(ScalarExprEvaluator* eval) {
-  evals_to_free_.push_back(eval);
-}
-
-void ExecNode::AddEvaluatorsToFree(const vector<ScalarExprEvaluator*>& evals) {
-  for (ScalarExprEvaluator* eval : evals) AddEvaluatorToFree(eval);
 }
 
 void ExecNode::AddCodegenDisabledMessage(RuntimeState* state) {

@@ -63,14 +63,14 @@ using std::shared_ptr;
 using std::make_shared;
 using strings::Substitute;
 
-DEFINE_string(rpc_authentication, "optional",
+DEFINE_string_hidden(rpc_authentication, "optional",
               "Whether to require RPC connections to authenticate. Must be one "
               "of 'disabled', 'optional', or 'required'. If 'optional', "
               "authentication will be used when the remote end supports it. If "
               "'required', connections which are not able to authenticate "
               "(because the remote end lacks support) are rejected. Secure "
               "clusters should use 'required'.");
-DEFINE_string(rpc_encryption, "optional",
+DEFINE_string_hidden(rpc_encryption, "optional",
               "Whether to require RPC connections to be encrypted. Must be one "
               "of 'disabled', 'optional', or 'required'. If 'optional', "
               "encryption will be used when the remote end supports it. If "
@@ -82,18 +82,18 @@ DEFINE_string(rpc_encryption, "optional",
 TAG_FLAG(rpc_authentication, evolving);
 TAG_FLAG(rpc_encryption, evolving);
 
-DEFINE_string(rpc_certificate_file, "",
+DEFINE_string_hidden(rpc_certificate_file, "",
               "Path to a PEM encoded X509 certificate to use for securing RPC "
               "connections with SSL/TLS. If set, '--rpc_private_key_file' and "
               "'--rpc_ca_certificate_file' must be set as well.");
-DEFINE_string(rpc_private_key_file, "",
+DEFINE_string_hidden(rpc_private_key_file, "",
               "Path to a PEM encoded private key paired with the certificate "
               "from '--rpc_certificate_file'");
-DEFINE_string(rpc_ca_certificate_file, "",
+DEFINE_string_hidden(rpc_ca_certificate_file, "",
               "Path to the PEM encoded X509 certificate of the trusted external "
               "certificate authority. The provided certificate should be the root "
               "issuer of the certificate passed in '--rpc_certificate_file'.");
-DEFINE_string(rpc_private_key_password_cmd, "", "A Unix command whose output "
+DEFINE_string_hidden(rpc_private_key_password_cmd, "", "A Unix command whose output "
               "returns the password used to decrypt the RPC server's private key "
               "file specified in --rpc_private_key_file. If the .PEM key file is "
               "not password-protected, this flag does not need to be set. "
@@ -107,7 +107,7 @@ TAG_FLAG(rpc_certificate_file, experimental);
 TAG_FLAG(rpc_private_key_file, experimental);
 TAG_FLAG(rpc_ca_certificate_file, experimental);
 
-DEFINE_int32(rpc_default_keepalive_time_ms, 65000,
+DEFINE_int32_hidden(rpc_default_keepalive_time_ms, 65000,
              "If an RPC connection from a client is idle for this amount of time, the server "
              "will disconnect the client.");
 TAG_FLAG(rpc_default_keepalive_time_ms, advanced);
@@ -208,6 +208,7 @@ MessengerBuilder::MessengerBuilder(std::string name)
       min_negotiation_threads_(0),
       max_negotiation_threads_(4),
       coarse_timer_granularity_(MonoDelta::FromMilliseconds(100)),
+      sasl_proto_name_("kudu"),
       enable_inbound_tls_(false) {
 }
 
@@ -239,6 +240,11 @@ MessengerBuilder& MessengerBuilder::set_coarse_timer_granularity(const MonoDelta
 MessengerBuilder &MessengerBuilder::set_metric_entity(
     const scoped_refptr<MetricEntity>& metric_entity) {
   metric_entity_ = metric_entity;
+  return *this;
+}
+
+MessengerBuilder &MessengerBuilder::set_sasl_proto_name(std::string sasl_proto_name) {
+  sasl_proto_name_ = std::move(sasl_proto_name);
   return *this;
 }
 
@@ -348,7 +354,7 @@ Status Messenger::AddAcceptorPool(const Sockaddr &accept_addr,
   // that everything is set up correctly. This way we'll generate errors on
   // startup rather than later on when we first receive a client connection.
   if (!FLAGS_keytab_file.empty()) {
-    RETURN_NOT_OK_PREPEND(ServerNegotiation::PreflightCheckGSSAPI(),
+    RETURN_NOT_OK_PREPEND(ServerNegotiation::PreflightCheckGSSAPI(sasl_proto_name()),
                           "GSSAPI/Kerberos not properly configured");
   }
 
@@ -437,6 +443,7 @@ Messenger::Messenger(const MessengerBuilder &bld)
     token_verifier_(new security::TokenVerifier()),
     rpcz_store_(new RpczStore()),
     metric_entity_(bld.metric_entity_),
+    sasl_proto_name_(bld.sasl_proto_name_),
     retain_self_(this) {
   for (int i = 0; i < bld.num_reactors_; i++) {
     reactors_.push_back(new Reactor(retain_self_, i, bld));

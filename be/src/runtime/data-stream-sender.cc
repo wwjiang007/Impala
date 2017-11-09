@@ -33,6 +33,7 @@
 #include "runtime/mem-tracker.h"
 #include "runtime/backend-client.h"
 #include "util/aligned-new.h"
+#include "util/condition-variable.h"
 #include "util/debug-util.h"
 #include "util/network-util.h"
 #include "util/thread-pool.h"
@@ -45,7 +46,6 @@
 
 #include "common/names.h"
 
-using boost::condition_variable;
 using namespace apache::thrift;
 using namespace apache::thrift::protocol;
 using namespace apache::thrift::transport;
@@ -133,7 +133,7 @@ class DataStreamSender::Channel : public CacheLineAligned {
   // TODO: if the order of row batches does not matter, we can consider increasing
   // the number of threads.
   ThreadPool<TRowBatch*> rpc_thread_; // sender thread.
-  condition_variable rpc_done_cv_;   // signaled when rpc_in_flight_ is set to true.
+  ConditionVariable rpc_done_cv_;   // signaled when rpc_in_flight_ is set to true.
   mutex rpc_thread_lock_; // Lock with rpc_done_cv_ protecting rpc_in_flight_
   bool rpc_in_flight_;  // true if the rpc_thread_ is busy sending.
 
@@ -188,7 +188,7 @@ void DataStreamSender::Channel::TransmitData(int thread_id, const TRowBatch* bat
     unique_lock<mutex> l(rpc_thread_lock_);
     rpc_in_flight_ = false;
   }
-  rpc_done_cv_.notify_one();
+  rpc_done_cv_.NotifyOne();
 }
 
 void DataStreamSender::Channel::TransmitDataHelper(const TRowBatch* batch) {
@@ -239,7 +239,7 @@ void DataStreamSender::Channel::WaitForRpc() {
   SCOPED_TIMER(parent_->state_->total_network_send_timer());
   unique_lock<mutex> l(rpc_thread_lock_);
   while (rpc_in_flight_) {
-    rpc_done_cv_.wait(l);
+    rpc_done_cv_.Wait(l);
   }
 }
 
@@ -390,7 +390,8 @@ Status DataStreamSender::Prepare(RuntimeState* state, MemTracker* parent_mem_tra
   state_ = state;
   SCOPED_TIMER(profile_->total_time_counter());
   RETURN_IF_ERROR(ScalarExprEvaluator::Create(partition_exprs_, state,
-      state->obj_pool(), expr_mem_pool(), &partition_expr_evals_));
+      state->obj_pool(), expr_perm_pool_.get(), expr_results_pool_.get(),
+      &partition_expr_evals_));
   bytes_sent_counter_ = ADD_COUNTER(profile(), "BytesSent", TUnit::BYTES);
   uncompressed_bytes_counter_ =
       ADD_COUNTER(profile(), "UncompressedRowBatchSize", TUnit::BYTES);
@@ -463,23 +464,22 @@ Status DataStreamSender::Send(RuntimeState* state, RowBatch* batch) {
     int num_channels = channels_.size();
     for (int i = 0; i < batch->num_rows(); ++i) {
       TupleRow* row = batch->GetRow(i);
-      uint32_t hash_val = HashUtil::FNV_SEED;
-      for (int i = 0; i < partition_exprs_.size(); ++i) {
-        ScalarExprEvaluator* eval = partition_expr_evals_[i];
+      uint64_t hash_val = EXCHANGE_HASH_SEED;
+      for (int j = 0; j < partition_exprs_.size(); ++j) {
+        ScalarExprEvaluator* eval = partition_expr_evals_[j];
         void* partition_val = eval->GetValue(row);
-        // We can't use the crc hash function here because it does not result
-        // in uncorrelated hashes with different seeds.  Instead we must use
-        // fnv hash.
+        // We can't use the crc hash function here because it does not result in
+        // uncorrelated hashes with different seeds. Instead we use FastHash.
         // TODO: fix crc hash/GetHashValue()
-        DCHECK(&partition_expr_evals_[i]->root() == partition_exprs_[i]);
-        hash_val = RawValue::GetHashValueFnv(
-            partition_val, partition_exprs_[i]->type(), hash_val);
+        DCHECK(&(eval->root()) == partition_exprs_[j]);
+        hash_val = RawValue::GetHashValueFastHash(
+            partition_val, partition_exprs_[j]->type(), hash_val);
       }
       RETURN_IF_ERROR(channels_[hash_val % num_channels]->AddRow(row));
     }
   }
   COUNTER_ADD(total_sent_rows_counter_, batch->num_rows());
-  ScalarExprEvaluator::FreeLocalAllocations(partition_expr_evals_);
+  expr_results_pool_->Clear();
   RETURN_IF_ERROR(state->CheckQueryState());
   return Status::OK();
 }

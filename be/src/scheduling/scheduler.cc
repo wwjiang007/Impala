@@ -65,29 +65,20 @@ Scheduler::Scheduler(StatestoreSubscriber* subscriber, const string& backend_id,
     request_pool_service_(request_pool_service) {
 }
 
-Status Scheduler::Init(const TNetworkAddress& backend_address, int krpc_port) {
+Status Scheduler::Init(const TNetworkAddress& backend_address,
+    const TNetworkAddress& krpc_address, const IpAddr& ip) {
   LOG(INFO) << "Starting scheduler";
-
-  // Figure out what our IP address is, so that each subscriber doesn't have to resolve
-  // it on every heartbeat. KRPC also assumes that the address is resolved already.
-  // May as well do it up front to avoid frequent DNS requests.
   local_backend_descriptor_.address = backend_address;
-  IpAddr ip;
-  const Hostname& hostname = backend_address.hostname;
-  Status status = HostnameToIpAddr(hostname, &ip);
-  if (!status.ok()) {
-    VLOG(1) << status.GetDetail();
-    status.AddDetail("Scheduler failed to start");
-    return status;
-  }
-
+  // Store our IP address so that each subscriber doesn't have to resolve
+  // it on every heartbeat. May as well do it up front to avoid frequent DNS
+  // requests.
   local_backend_descriptor_.ip_address = ip;
   LOG(INFO) << "Scheduler using " << ip << " as IP address";
-
   if (FLAGS_use_krpc) {
-    // KRPC expects address to have been resolved already.
-    TNetworkAddress krpc_svc_addr = MakeNetworkAddress(ip, krpc_port);
-    local_backend_descriptor_.__set_krpc_address(krpc_svc_addr);
+    // KRPC relies on resolved IP address.
+    DCHECK(IsResolvedAddress(krpc_address));
+    DCHECK_EQ(krpc_address.hostname, ip);
+    local_backend_descriptor_.__set_krpc_address(krpc_address);
   }
 
   coord_only_backend_config_.AddBackend(local_backend_descriptor_);
@@ -140,9 +131,7 @@ void Scheduler::UpdateMembership(
 
   // If the delta transmitted by the statestore is empty we can skip processing
   // altogether and avoid making a copy of executors_config_.
-  if (delta.is_delta && delta.topic_entries.empty() && delta.topic_deletions.empty()) {
-    return;
-  }
+  if (delta.is_delta && delta.topic_entries.empty()) return;
 
   // This function needs to handle both delta and non-delta updates. To minimize the
   // time needed to hold locks, all updates are applied to a copy of
@@ -159,10 +148,17 @@ void Scheduler::UpdateMembership(
     new_executors_config = std::make_shared<BackendConfig>(*executors_config_);
   }
 
-  // Process new entries to the topic. Update executors_config_ and
+  // Process new and removed entries to the topic. Update executors_config_ and
   // current_executors_ to match the set of executors given by the
   // subscriber_topic_updates.
   for (const TTopicItem& item : delta.topic_entries) {
+    if (item.deleted) {
+      if (current_executors_.find(item.key) != current_executors_.end()) {
+        new_executors_config->RemoveBackend(current_executors_[item.key]);
+        current_executors_.erase(item.key);
+      }
+      continue;
+    }
     TBackendDescriptor be_desc;
     // Benchmarks have suggested that this method can deserialize
     // ~10m messages per second, so no immediate need to consider optimization.
@@ -187,7 +183,9 @@ void Scheduler::UpdateMembership(
       // will try to re-register (i.e. overwrite their subscription), but there is
       // likely a configuration problem.
       LOG_EVERY_N(WARNING, 30) << "Duplicate subscriber registration from address: "
-                               << be_desc.address;
+                               << be_desc.address
+                               << " (we are: " << local_backend_descriptor_.address
+                               << ")";
       continue;
     }
     if (be_desc.is_executor) {
@@ -195,15 +193,6 @@ void Scheduler::UpdateMembership(
       current_executors_.insert(make_pair(item.key, be_desc));
     }
   }
-
-  // Process deletions from the topic
-  for (const string& backend_id : delta.topic_deletions) {
-    if (current_executors_.find(backend_id) != current_executors_.end()) {
-      new_executors_config->RemoveBackend(current_executors_[backend_id]);
-      current_executors_.erase(backend_id);
-    }
-  }
-
   SetExecutorsConfig(new_executors_config);
 
   if (metrics_ != nullptr) {

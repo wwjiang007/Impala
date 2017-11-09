@@ -613,15 +613,22 @@ public class CatalogOpExecutor {
    */
   private Table addHdfsPartition(Table tbl, Partition partition)
       throws CatalogException {
+    return addHdfsPartitions(tbl, Lists.newArrayList(partition));
+  }
+
+  private Table addHdfsPartitions(Table tbl, List<Partition> partitions)
+      throws CatalogException {
     Preconditions.checkNotNull(tbl);
-    Preconditions.checkNotNull(partition);
+    Preconditions.checkNotNull(partitions);
     if (!(tbl instanceof HdfsTable)) {
       throw new CatalogException("Table " + tbl.getFullName() + " is not an HDFS table");
     }
     HdfsTable hdfsTable = (HdfsTable) tbl;
-    HdfsPartition hdfsPartition =
-        hdfsTable.createAndLoadPartition(partition.getSd(), partition);
-    return catalog_.addPartition(hdfsPartition);
+    List<HdfsPartition> hdfsPartitions = hdfsTable.createAndLoadPartitions(partitions);
+    for (HdfsPartition hdfsPartition: hdfsPartitions) {
+      catalog_.addPartition(hdfsPartition);
+    }
+    return hdfsTable;
   }
 
   /**
@@ -1084,6 +1091,7 @@ public class CatalogOpExecutor {
     removedObject.setCatalog_version(dataSource.getCatalogVersion());
     resp.result.addToRemoved_catalog_objects(removedObject);
     resp.result.setVersion(dataSource.getCatalogVersion());
+    catalog_.getDeleteLog().addRemovedObject(removedObject);
   }
 
   /**
@@ -1266,6 +1274,7 @@ public class CatalogOpExecutor {
     removedObject.getDb().setDb_name(params.getDb());
     resp.result.setVersion(removedObject.getCatalog_version());
     resp.result.addToRemoved_catalog_objects(removedObject);
+    catalog_.getDeleteLog().addRemovedObject(removedObject);
   }
 
   /**
@@ -1387,6 +1396,7 @@ public class CatalogOpExecutor {
     removedObject.getTable().setTbl_name(tableName.getTbl());
     removedObject.getTable().setDb_name(tableName.getDb());
     removedObject.setCatalog_version(resp.result.getVersion());
+    catalog_.getDeleteLog().addRemovedObject(removedObject);
     resp.result.addToRemoved_catalog_objects(removedObject);
   }
 
@@ -1514,6 +1524,9 @@ public class CatalogOpExecutor {
 
       if (!removedFunctions.isEmpty()) {
         resp.result.setRemoved_catalog_objects(removedFunctions);
+        for (TCatalogObject removedFnObject: removedFunctions) {
+          catalog_.getDeleteLog().addRemovedObject(removedFnObject);
+        }
       }
       resp.result.setVersion(catalog_.getCatalogVersion());
     }
@@ -1919,7 +1932,7 @@ public class CatalogOpExecutor {
     TableName tableName = tbl.getTableName();
     org.apache.hadoop.hive.metastore.api.Table msTbl = tbl.getMetaStoreTable().deepCopy();
     boolean ifNotExists = addPartParams.isIf_not_exists();
-    List<Partition> hmsPartitionsToAdd = Lists.newArrayList();
+    List<Partition> allHmsPartitionsToAdd = Lists.newArrayList();
     Map<List<String>, THdfsCachingOp> partitionCachingOpMap = Maps.newHashMap();
     for (TPartitionDef partParams: addPartParams.getPartitions()) {
       List<TPartitionKeyValue> partitionSpec = partParams.getPartition_spec();
@@ -1937,23 +1950,26 @@ public class CatalogOpExecutor {
 
       Partition hmsPartition = createHmsPartition(partitionSpec, msTbl, tableName,
           partParams.getLocation());
-      hmsPartitionsToAdd.add(hmsPartition);
+      allHmsPartitionsToAdd.add(hmsPartition);
 
       THdfsCachingOp cacheOp = partParams.getCache_op();
       if (cacheOp != null) partitionCachingOpMap.put(hmsPartition.getValues(), cacheOp);
     }
 
-    if (hmsPartitionsToAdd.isEmpty()) return null;
+    if (allHmsPartitionsToAdd.isEmpty()) return null;
 
     try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
-      // Add partitions in bulk
-      List<Partition> addedHmsPartitions = null;
-      try {
-        addedHmsPartitions = msClient.getHiveClient().add_partitions(hmsPartitionsToAdd,
-            ifNotExists, true);
-      } catch (TException e) {
-        throw new ImpalaRuntimeException(
-            String.format(HMS_RPC_ERROR_FORMAT_STR, "add_partitions"), e);
+      List<Partition> addedHmsPartitions = Lists.newArrayList();
+
+      for (List<Partition> hmsSublist :
+          Lists.partition(allHmsPartitionsToAdd, MAX_PARTITION_UPDATES_PER_RPC)) {
+        try {
+          addedHmsPartitions.addAll(msClient.getHiveClient().add_partitions(hmsSublist,
+              ifNotExists, true));
+        } catch (TException e) {
+          throw new ImpalaRuntimeException(
+              String.format(HMS_RPC_ERROR_FORMAT_STR, "add_partitions"), e);
+        }
       }
 
       // Handle HDFS cache. This is done in a separate round bacause we have to apply
@@ -1964,20 +1980,15 @@ public class CatalogOpExecutor {
       // If 'ifNotExists' is true, add_partitions() may fail to add all the partitions to
       // HMS because some of them may already exist there. In that case, we load in the
       // catalog the partitions that already exist in HMS but aren't in the catalog yet.
-      if (hmsPartitionsToAdd.size() != addedHmsPartitions.size()) {
-        List<Partition> difference = computeDifference(hmsPartitionsToAdd,
+      if (allHmsPartitionsToAdd.size() != addedHmsPartitions.size()) {
+        List<Partition> difference = computeDifference(allHmsPartitionsToAdd,
             addedHmsPartitions);
         addedHmsPartitions.addAll(
             getPartitionsFromHms(msTbl, msClient, tableName, difference));
       }
-
-      for (Partition partition: addedHmsPartitions) {
-        // Create and add the HdfsPartition to catalog. Return the table object with an
-        // updated catalog version.
-        addHdfsPartition(tbl, partition);
-      }
-      return tbl;
+      addHdfsPartitions(tbl, addedHmsPartitions);
     }
+    return tbl;
   }
 
   /**
@@ -2137,7 +2148,6 @@ public class CatalogOpExecutor {
               " ifExists is true.", e, tableName));
         }
       }
-      updateLastDdlTime(msTbl, msClient);
     } catch (TException e) {
       throw new ImpalaRuntimeException(
           String.format(HMS_RPC_ERROR_FORMAT_STR, "dropPartition"), e);
@@ -2213,6 +2223,7 @@ public class CatalogOpExecutor {
     removedObject.setTable(new TTable(tableName.getDb(), tableName.getTbl()));
     removedObject.setCatalog_version(addedObject.getCatalog_version());
     response.result.addToRemoved_catalog_objects(removedObject);
+    catalog_.getDeleteLog().addRemovedObject(removedObject);
     response.result.addToUpdated_catalog_objects(addedObject);
     response.result.setVersion(addedObject.getCatalog_version());
   }
@@ -2599,19 +2610,12 @@ public class CatalogOpExecutor {
     // Add partitions to metastore.
     try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
       // Apply the updates in batches of 'MAX_PARTITION_UPDATES_PER_RPC'.
-      for (int i = 0; i < hmsPartitions.size(); i += MAX_PARTITION_UPDATES_PER_RPC) {
-        int endPartitionIndex =
-            Math.min(i + MAX_PARTITION_UPDATES_PER_RPC, hmsPartitions.size());
-        List<Partition> hmsSublist = hmsPartitions.subList(i, endPartitionIndex);
+      for (List<Partition> hmsSublist :
+          Lists.partition(hmsPartitions, MAX_PARTITION_UPDATES_PER_RPC)) {
         // ifNotExists and needResults are true.
         List<Partition> hmsAddedPartitions =
             msClient.getHiveClient().add_partitions(hmsSublist, true, true);
-        for (Partition partition: hmsAddedPartitions) {
-          // Create and add the HdfsPartition. Return the table object with an updated
-          // catalog version.
-          addHdfsPartition(tbl, partition);
-        }
-
+        addHdfsPartitions(tbl, hmsAddedPartitions);
         // Handle HDFS cache.
         if (cachePoolName != null) {
           for (Partition partition: hmsAddedPartitions) {
@@ -2623,7 +2627,6 @@ public class CatalogOpExecutor {
           MetastoreShim.alterPartitions(msClient.getHiveClient(), tableName.getDb(),
               tableName.getTbl(), hmsAddedPartitions);
         }
-        updateLastDdlTime(msTbl, msClient);
       }
     } catch (TException e) {
       throw new ImpalaRuntimeException(
@@ -2813,6 +2816,7 @@ public class CatalogOpExecutor {
     catalogObject.setCatalog_version(role.getCatalogVersion());
     if (createDropRoleParams.isIs_drop()) {
       resp.result.addToRemoved_catalog_objects(catalogObject);
+      catalog_.getDeleteLog().addRemovedObject(catalogObject);
     } else {
       resp.result.addToUpdated_catalog_objects(catalogObject);
     }
@@ -2875,6 +2879,9 @@ public class CatalogOpExecutor {
       catalogObject.setPrivilege(rolePriv.toThrift());
       catalogObject.setCatalog_version(rolePriv.getCatalogVersion());
       updatedPrivs.add(catalogObject);
+      if (!grantRevokePrivParams.isIs_grant() && !privileges.get(0).isHas_grant_opt()) {
+        catalog_.getDeleteLog().addRemovedObject(catalogObject);
+      }
     }
 
     // TODO: Currently we only support sending back 1 catalog object in a "direct DDL"
@@ -2924,16 +2931,15 @@ public class CatalogOpExecutor {
 
     try (MetaStoreClient msClient = catalog_.getMetaStoreClient()) {
       // Apply the updates in batches of 'MAX_PARTITION_UPDATES_PER_RPC'.
-      for (int i = 0; i < hmsPartitions.size(); i += MAX_PARTITION_UPDATES_PER_RPC) {
-        int endPartitionIndex =
-            Math.min(i + MAX_PARTITION_UPDATES_PER_RPC, hmsPartitions.size());
+      for (List<Partition> hmsPartitionsSubList :
+        Lists.partition(hmsPartitions, MAX_PARTITION_UPDATES_PER_RPC)) {
         try {
           // Alter partitions in bulk.
           MetastoreShim.alterPartitions(msClient.getHiveClient(), dbName, tableName,
-              hmsPartitions.subList(i, endPartitionIndex));
+              hmsPartitionsSubList);
           // Mark the corresponding HdfsPartition objects as dirty
           for (org.apache.hadoop.hive.metastore.api.Partition msPartition:
-              hmsPartitions.subList(i, endPartitionIndex)) {
+              hmsPartitionsSubList) {
             try {
               catalog_.getHdfsPartition(dbName, tableName, msPartition).markDirty();
             } catch (PartitionNotFoundException e) {
@@ -3047,6 +3053,9 @@ public class CatalogOpExecutor {
           resp.result.setUpdated_catalog_objects(addedFuncs);
           resp.result.setRemoved_catalog_objects(removedFuncs);
           resp.result.setVersion(catalog_.getCatalogVersion());
+          for (TCatalogObject removedFn: removedFuncs) {
+            catalog_.getDeleteLog().addRemovedObject(removedFn);
+          }
         }
       }
     } else if (req.isSetTable_name()) {
@@ -3084,6 +3093,7 @@ public class CatalogOpExecutor {
         // processed as a direct DDL operation.
         if (tblWasRemoved.getRef()) {
           resp.getResult().addToRemoved_catalog_objects(updatedThriftTable);
+          catalog_.getDeleteLog().addRemovedObject(updatedThriftTable);
         } else {
           resp.getResult().addToUpdated_catalog_objects(updatedThriftTable);
         }
@@ -3252,7 +3262,6 @@ public class CatalogOpExecutor {
                   }
                 }
               }
-              updateLastDdlTime(msTbl, msClient);
             }
           } catch (AlreadyExistsException e) {
             throw new InternalException(

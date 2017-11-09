@@ -27,9 +27,14 @@
 #include "common/status.h"
 #include "runtime/client-cache-types.h"
 #include "util/hdfs-bulk-ops-defs.h" // For declaration of HdfsOpThreadPool
+#include "util/network-util.h"
 #include "util/spinlock.h"
 
-namespace kudu { namespace client { class KuduClient; } }
+namespace kudu {
+namespace client {
+class KuduClient;
+} // namespace client
+} // namespace kudu
 
 namespace impala {
 
@@ -53,6 +58,7 @@ class ObjectPool;
 class QueryResourceMgr;
 class RequestPoolService;
 class ReservationTracker;
+class RpcMgr;
 class Scheduler;
 class StatestoreSubscriber;
 class ThreadResourceMgr;
@@ -80,6 +86,10 @@ class ExecEnv {
 
   /// Destructor - only used in backend tests that create new environment per test.
   ~ExecEnv();
+
+  /// Initialize the exec environment, including parsing memory limits and initializing
+  /// subsystems like the webserver, scheduler etc.
+  Status Init();
 
   /// Starts any dependent services in their correct order
   Status StartServices() WARN_UNUSED_RESULT;
@@ -127,7 +137,9 @@ class ExecEnv {
 
   const TNetworkAddress& backend_address() const { return backend_address_; }
 
-  int krpc_port() const { return krpc_port_; }
+  const IpAddr& ip_address() const { return ip_address_; }
+
+  const TNetworkAddress& krpc_address() const { return krpc_address_; }
 
   /// Initializes the exec env for running FE tests.
   Status InitForFeTests() WARN_UNUSED_RESULT;
@@ -162,13 +174,22 @@ class ExecEnv {
   boost::scoped_ptr<MemTracker> mem_tracker_;
   boost::scoped_ptr<PoolMemTrackerRegistry> pool_mem_trackers_;
   boost::scoped_ptr<ThreadResourceMgr> thread_mgr_;
+
+  // Thread pool for running HdfsOp operations. Only used by the coordinator, so it's
+  // only started if FLAGS_is_coordinator is 'true'.
   boost::scoped_ptr<HdfsOpThreadPool> hdfs_op_thread_pool_;
+
   boost::scoped_ptr<TmpFileMgr> tmp_file_mgr_;
   boost::scoped_ptr<RequestPoolService> request_pool_service_;
   boost::scoped_ptr<Frontend> frontend_;
+
+  // Thread pool for the ExecQueryFInstances RPC. Only used by the coordinator, so it's
+  // only started if FLAGS_is_coordinator is 'true'.
   boost::scoped_ptr<CallableThreadPool> exec_rpc_thread_pool_;
+
   boost::scoped_ptr<CallableThreadPool> async_rpc_pool_;
   boost::scoped_ptr<QueryExecMgr> query_exec_mgr_;
+  boost::scoped_ptr<RpcMgr> rpc_mgr_;
 
   /// Query-wide buffer pool and the root reservation tracker for the pool. The
   /// reservation limit is equal to the maximum capacity of the pool. Created in
@@ -187,11 +208,14 @@ class ExecEnv {
   static ExecEnv* exec_env_;
   bool is_fe_tests_ = false;
 
-  /// Address of the Impala backend server instance
+  /// Address of the thrift based ImpalaInternalService
   TNetworkAddress backend_address_;
 
-  /// Port number on which all KRPC-based services are exported.
-  int krpc_port_;
+  /// Resolved IP address of the host name.
+  IpAddr ip_address_;
+
+  /// Address of the KRPC-based ImpalaInternalService
+  TNetworkAddress krpc_address_;
 
   /// fs.defaultFs value set in core-site.xml
   std::string default_fs_;

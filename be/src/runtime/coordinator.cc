@@ -17,39 +17,21 @@
 
 #include "runtime/coordinator.h"
 
-#include <map>
-#include <memory>
 #include <thrift/protocol/TDebugProtocol.h>
 #include <boost/algorithm/string/join.hpp>
-#include <boost/accumulators/accumulators.hpp>
-#include <boost/accumulators/statistics/stats.hpp>
-#include <boost/accumulators/statistics/min.hpp>
-#include <boost/accumulators/statistics/mean.hpp>
-#include <boost/accumulators/statistics/median.hpp>
-#include <boost/accumulators/statistics/max.hpp>
-#include <boost/accumulators/statistics/variance.hpp>
-#include <boost/bind.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/lexical_cast.hpp>
-#include <boost/unordered_set.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string.hpp>
 #include <gutil/strings/substitute.h>
-#include <errno.h>
 
-#include "common/logging.h"
 #include "exec/data-sink.h"
 #include "exec/plan-root-sink.h"
-#include "gen-cpp/Frontend_types.h"
 #include "gen-cpp/ImpalaInternalService.h"
 #include "gen-cpp/ImpalaInternalService_constants.h"
-#include "gen-cpp/ImpalaInternalService_types.h"
-#include "gen-cpp/Partitions_types.h"
-#include "gen-cpp/PlanNodes_types.h"
 #include "runtime/exec-env.h"
 #include "runtime/fragment-instance-state.h"
 #include "runtime/hdfs-fs-cache.h"
-#include "runtime/mem-tracker.h"
 #include "runtime/query-exec-mgr.h"
 #include "runtime/coordinator-filter-state.h"
 #include "runtime/coordinator-backend-state.h"
@@ -58,14 +40,9 @@
 #include "scheduling/scheduler.h"
 #include "util/bloom-filter.h"
 #include "util/counting-barrier.h"
-#include "util/debug-util.h"
-#include "util/error-util.h"
 #include "util/hdfs-bulk-ops.h"
 #include "util/hdfs-util.h"
 #include "util/histogram-metric.h"
-#include "util/network-util.h"
-#include "util/pretty-printer.h"
-#include "util/runtime-profile.h"
 #include "util/table-printer.h"
 
 #include "common/names.h"
@@ -100,8 +77,8 @@ Coordinator::Coordinator(
     query_events_(events) {}
 
 Coordinator::~Coordinator() {
-  DCHECK(released_resources_)
-      << "ReleaseResources() must be called before Coordinator is destroyed";
+  DCHECK(released_exec_resources_)
+      << "ReleaseExecResources() must be called before Coordinator is destroyed";
   if (query_state_ != nullptr) {
     ExecEnv::GetInstance()->query_exec_mgr()->ReleaseQueryState(query_state_);
   }
@@ -145,6 +122,7 @@ Status Coordinator::Exec() {
   lock_guard<mutex> l(lock_);
 
   query_state_ = ExecEnv::GetInstance()->query_exec_mgr()->CreateQueryState(query_ctx_);
+  query_state_->AcquireExecResourceRefcount(); // Decremented in ReleaseExecResources().
   filter_mem_tracker_ = query_state_->obj_pool()->Add(new MemTracker(
       -1, "Runtime Filter (Coordinator)", query_state_->query_mem_tracker(), false));
 
@@ -205,6 +183,7 @@ void Coordinator::InitFragmentStats() {
   vector<const TPlanFragment*> fragments;
   schedule_.GetTPlanFragments(&fragments);
   const TPlanFragment* coord_fragment = schedule_.GetCoordFragment();
+  int64_t total_num_finstances = 0;
 
   for (const TPlanFragment* fragment: fragments) {
     string root_profile_name =
@@ -215,6 +194,7 @@ void Coordinator::InitFragmentStats() {
         Substitute("Averaged Fragment $0", fragment->display_name);
     int num_instances =
         schedule_.GetFragmentExecParams(fragment->idx).instance_exec_params.size();
+    total_num_finstances += num_instances;
     // TODO: special-case the coordinator fragment?
     FragmentStats* fragment_stats = obj_pool()->Add(
         new FragmentStats(
@@ -223,12 +203,22 @@ void Coordinator::InitFragmentStats() {
     query_profile_->AddChild(fragment_stats->avg_profile(), true);
     query_profile_->AddChild(fragment_stats->root_profile());
   }
+  RuntimeProfile::Counter* num_fragments =
+      ADD_COUNTER(query_profile_, "NumFragments", TUnit::UNIT);
+  num_fragments->Set(static_cast<int64_t>(fragments.size()));
+  RuntimeProfile::Counter* num_finstances =
+      ADD_COUNTER(query_profile_, "NumFragmentInstances", TUnit::UNIT);
+  num_finstances->Set(total_num_finstances);
 }
 
 void Coordinator::InitBackendStates() {
   int num_backends = schedule_.per_backend_exec_params().size();
   DCHECK_GT(num_backends, 0);
   backend_states_.resize(num_backends);
+
+  RuntimeProfile::Counter* num_backends_counter =
+      ADD_COUNTER(query_profile_, "NumBackends", TUnit::UNIT);
+  num_backends_counter->Set(num_backends);
 
   // create BackendStates
   bool has_coord_fragment = schedule_.GetCoordFragment() != nullptr;
@@ -304,9 +294,7 @@ void Coordinator::InitFilterRoutingTable() {
     for (const TPlanNode& plan_node: fragment_params.fragment.plan.nodes) {
       if (!plan_node.__isset.runtime_filters) continue;
       for (const TRuntimeFilterDesc& filter: plan_node.runtime_filters) {
-        if (filter_mode_ == TRuntimeFilterMode::LOCAL && !filter.has_local_targets) {
-          continue;
-        }
+        DCHECK(filter_mode_ == TRuntimeFilterMode::GLOBAL || filter.has_local_targets);
         FilterRoutingTable::iterator i = filter_routing_table_.emplace(
             filter.filter_id, FilterState(filter, plan_node.node_id)).first;
         FilterState* f = &(i->second);
@@ -340,9 +328,7 @@ void Coordinator::InitFilterRoutingTable() {
           auto it = filter.planid_to_target_ndx.find(plan_node.node_id);
           DCHECK(it != filter.planid_to_target_ndx.end());
           const TRuntimeFilterTargetDesc& t_target = filter.targets[it->second];
-          if (filter_mode_ == TRuntimeFilterMode::LOCAL && !t_target.is_local_target) {
-            continue;
-          }
+          DCHECK(filter_mode_ == TRuntimeFilterMode::GLOBAL || t_target.is_local_target);
           f->targets()->emplace_back(t_target, fragment_params.fragment.idx);
         } else {
           DCHECK(false) << "Unexpected plan node with runtime filters: "
@@ -806,7 +792,7 @@ Status Coordinator::WaitForBackendCompletion() {
   while (num_remaining_backends_ > 0 && query_status_.ok()) {
     VLOG_QUERY << "Coordinator waiting for backends to finish, "
                << num_remaining_backends_ << " remaining";
-    backend_completion_cv_.wait(l);
+    backend_completion_cv_.Wait(l);
   }
   if (query_status_.ok()) {
     VLOG_QUERY << "All backends finished successfully.";
@@ -839,6 +825,10 @@ Status Coordinator::Wait() {
   // pick it up and needs to execute regardless.
   Status status = WaitForBackendCompletion();
   if (!needs_finalization_ && !status.ok()) return status;
+
+  // Execution of query fragments has finished. We don't need to hold onto query execution
+  // resources while we finalize the query.
+  ReleaseExecResources();
 
   // Query finalization is required only for HDFS table sinks
   if (needs_finalization_) RETURN_IF_ERROR(FinalizeQuery());
@@ -876,11 +866,8 @@ Status Coordinator::GetNext(QueryResultSet* results, int max_rows, bool* eos) {
 
   if (*eos) {
     returned_all_results_ = true;
-    // release resources here, since we won't be fetching more result rows
-    {
-      lock_guard<mutex> l(lock_);
-      ReleaseResources();
-    }
+    // release query execution resources here, since we won't be fetching more result rows
+    ReleaseExecResources();
 
     // wait for all backends to complete before computing the summary
     // TODO: relocate this so GetNext() won't have to wait for backends to complete?
@@ -920,12 +907,12 @@ void Coordinator::CancelInternal() {
   VLOG_QUERY << Substitute(
       "CancelBackends() query_id=$0, tried to cancel $1 backends",
       PrintId(query_id()), num_cancelled);
-  backend_completion_cv_.notify_all();
+  backend_completion_cv_.NotifyAll();
+
+  ReleaseExecResourcesLocked();
 
   // Report the summary with whatever progress the query made before being cancelled.
   ComputeQuerySummary();
-
-  ReleaseResources();
 }
 
 Status Coordinator::UpdateBackendExecStatus(const TReportExecStatusParams& params) {
@@ -973,7 +960,7 @@ Status Coordinator::UpdateBackendExecStatus(const TReportExecStatusParams& param
       BackendState::LogFirstInProgress(backend_states_);
     }
     if (--num_remaining_backends_ == 0 || !status.ok()) {
-      backend_completion_cv_.notify_all();
+      backend_completion_cv_.NotifyAll();
     }
     return Status::OK();
   }
@@ -1066,9 +1053,14 @@ string Coordinator::GetErrorLog() {
   return PrintErrorMapToString(merged);
 }
 
-void Coordinator::ReleaseResources() {
-  if (released_resources_) return;
-  released_resources_ = true;
+void Coordinator::ReleaseExecResources() {
+  lock_guard<mutex> l(lock_);
+  ReleaseExecResourcesLocked();
+}
+
+void Coordinator::ReleaseExecResourcesLocked() {
+  if (released_exec_resources_) return;
+  released_exec_resources_ = true;
   if (filter_routing_table_.size() > 0) {
     query_profile_->AddInfoString("Final filter table", FilterDebugString());
   }
@@ -1083,9 +1075,11 @@ void Coordinator::ReleaseResources() {
   // This may be NULL while executing UDFs.
   if (filter_mem_tracker_ != nullptr) filter_mem_tracker_->Close();
   // Need to protect against failed Prepare(), where root_sink() would not be set.
-  if (coord_sink_ != nullptr) {
-    coord_sink_->CloseConsumer();
-  }
+  if (coord_sink_ != nullptr) coord_sink_->CloseConsumer();
+  // Now that we've released our own resources, can release query-wide resources.
+  if (query_state_ != nullptr) query_state_->ReleaseExecResourceRefcount();
+  // At this point some tracked memory may still be used in the coordinator for result
+  // caching. The query MemTracker will be cleaned up later.
 }
 
 void Coordinator::UpdateFilter(const TUpdateFilterParams& params) {
@@ -1097,8 +1091,7 @@ void Coordinator::UpdateFilter(const TUpdateFilterParams& params) {
   DCHECK(filter_routing_table_complete_)
       << "Filter received before routing table complete";
 
-  // Make a 'master' copy that will be shared by all concurrent delivery RPC attempts.
-  shared_ptr<TPublishFilterParams> rpc_params(new TPublishFilterParams());
+  TPublishFilterParams rpc_params;
   unordered_set<int> target_fragment_idxs;
   {
     lock_guard<SpinLock> l(filter_lock_);
@@ -1112,12 +1105,14 @@ void Coordinator::UpdateFilter(const TUpdateFilterParams& params) {
     DCHECK(state->desc().has_remote_targets)
           << "Coordinator received filter that has only local targets";
 
-    // Check if the filter has already been sent, which could happen in three cases:
+    // Check if the filter has already been sent, which could happen in four cases:
     //   * if one local filter had always_true set - no point waiting for other local
     //     filters that can't affect the aggregated global filter
     //   * if this is a broadcast join, and another local filter was already received
     //   * if the filter could not be allocated and so an always_true filter was sent
     //     immediately.
+    //   * query execution finished and resources were released: filters do not need
+    //     to be processed.
     if (state->disabled()) return;
 
     if (filter_updates_received_->value() == 0) {
@@ -1129,7 +1124,6 @@ void Coordinator::UpdateFilter(const TUpdateFilterParams& params) {
 
     if (state->pending_count() > 0 && !state->disabled()) return;
     // At this point, we either disabled this filter or aggregation is complete.
-    DCHECK(state->disabled() || state->pending_count() == 0);
 
     // No more updates are pending on this filter ID. Create a distribution payload and
     // offer it to the queue.
@@ -1141,29 +1135,25 @@ void Coordinator::UpdateFilter(const TUpdateFilterParams& params) {
     }
 
     // Assign outgoing bloom filter.
-    if (state->bloom_filter() != nullptr) {
-      // Complete filter case.
-      // TODO: Replace with move() in Thrift 0.9.3.
-      TBloomFilter* aggregated_filter = state->bloom_filter();
-      filter_mem_tracker_->Release(aggregated_filter->directory.size());
-      swap(rpc_params->bloom_filter, *aggregated_filter);
-      DCHECK_EQ(aggregated_filter->directory.size(), 0);
-    } else {
-      // Disabled filter case (due to OOM or due to receiving an always_true filter).
-      rpc_params->bloom_filter.always_true = true;
-    }
+    TBloomFilter& aggregated_filter = state->bloom_filter();
+    filter_mem_tracker_->Release(aggregated_filter.directory.size());
 
+    // TODO: Track memory used by 'rpc_params'.
+    swap(rpc_params.bloom_filter, aggregated_filter);
+    DCHECK(rpc_params.bloom_filter.always_false || rpc_params.bloom_filter.always_true ||
+        !rpc_params.bloom_filter.directory.empty());
+    DCHECK(aggregated_filter.directory.empty());
+    rpc_params.__isset.bloom_filter = true;
     // Filter is complete, and can be released.
     state->Disable(filter_mem_tracker_);
-    DCHECK(state->bloom_filter() == nullptr);
   }
 
-  rpc_params->__set_dst_query_id(query_id());
-  rpc_params->__set_filter_id(params.filter_id);
+  rpc_params.__set_dst_query_id(query_id());
+  rpc_params.__set_filter_id(params.filter_id);
 
   for (BackendState* bs: backend_states_) {
     for (int fragment_idx: target_fragment_idxs) {
-      rpc_params->__set_dst_fragment_idx(fragment_idx);
+      rpc_params.__set_dst_fragment_idx(fragment_idx);
       bs->PublishFilter(rpc_params);
     }
   }
@@ -1171,6 +1161,7 @@ void Coordinator::UpdateFilter(const TUpdateFilterParams& params) {
 
 void Coordinator::FilterState::ApplyUpdate(const TUpdateFilterParams& params,
     Coordinator* coord) {
+  DCHECK(!disabled());
   DCHECK_GT(pending_count_, 0);
   DCHECK_EQ(completion_time_, 0L);
   if (first_arrival_time_ == 0L) {
@@ -1180,7 +1171,7 @@ void Coordinator::FilterState::ApplyUpdate(const TUpdateFilterParams& params,
   --pending_count_;
   if (params.bloom_filter.always_true) {
     Disable(coord->filter_mem_tracker_);
-  } else if (bloom_filter_.get() == nullptr) {
+  } else if (bloom_filter_.always_false) {
     int64_t heap_space = params.bloom_filter.directory.size();
     if (!coord->filter_mem_tracker_->TryConsume(heap_space)) {
       VLOG_QUERY << "Not enough memory to allocate filter: "
@@ -1189,31 +1180,29 @@ void Coordinator::FilterState::ApplyUpdate(const TUpdateFilterParams& params,
       // Disable, as one missing update means a correct filter cannot be produced.
       Disable(coord->filter_mem_tracker_);
     } else {
-      bloom_filter_.reset(new TBloomFilter());
       // Workaround for fact that parameters are const& for Thrift RPCs - yet we want to
       // move the payload from the request rather than copy it and take double the memory
       // cost. After this point, params.bloom_filter is an empty filter and should not be
       // read.
-      TBloomFilter* non_const_filter =
-          &const_cast<TBloomFilter&>(params.bloom_filter);
-      swap(*bloom_filter_.get(), *non_const_filter);
+      TBloomFilter* non_const_filter = &const_cast<TBloomFilter&>(params.bloom_filter);
+      swap(bloom_filter_, *non_const_filter);
       DCHECK_EQ(non_const_filter->directory.size(), 0);
     }
   } else {
-    BloomFilter::Or(params.bloom_filter, bloom_filter_.get());
+    BloomFilter::Or(params.bloom_filter, &bloom_filter_);
   }
 
-  if (pending_count_ == 0 || disabled_) {
+  if (pending_count_ == 0 || disabled()) {
     completion_time_ = coord->query_events_->ElapsedTime();
   }
 }
 
 void Coordinator::FilterState::Disable(MemTracker* tracker) {
-  disabled_ = true;
-  if (bloom_filter_.get() == nullptr) return;
-  int64_t heap_space = bloom_filter_.get()->directory.size();
-  tracker->Release(heap_space);
-  bloom_filter_.reset();
+  bloom_filter_.always_true = true;
+  bloom_filter_.always_false = false;
+  tracker->Release(bloom_filter_.directory.size());
+  bloom_filter_.directory.clear();
+  bloom_filter_.directory.shrink_to_fit();
 }
 
 const TUniqueId& Coordinator::query_id() const {

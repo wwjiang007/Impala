@@ -151,11 +151,10 @@ class HdfsScanNodeBase : public ScanNode {
 
   const TupleDescriptor* min_max_tuple_desc() const { return min_max_tuple_desc_; }
   const TupleDescriptor* tuple_desc() const { return tuple_desc_; }
-  const HdfsTableDescriptor* hdfs_table() { return hdfs_table_; }
-  const AvroSchemaElement& avro_schema() { return *avro_schema_.get(); }
-  RuntimeState* runtime_state() { return runtime_state_; }
+  const HdfsTableDescriptor* hdfs_table() const { return hdfs_table_; }
+  const AvroSchemaElement& avro_schema() const { return *avro_schema_.get(); }
   int skip_header_line_count() const { return skip_header_line_count_; }
-  DiskIoRequestContext* reader_context() { return reader_context_; }
+  DiskIoRequestContext* reader_context() const { return reader_context_; }
   bool optimize_parquet_count_star() const { return optimize_parquet_count_star_; }
   int parquet_count_star_slot_offset() const { return parquet_count_star_slot_offset_; }
 
@@ -306,15 +305,9 @@ class HdfsScanNodeBase : public ScanNode {
   bool PartitionPassesFilters(int32_t partition_id, const std::string& stats_name,
       const std::vector<FilterContext>& filter_ctxs);
 
-  const std::vector<ScalarExpr*>& filter_exprs() const { return filter_exprs_; }
-
-  const std::vector<FilterContext>& filter_ctxs() const { return filter_ctxs_; }
-
  protected:
   friend class ScannerContext;
   friend class HdfsScanner;
-
-  RuntimeState* runtime_state_ = nullptr;
 
   /// Tuple id of the tuple used to evaluate conjuncts on parquet::Statistics.
   const int min_max_tuple_id_;
@@ -406,14 +399,6 @@ class HdfsScanNodeBase : public ScanNode {
   typedef boost::unordered_map<std::vector<int>, int> PathToSlotIdxMap;
   PathToSlotIdxMap path_to_materialized_slot_idx_;
 
-  /// Expressions to evaluate the input rows for filtering against runtime filters.
-  std::vector<ScalarExpr*> filter_exprs_;
-
-  /// List of contexts for expected runtime filters for this scan node. These contexts are
-  /// cloned by individual scanners to be used in multi-threaded contexts, passed through
-  /// the per-scanner ScannerContext. Correspond to exprs in 'filter_exprs_'.
-  std::vector<FilterContext> filter_ctxs_;
-
   /// is_materialized_col_[i] = <true i-th column should be materialized, false otherwise>
   /// for 0 <= i < total # columns in table
   //
@@ -435,12 +420,6 @@ class HdfsScanNodeBase : public ScanNode {
   /// materialize and conjuncts evaluation code paths.
   AtomicInt32 num_scanners_codegen_enabled_;
   AtomicInt32 num_scanners_codegen_disabled_;
-
-  /// This is the number of io buffers that are owned by the scan node and the scanners.
-  /// This is used just to help debug leaked io buffers to determine if the leak is
-  /// happening in the scanners vs other parts of the execution.
-  /// TODO: Remove this counter when deprecating the multi-threaded scan node.
-  AtomicInt32 num_owned_io_buffers_;
 
   /// If true, counters are actively running and need to be reported in the runtime
   /// profile.
@@ -494,13 +473,6 @@ class HdfsScanNodeBase : public ScanNode {
   /// scanner threads.
   Status status_;
 
-  /// Mapping of file formats (file type, compression type) to the number of
-  /// splits of that type and the lock protecting it.
-  typedef std::map<
-     std::tuple<THdfsFileFormat::type, bool, THdfsCompression::type>,
-     int> FileTypeCountsMap;
-  FileTypeCountsMap file_type_counts_;
-
   /// Performs dynamic partition pruning, i.e., applies runtime filters to files, and
   /// issues initial ranges for all file types. Waits for runtime filters if necessary.
   /// Only valid to call if !initial_ranges_issued_. Sets initial_ranges_issued_ to true.
@@ -529,11 +501,6 @@ class HdfsScanNodeBase : public ScanNode {
   bool FilePassesFilterPredicates(const std::vector<FilterContext>& filter_ctxs,
       const THdfsFileFormat::type& file_type, HdfsFileDesc* file);
 
-  /// Waits for up to time_ms for runtime filters to arrive, checking every 20ms. Returns
-  /// true if all filters arrived within the time limit (as measured from the time of
-  /// RuntimeFilterBank::RegisterFilter()), false otherwise.
-  bool WaitForRuntimeFilters(int32_t time_ms);
-
   /// Stops periodic counters and aggregates counter values for the entire scan node.
   /// This should be called as soon as the scan node is complete to get the most accurate
   /// counter values.
@@ -545,6 +512,55 @@ class HdfsScanNodeBase : public ScanNode {
   /// Calls ExecNode::ExecDebugAction() with 'phase'. Returns the status based on the
   /// debug action specified for the query.
   Status ScanNodeDebugAction(TExecNodePhase::type phase) WARN_UNUSED_RESULT;
+
+ private:
+  class HdfsCompressionTypesSet {
+   public:
+    HdfsCompressionTypesSet(): bit_map_(0) {
+      DCHECK_GE(sizeof(bit_map_) * CHAR_BIT, _THdfsCompression_VALUES_TO_NAMES.size());
+    }
+
+    bool HasType(THdfsCompression::type type) {
+      return (bit_map_ & (1 << type)) != 0;
+    }
+
+    void AddType(const THdfsCompression::type type) {
+      bit_map_ |= (1 << type);
+    }
+
+    int Size() { return BitUtil::Popcount(bit_map_); }
+
+    THdfsCompression::type GetFirstType() {
+      DCHECK_GT(Size(), 0);
+      for (auto& elem : _THdfsCompression_VALUES_TO_NAMES) {
+        THdfsCompression::type type = static_cast<THdfsCompression::type>(elem.first);
+        if (HasType(type))  return type;
+      }
+      return THdfsCompression::NONE;
+    }
+
+    // The following operator overloading is needed so this class can be part of the
+    // std::map key.
+    bool operator< (const HdfsCompressionTypesSet& o) const {
+      return bit_map_ < o.bit_map_;
+    }
+
+    bool operator== (const HdfsCompressionTypesSet& o) const {
+      return bit_map_ == o.bit_map_;
+    }
+
+   private:
+    uint32_t bit_map_;
+  };
+
+  /// Mapping of file formats to the number of splits of that type. The key is a tuple
+  /// containing:
+  /// * file type
+  /// * whether the split was skipped
+  /// * compression types set
+  typedef std::map<std::tuple<THdfsFileFormat::type, bool, HdfsCompressionTypesSet>, int>
+      FileTypeCountsMap;
+  FileTypeCountsMap file_type_counts_;
 };
 
 }

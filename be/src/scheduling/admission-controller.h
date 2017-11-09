@@ -31,6 +31,7 @@
 #include "scheduling/request-pool-service.h"
 #include "scheduling/query-schedule.h"
 #include "statestore/statestore-subscriber.h"
+#include "util/condition-variable.h"
 #include "util/internal-queue.h"
 #include "util/thread.h"
 
@@ -408,7 +409,7 @@ class AdmissionController {
 
   /// Notifies the dequeuing thread that pool stats have changed and it may be
   /// possible to dequeue and admit queries.
-  boost::condition_variable dequeue_cv_;
+  ConditionVariable dequeue_cv_;
 
   /// If true, tear down the dequeuing thread. This only happens in unit tests.
   bool done_;
@@ -426,12 +427,9 @@ class AdmissionController {
   void AddPoolUpdates(std::vector<TTopicDelta>* subscriber_topic_updates);
 
   /// Updates the remote stats with per-host topic_updates coming from the statestore.
-  /// Called by UpdatePoolStats(). Must hold admission_ctrl_lock_.
+  /// Removes remote stats identified by topic deletions coming from the
+  /// statestore. Called by UpdatePoolStats(). Must hold admission_ctrl_lock_.
   void HandleTopicUpdates(const std::vector<TTopicItem>& topic_updates);
-
-  /// Removes remote stats identified by the topic_deletions coming from the statestore.
-  /// Called by UpdatePoolStats(). Must hold admission_ctrl_lock_.
-  void HandleTopicDeletions(const std::vector<std::string>& topic_deletions);
 
   /// Re-computes the per-pool aggregate stats and the per-host aggregates in
   /// host_mem_reserved_ using each pool's remote_stats_ and local_stats_.

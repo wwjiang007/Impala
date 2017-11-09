@@ -301,6 +301,10 @@ IMPALA_ADD_THIRDPARTY_LIB(breakpad_client ${BREAKPAD_INCLUDE_DIR} ${BREAKPAD_STA
 find_package(Kerberos REQUIRED)
 IMPALA_ADD_THIRDPARTY_LIB(krb5 ${KERBEROS_INCLUDE_DIR} "" ${KERBEROS_LIBRARY})
 
+# We require certain binaries from the kerberos project for our automated kerberos
+# testing.
+find_package(KerberosPrograms REQUIRED)
+
 ###################################################################
 
 # System dependencies
@@ -347,12 +351,13 @@ add_subdirectory(common/function-registry)
 add_subdirectory(common/thrift)
 add_subdirectory(common/fbs)
 add_subdirectory(common/yarn-extras)
+add_subdirectory(common/protobuf)
 add_subdirectory(be)
 add_subdirectory(fe)
 add_subdirectory(ext-data-source)
 
 # Build target for all generated files which most backend code depends on
-add_custom_target(gen-deps ALL DEPENDS thrift-deps)
+add_custom_target(gen-deps ALL DEPENDS thrift-deps proto-deps)
 
 add_custom_target(tarballs ALL DEPENDS shell_tarball)
 

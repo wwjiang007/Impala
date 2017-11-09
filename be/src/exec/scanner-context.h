@@ -65,7 +65,8 @@ class ScannerContext {
   /// get pushed to) and the scan range to process.
   /// This context starts with 1 stream.
   ScannerContext(RuntimeState*, HdfsScanNodeBase*, HdfsPartitionDescriptor*,
-      DiskIoMgr::ScanRange* scan_range, const std::vector<FilterContext>& filter_ctxs);
+      DiskIoMgr::ScanRange* scan_range, const std::vector<FilterContext>& filter_ctxs,
+      MemPool* expr_results_pool);
 
   /// Destructor verifies that all stream objects have been released.
   ~ScannerContext();
@@ -98,13 +99,6 @@ class ScannerContext {
     /// the boundary buffer used to stitch IO buffers together.
     /// If we are past the end of the scan range, no bytes are returned.
     Status GetBuffer(bool peek, uint8_t** buffer, int64_t* out_len);
-
-    /// Sets whether of not the resulting tuples contain ptrs into memory owned by
-    /// the scanner context. This by default, is inferred from the scan_node tuple
-    /// descriptor (i.e. contains string slots) but can be overridden.  If possible,
-    /// this should be set to false to reduce memory usage as resources can be reused
-    /// and recycled more quickly.
-    void set_contains_tuple_data(bool v) { contains_tuple_data_ = v; }
 
     /// Callback that returns the buffer size to use when reading past the end of the scan
     /// range. Reading past the end of the scan range is likely a remote read, so we want
@@ -174,15 +168,16 @@ class ScannerContext {
     /// Skip this text object.
     bool SkipText(Status*);
 
+    /// Release all completed resources in the context, i.e. I/O and boundary buffers
+    /// that the caller has finished reading. If 'done' is true all resources are
+    /// freed, even if the caller has not read that data yet.
+    void ReleaseCompletedResources(bool done);
+
    private:
     friend class ScannerContext;
     ScannerContext* parent_;
     DiskIoMgr::ScanRange* scan_range_;
     const HdfsFileDesc* file_desc_;
-
-    /// If true, tuples will contain pointers into memory contained in this object.
-    /// That memory (io buffers or boundary buffers) must be attached to the row batch.
-    bool contains_tuple_data_;
 
     /// Total number of bytes returned from GetBytes()
     int64_t total_bytes_returned_;
@@ -231,7 +226,7 @@ class ScannerContext {
     /// List of buffers that are completed but still have bytes referenced by the caller.
     /// On the next GetBytes() call, these buffers are released (the caller by calling
     /// GetBytes() signals it is done with its previous bytes).  At this point the
-    /// buffers are either returned to the io mgr or attached to the current row batch.
+    /// buffers are returned to the I/O manager.
     std::deque<std::unique_ptr<DiskIoMgr::BufferDescriptor>> completed_io_buffers_;
 
     Stream(ScannerContext* parent);
@@ -256,14 +251,6 @@ class ScannerContext {
     /// never set to NULL, even if it contains 0 bytes.
     Status GetNextBuffer(int64_t read_past_size = 0);
 
-    /// If 'batch' is not NULL and 'contains_tuple_data_' is true, attaches all completed
-    /// io buffers and the boundary mem pool to 'batch'. If 'done' is set, all in-flight
-    /// resources are also attached or released.
-    /// If 'batch' is NULL then 'done' must be true or 'contains_tuple_data_' false. Such
-    /// a call will release all completed resources. If 'done' is true all in-flight
-    /// resources are also freed.
-    void ReleaseCompletedResources(RowBatch* batch, bool done);
-
     /// Validates that the output buffer pointers point to the correct buffer.
     bool ValidateBufferPointers() const;
 
@@ -279,22 +266,23 @@ class ScannerContext {
     return streams_[idx].get();
   }
 
-  /// If a non-NULL 'batch' is passed, attaches completed io buffers and boundary mem pools
-  /// from all streams to 'batch'. Attaching only completed resources ensures that buffers
-  /// (and their cleanup) trail the rows that reference them (row batches are consumed and
-  /// cleaned up in order by the rest of the query).
-  /// If 'done' is true, this is the final call for the current streams and any pending
-  /// resources in each stream are also passed to the row batch. Callers which want to
-  /// clear the streams from the context should also call ClearStreams().
-  ///
-  /// A NULL 'batch' may be passed to free all resources. It is only valid to pass a NULL
-  /// 'batch' when also passing 'done'.
+  /// Returns completed I/O buffers to the I/O manager. If 'done' is true, this is the
+  /// final call for the current streams and any pending resources in each stream are
+  /// also freed. Callers which want to clear the streams from the context should also
+  /// call ClearStreams().
   ///
   /// This must be called with 'done' set when the scanner is complete and no longer needs
   /// any resources (e.g. tuple memory, io buffers) returned from the current streams.
   /// After calling with 'done' set, this should be called again if new streams are
   /// created via AddStream().
-  void ReleaseCompletedResources(RowBatch* batch, bool done);
+  void ReleaseCompletedResources(bool done);
+
+  /// Overload with the signature expected by Impala-lzo to enable easier staging of
+  /// the API change. TODO: remove this once Impala-lzo is updated to use the new
+  /// signature.
+  void ReleaseCompletedResources(RowBatch* batch, bool done) {
+    ReleaseCompletedResources(done);
+  }
 
   /// Releases all the Stream objects in the vector 'streams_' and reduces the vector's
   /// size to 0.
@@ -311,7 +299,7 @@ class ScannerContext {
   int num_completed_io_buffers() const { return num_completed_io_buffers_; }
   HdfsPartitionDescriptor* partition_descriptor() { return partition_desc_; }
   const std::vector<FilterContext>& filter_ctxs() const { return filter_ctxs_; }
-
+  MemPool* expr_results_pool() const { return expr_results_pool_; }
  private:
   friend class Stream;
 
@@ -329,6 +317,18 @@ class ScannerContext {
   /// Filter contexts for all filters applicable to this scan. Memory attached to the
   /// context is owned by the scan node.
   std::vector<FilterContext> filter_ctxs_;
+
+  /// MemPool used for allocations that hold results of expression evaluation in the
+  /// scanner and 'filter_ctxs_'. Must be thread-local since MemPool is not thread-safe.
+  /// Owned by ScannerThread() in the multi-threaded scan node and by the ExecNode in the
+  /// single-threaded scan node implementation.
+  ///
+  /// The scanner is responsible for clearing the MemPool periodically after expression
+  /// evaluation to prevent memory from accumulating.
+  ///
+  /// TODO: IMPALA-6015: it should be possible to simplify the lifecycle of this pool and
+  /// filter_ctxs_ once the multithreaded scan node is removed.
+  MemPool* const expr_results_pool_;
 };
 
 }

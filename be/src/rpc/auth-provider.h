@@ -140,7 +140,9 @@ class SaslAuthProvider : public AuthProvider {
   /// function as a client.
   bool needs_kinit_;
 
-  /// Runs "RunKinit" below if needs_kinit_ is true.
+  /// Runs "RunKinit" below if needs_kinit_ is true and FLAGS_use_kudu_kinit is false.
+  /// Once started, this thread lives as long as the process does and periodically forks
+  /// impalad and execs the 'kinit' process.
   std::unique_ptr<Thread> kinit_thread_;
 
   /// Periodically (roughly once every FLAGS_kerberos_reinit_interval minutes) calls kinit
@@ -177,6 +179,10 @@ class NoAuthProvider : public AuthProvider {
 /// The first entry point to the authentication subsystem.  Performs initialization
 /// of Sasl, the global AuthManager, and the two authentication providers.  Appname
 /// should generally be argv[0].
+/// TODO: Calling InitAuth() more than once is not an issue, however, calling InitAuth()
+/// more than once with a different 'appname' can lead to undefined behavior. Also,
+/// 'appname' must live as long as the process does since the cyrus-sasl library holds a
+/// reference to it.
 Status InitAuth(const std::string& appname);
 
 }
