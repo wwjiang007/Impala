@@ -27,16 +27,16 @@
 #include "exec/parquet-column-stats.h"
 #include "exec/scanner-context.inline.h"
 #include "runtime/collection-value-builder.h"
+#include "runtime/io/disk-io-mgr.h"
 #include "runtime/runtime-state.h"
 #include "runtime/runtime-filter.inline.h"
 #include "rpc/thrift-util.h"
 
 #include "common/names.h"
 
-using llvm::Function;
 using std::move;
 using namespace impala;
-using namespace llvm;
+using namespace impala::io;
 
 DEFINE_double(parquet_min_filter_reject_ratio, 0.1, "(Advanced) If the percentage of "
     "rows rejected by a runtime filter drops below this value, the filter is disabled.");
@@ -69,7 +69,7 @@ const string PARQUET_MEM_LIMIT_EXCEEDED =
 
 Status HdfsParquetScanner::IssueInitialRanges(HdfsScanNodeBase* scan_node,
     const std::vector<HdfsFileDesc*>& files) {
-  vector<DiskIoMgr::ScanRange*> footer_ranges;
+  vector<ScanRange*> footer_ranges;
   for (int i = 0; i < files.size(); ++i) {
     // If the file size is less than 12 bytes, it is an invalid Parquet file.
     if (files[i]->file_length < 12) {
@@ -82,10 +82,10 @@ Status HdfsParquetScanner::IssueInitialRanges(HdfsScanNodeBase* scan_node,
     DCHECK_GE(footer_start, 0);
 
     // Try to find the split with the footer.
-    DiskIoMgr::ScanRange* footer_split = FindFooterSplit(files[i]);
+    ScanRange* footer_split = FindFooterSplit(files[i]);
 
     for (int j = 0; j < files[i]->splits.size(); ++j) {
-      DiskIoMgr::ScanRange* split = files[i]->splits[j];
+      ScanRange* split = files[i]->splits[j];
 
       DCHECK_LE(split->offset() + split->len(), files[i]->file_length);
       // If there are no materialized slots (such as count(*) over the table), we can
@@ -100,19 +100,19 @@ Status HdfsParquetScanner::IssueInitialRanges(HdfsScanNodeBase* scan_node,
         // is done here, followed by scan ranges for the columns of each row group within
         // the actual split (in InitColumns()). The original split is stored in the
         // metadata associated with the footer range.
-        DiskIoMgr::ScanRange* footer_range;
+        ScanRange* footer_range;
         if (footer_split != NULL) {
           footer_range = scan_node->AllocateScanRange(files[i]->fs,
               files[i]->filename.c_str(), footer_size, footer_start,
               split_metadata->partition_id, footer_split->disk_id(),
               footer_split->expected_local(),
-              DiskIoMgr::BufferOpts(footer_split->try_cache(), files[i]->mtime), split);
+              BufferOpts(footer_split->try_cache(), files[i]->mtime), split);
         } else {
           // If we did not find the last split, we know it is going to be a remote read.
           footer_range =
               scan_node->AllocateScanRange(files[i]->fs, files[i]->filename.c_str(),
                   footer_size, footer_start, split_metadata->partition_id, -1, false,
-                  DiskIoMgr::BufferOpts::Uncached(), split);
+                  BufferOpts::Uncached(), split);
         }
 
         footer_ranges.push_back(footer_range);
@@ -127,10 +127,10 @@ Status HdfsParquetScanner::IssueInitialRanges(HdfsScanNodeBase* scan_node,
   return Status::OK();
 }
 
-DiskIoMgr::ScanRange* HdfsParquetScanner::FindFooterSplit(HdfsFileDesc* file) {
+ScanRange* HdfsParquetScanner::FindFooterSplit(HdfsFileDesc* file) {
   DCHECK(file != NULL);
   for (int i = 0; i < file->splits.size(); ++i) {
-    DiskIoMgr::ScanRange* split = file->splits[i];
+    ScanRange* split = file->splits[i];
     if (split->offset() + split->len() == file->file_length) return split;
   }
   return NULL;
@@ -228,6 +228,7 @@ Status HdfsParquetScanner::Open(ScannerContext* context) {
   // Release I/O buffers immediately to make sure they are cleaned up
   // in case we return a non-OK status anywhere below.
   context_->ReleaseCompletedResources(true);
+  context_->ClearStreams();
   RETURN_IF_ERROR(footer_status);
 
   // Parse the file schema into an internal representation for schema resolution.
@@ -263,7 +264,7 @@ void HdfsParquetScanner::Close(RowBatch* row_batch) {
     }
   } else {
     template_tuple_pool_->FreeAll();
-    dictionary_pool_.get()->FreeAll();
+    dictionary_pool_->FreeAll();
     context_->ReleaseCompletedResources(true);
     for (ParquetColumnReader* col_reader : column_readers_) col_reader->Close(nullptr);
     // The scratch batch may still contain tuple data. We can get into this case if
@@ -279,7 +280,6 @@ void HdfsParquetScanner::Close(RowBatch* row_batch) {
   DCHECK_EQ(template_tuple_pool_->total_allocated_bytes(), 0);
   DCHECK_EQ(dictionary_pool_->total_allocated_bytes(), 0);
   DCHECK_EQ(scratch_batch_->total_allocated_bytes(), 0);
-  DCHECK_EQ(context_->num_completed_io_buffers(), 0);
 
   // Collect compression types for reporting completed ranges.
   vector<THdfsCompression::type> compression_types;
@@ -343,7 +343,7 @@ static int64_t GetRowGroupMidOffset(const parquet::RowGroup& row_group) {
 
 // Returns true if 'row_group' overlaps with 'split_range'.
 static bool CheckRowGroupOverlapsSplit(const parquet::RowGroup& row_group,
-    const DiskIoMgr::ScanRange* split_range) {
+    const ScanRange* split_range) {
   int64_t row_group_start = GetColumnStartOffset(row_group.columns[0].meta_data);
 
   const parquet::ColumnMetaData& last_column =
@@ -461,7 +461,7 @@ Status HdfsParquetScanner::GetNextInternal(RowBatch* row_batch) {
     Status status = CommitRows(row_batch, num_to_commit);
     assemble_rows_timer_.Stop();
     RETURN_IF_ERROR(status);
-    row_group_rows_read_ += num_to_commit;
+    row_group_rows_read_ += max_tuples;
     COUNTER_ADD(scan_node_->rows_read_counter(), row_group_rows_read_);
     return Status::OK();
   }
@@ -479,7 +479,6 @@ Status HdfsParquetScanner::GetNextInternal(RowBatch* row_batch) {
     // Transfer resources and clear streams if there is any leftover from the previous
     // row group. We will create new streams for the next row group.
     FlushRowGroupResources(row_batch);
-    context_->ClearStreams();
     if (!advance_row_group_) {
       Status status =
           ValidateEndOfRowGroup(column_readers_, row_group_idx_, row_group_rows_read_);
@@ -600,7 +599,7 @@ Status HdfsParquetScanner::EvaluateStatsConjuncts(
 }
 
 Status HdfsParquetScanner::NextRowGroup() {
-  const DiskIoMgr::ScanRange* split_range = static_cast<ScanRangeMetadata*>(
+  const ScanRange* split_range = static_cast<ScanRangeMetadata*>(
       metadata_range_->meta_data())->original_split;
   int64_t split_offset = split_range->offset();
   int64_t split_length = split_range->len();
@@ -620,6 +619,9 @@ Status HdfsParquetScanner::NextRowGroup() {
   while (true) {
     // Reset the parse status for the next row group.
     parse_status_ = Status::OK();
+    // Make sure that we don't have leftover resources from the file metadata scan range
+    // or previous row groups.
+    DCHECK_EQ(0, context_->NumStreams());
 
     ++row_group_idx_;
     if (row_group_idx_ >= file_metadata_.row_groups.size()) {
@@ -670,6 +672,9 @@ Status HdfsParquetScanner::NextRowGroup() {
     // of the column.
     RETURN_IF_ERROR(InitColumns(row_group_idx_, dict_filterable_readers_));
 
+    // InitColumns() may have allocated resources to scan columns. If we skip this row
+    // group below, we must call ReleaseSkippedRowGroupResources() before continuing.
+
     // If there is a dictionary-encoded column where every value is eliminated
     // by a conjunct, the row group can be eliminated. This initializes dictionaries
     // for all columns visited.
@@ -678,10 +683,12 @@ Status HdfsParquetScanner::NextRowGroup() {
     if (!status.ok()) {
       // Either return an error or skip this row group if it is ok to ignore errors
       RETURN_IF_ERROR(state_->LogOrReturnError(status.msg()));
+      ReleaseSkippedRowGroupResources();
       continue;
     }
     if (skip_row_group_on_dict_filters) {
       COUNTER_ADD(num_dict_filtered_row_groups_counter_, 1);
+      ReleaseSkippedRowGroupResources();
       continue;
     }
 
@@ -693,6 +700,7 @@ Status HdfsParquetScanner::NextRowGroup() {
     if (!status.ok()) {
       // Either return an error or skip this row group if it is ok to ignore errors
       RETURN_IF_ERROR(state_->LogOrReturnError(status.msg()));
+      ReleaseSkippedRowGroupResources();
       continue;
     }
 
@@ -731,9 +739,16 @@ void HdfsParquetScanner::FlushRowGroupResources(RowBatch* row_batch) {
   row_batch->tuple_data_pool()->AcquireData(dictionary_pool_.get(), false);
   scratch_batch_->ReleaseResources(row_batch->tuple_data_pool());
   context_->ReleaseCompletedResources(true);
-  for (ParquetColumnReader* col_reader : column_readers_) {
-    col_reader->Close(row_batch);
-  }
+  for (ParquetColumnReader* col_reader : column_readers_) col_reader->Close(row_batch);
+  context_->ClearStreams();
+}
+
+void HdfsParquetScanner::ReleaseSkippedRowGroupResources() {
+  dictionary_pool_->FreeAll();
+  scratch_batch_->ReleaseResources(nullptr);
+  context_->ReleaseCompletedResources(true);
+  for (ParquetColumnReader* col_reader : column_readers_) col_reader->Close(nullptr);
+  context_->ClearStreams();
 }
 
 bool HdfsParquetScanner::IsDictFilterable(ParquetColumnReader* col_reader) {
@@ -1064,24 +1079,24 @@ int HdfsParquetScanner::TransferScratchTuples(RowBatch* dst_batch) {
 }
 
 Status HdfsParquetScanner::Codegen(HdfsScanNodeBase* node,
-    const vector<ScalarExpr*>& conjuncts, Function** process_scratch_batch_fn) {
+    const vector<ScalarExpr*>& conjuncts, llvm::Function** process_scratch_batch_fn) {
   DCHECK(node->runtime_state()->ShouldCodegen());
   *process_scratch_batch_fn = NULL;
   LlvmCodeGen* codegen = node->runtime_state()->codegen();
   DCHECK(codegen != NULL);
   SCOPED_TIMER(codegen->codegen_timer());
 
-  Function* fn = codegen->GetFunction(IRFunction::PROCESS_SCRATCH_BATCH, true);
+  llvm::Function* fn = codegen->GetFunction(IRFunction::PROCESS_SCRATCH_BATCH, true);
   DCHECK(fn != NULL);
 
-  Function* eval_conjuncts_fn;
+  llvm::Function* eval_conjuncts_fn;
   RETURN_IF_ERROR(ExecNode::CodegenEvalConjuncts(codegen, conjuncts, &eval_conjuncts_fn));
   DCHECK(eval_conjuncts_fn != NULL);
 
   int replaced = codegen->ReplaceCallSites(fn, eval_conjuncts_fn, "EvalConjuncts");
   DCHECK_EQ(replaced, 1);
 
-  Function* eval_runtime_filters_fn;
+  llvm::Function* eval_runtime_filters_fn;
   RETURN_IF_ERROR(CodegenEvalRuntimeFilters(
       codegen, node->filter_exprs(), &eval_runtime_filters_fn));
   DCHECK(eval_runtime_filters_fn != NULL);
@@ -1110,7 +1125,8 @@ bool HdfsParquetScanner::EvalRuntimeFilters(TupleRow* row) {
 //                               %"class.impala::TupleRow"* %row) #34 {
 // entry:
 //   %0 = call i1 @_ZN6impala18HdfsParquetScanner17EvalRuntimeFilterEiPNS_8TupleRowE.2(
-//       %"class.impala::HdfsParquetScanner"* %this, i32 0, %"class.impala::TupleRow"* %row)
+//       %"class.impala::HdfsParquetScanner"* %this, i32 0, %"class.impala::TupleRow"*
+//       %row)
 //   br i1 %0, label %continue, label %bail_out
 //
 // bail_out:                                         ; preds = %entry
@@ -1122,41 +1138,41 @@ bool HdfsParquetScanner::EvalRuntimeFilters(TupleRow* row) {
 //
 // EvalRuntimeFilter() is the same as the cross-compiled version except EvalOneFilter()
 // is replaced with the one generated by CodegenEvalOneFilter().
-Status HdfsParquetScanner::CodegenEvalRuntimeFilters(LlvmCodeGen* codegen,
-    const vector<ScalarExpr*>& filter_exprs, Function** fn) {
-  LLVMContext& context = codegen->context();
+Status HdfsParquetScanner::CodegenEvalRuntimeFilters(
+    LlvmCodeGen* codegen, const vector<ScalarExpr*>& filter_exprs, llvm::Function** fn) {
+  llvm::LLVMContext& context = codegen->context();
   LlvmBuilder builder(context);
 
   *fn = nullptr;
-  Type* this_type = codegen->GetPtrType(HdfsParquetScanner::LLVM_CLASS_NAME);
-  PointerType* tuple_row_ptr_type = codegen->GetPtrType(TupleRow::LLVM_CLASS_NAME);
+  llvm::Type* this_type = codegen->GetPtrType(HdfsParquetScanner::LLVM_CLASS_NAME);
+  llvm::PointerType* tuple_row_ptr_type = codegen->GetPtrType(TupleRow::LLVM_CLASS_NAME);
   LlvmCodeGen::FnPrototype prototype(codegen, "EvalRuntimeFilters",
       codegen->GetType(TYPE_BOOLEAN));
   prototype.AddArgument(LlvmCodeGen::NamedVariable("this", this_type));
   prototype.AddArgument(LlvmCodeGen::NamedVariable("row", tuple_row_ptr_type));
 
-  Value* args[2];
-  Function* eval_runtime_filters_fn = prototype.GeneratePrototype(&builder, args);
-  Value* this_arg = args[0];
-  Value* row_arg = args[1];
+  llvm::Value* args[2];
+  llvm::Function* eval_runtime_filters_fn = prototype.GeneratePrototype(&builder, args);
+  llvm::Value* this_arg = args[0];
+  llvm::Value* row_arg = args[1];
 
   int num_filters = filter_exprs.size();
   if (num_filters == 0) {
     builder.CreateRet(codegen->true_value());
   } else {
     // row_rejected_block: jump target for when a filter is evaluated to false.
-    BasicBlock* row_rejected_block =
-        BasicBlock::Create(context, "row_rejected", eval_runtime_filters_fn);
+    llvm::BasicBlock* row_rejected_block =
+        llvm::BasicBlock::Create(context, "row_rejected", eval_runtime_filters_fn);
 
     DCHECK_GT(num_filters, 0);
     for (int i = 0; i < num_filters; ++i) {
-      Function* eval_runtime_filter_fn =
+      llvm::Function* eval_runtime_filter_fn =
           codegen->GetFunction(IRFunction::PARQUET_SCANNER_EVAL_RUNTIME_FILTER, true);
       DCHECK(eval_runtime_filter_fn != nullptr);
 
       // Codegen function for inlining filter's expression evaluation and constant fold
       // the type of the expression into the hashing function to avoid branches.
-      Function* eval_one_filter_fn;
+      llvm::Function* eval_one_filter_fn;
       DCHECK(filter_exprs[i] != nullptr);
       RETURN_IF_ERROR(FilterContext::CodegenEval(codegen, filter_exprs[i],
           &eval_one_filter_fn));
@@ -1166,12 +1182,12 @@ Status HdfsParquetScanner::CodegenEvalRuntimeFilters(LlvmCodeGen* codegen,
           "FilterContext4Eval");
       DCHECK_EQ(replaced, 1);
 
-      Value* idx = codegen->GetIntConstant(TYPE_INT, i);
-      Value* passed_filter = builder.CreateCall(
-          eval_runtime_filter_fn, ArrayRef<Value*>({this_arg, idx, row_arg}));
+      llvm::Value* idx = codegen->GetIntConstant(TYPE_INT, i);
+      llvm::Value* passed_filter = builder.CreateCall(
+          eval_runtime_filter_fn, llvm::ArrayRef<llvm::Value*>({this_arg, idx, row_arg}));
 
-      BasicBlock* continue_block =
-          BasicBlock::Create(context, "continue", eval_runtime_filters_fn);
+      llvm::BasicBlock* continue_block =
+          llvm::BasicBlock::Create(context, "continue", eval_runtime_filters_fn);
       builder.CreateCondBr(passed_filter, continue_block, row_rejected_block);
       builder.SetInsertPoint(continue_block);
     }
@@ -1378,12 +1394,12 @@ Status HdfsParquetScanner::ProcessFooter() {
     DiskIoMgr* io_mgr = scan_node_->runtime_state()->io_mgr();
 
     // Read the header into the metadata buffer.
-    DiskIoMgr::ScanRange* metadata_range = scan_node_->AllocateScanRange(
+    ScanRange* metadata_range = scan_node_->AllocateScanRange(
         metadata_range_->fs(), filename(), metadata_size, metadata_start, partition_id,
         metadata_range_->disk_id(), metadata_range_->expected_local(),
-        DiskIoMgr::BufferOpts::ReadInto(metadata_buffer.buffer(), metadata_size));
+        BufferOpts::ReadInto(metadata_buffer.buffer(), metadata_size));
 
-    unique_ptr<DiskIoMgr::BufferDescriptor> io_buffer;
+    unique_ptr<BufferDescriptor> io_buffer;
     RETURN_IF_ERROR(
         io_mgr->Read(scan_node_->reader_context(), metadata_range, &io_buffer));
     DCHECK_EQ(io_buffer->buffer(), metadata_buffer.buffer());
@@ -1590,7 +1606,7 @@ Status HdfsParquetScanner::InitColumns(
   parquet::RowGroup& row_group = file_metadata_.row_groups[row_group_idx];
 
   // All the scan ranges (one for each column).
-  vector<DiskIoMgr::ScanRange*> col_ranges;
+  vector<ScanRange*> col_ranges;
   // Used to validate that the number of values in each reader in column_readers_ is the
   // same.
   int num_values = -1;
@@ -1657,17 +1673,17 @@ Status HdfsParquetScanner::InitColumns(
           "filename '$1'", col_chunk.file_path, filename()));
     }
 
-    const DiskIoMgr::ScanRange* split_range =
+    const ScanRange* split_range =
         static_cast<ScanRangeMetadata*>(metadata_range_->meta_data())->original_split;
 
     // Determine if the column is completely contained within a local split.
     bool col_range_local = split_range->expected_local()
         && col_start >= split_range->offset()
         && col_end <= split_range->offset() + split_range->len();
-    DiskIoMgr::ScanRange* col_range = scan_node_->AllocateScanRange(metadata_range_->fs(),
+    ScanRange* col_range = scan_node_->AllocateScanRange(metadata_range_->fs(),
         filename(), col_len, col_start, partition_id, split_range->disk_id(),
         col_range_local,
-        DiskIoMgr::BufferOpts(split_range->try_cache(), file_desc->mtime));
+        BufferOpts(split_range->try_cache(), file_desc->mtime));
     col_ranges.push_back(col_range);
 
     // Get the stream that will be used for this column

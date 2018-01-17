@@ -36,7 +36,8 @@ import textwrap
 import time
 
 from impala_client import (ImpalaClient, DisconnectedException, QueryStateException,
-                           RPCException, TApplicationException)
+                           RPCException, TApplicationException,
+                           QueryCancelledByShellException)
 from impala_shell_config_defaults import impala_shell_defaults
 from option_parser import get_option_parser, get_config_from_file
 from shell_output import DelimitedOutputFormatter, OutputStream, PrettyOutputFormatter
@@ -77,6 +78,18 @@ class ImpalaPrettyTable(prettytable.PrettyTable):
       # If a value cannot be encoded, replace it with a placeholder.
       value = unicode(value, self.encoding, "replace")
     return value
+
+class QueryOptionLevels:
+  """These are the levels used when displaying query options.
+  The values correspond to the ones in TQueryOptionLevel"""
+  REGULAR = 0
+  ADVANCED = 1
+  DEVELOPMENT = 2
+  DEPRECATED = 3
+
+class QueryOptionDisplayModes:
+  REGULAR_OPTIONS_ONLY = 1
+  ALL_OPTIONS = 2
 
 class ImpalaShell(object, cmd.Cmd):
   """ Simple Impala Shell.
@@ -162,6 +175,7 @@ class ImpalaShell(object, cmd.Cmd):
     self._populate_command_list()
 
     self.imp_client = None;
+    self.orig_cmd = None
 
     # Tracks query handle of the last query executed. Used by the 'profile' command.
     self.last_query_handle = None;
@@ -214,19 +228,64 @@ class ImpalaShell(object, cmd.Cmd):
     """
     self.readline = None
 
-  def _print_options(self, default_options, set_options):
-    # Prints the current query options
-    # with default values distinguished from set values by brackets [], followed by
-    # shell-local options.
-    if not default_options and not set_options:
+  def _print_options(self, print_mode):
+    """Prints the current query options with default values distinguished from set values
+    by brackets [], followed by shell-local options.
+    The options are displayed in groups based on option levels received in parameter.
+    Input parameter decides whether all groups or just the 'Regular' and 'Advanced'
+    options are displayed."""
+    print "Query options (defaults shown in []):"
+    if not self.imp_client.default_query_options and not self.set_query_options:
       print '\tNo options available.'
     else:
-      for k in sorted(default_options):
-        if k in set_options and set_options[k] != default_options[k]:
-          print '\n'.join(["\t%s: %s" % (k, set_options[k])])
-        else:
-          print '\n'.join(["\t%s: [%s]" % (k, default_options[k])])
+      (regular_options, advanced_options, development_options, deprecated_options) = \
+          self._get_query_option_grouping()
+      self._print_option_group(regular_options)
+      # If the shell is connected to an Impala that predates IMPALA-2181 then
+      # the advanced_options would be empty and only the regular options would
+      # be displayed.
+      if advanced_options:
+        print '\nAdvanced Query Options:'
+        self._print_option_group(advanced_options)
+      if print_mode == QueryOptionDisplayModes.ALL_OPTIONS:
+        if development_options:
+          print '\nDevelopment Query Options:'
+          self._print_option_group(development_options)
+        if deprecated_options:
+          print '\nDeprecated Query Options:'
+          self._print_option_group(deprecated_options)
     self._print_shell_options()
+
+  def _get_query_option_grouping(self):
+    """For all the query options received through rpc this function determines the
+    query option level for display purposes using the received query_option_levels
+    parameters.
+    If the option level can't be determined then it defaults to 'REGULAR'"""
+    regular_options, advanced_options, development_options, deprecated_options = \
+        {}, {}, {}, {}
+    for option_name, option_value in self.imp_client.default_query_options.iteritems():
+      level = self.imp_client.query_option_levels.get(option_name,
+                                                      QueryOptionLevels.REGULAR)
+      if level == QueryOptionLevels.REGULAR:
+        regular_options[option_name] = option_value
+      elif level == QueryOptionLevels.DEVELOPMENT:
+        development_options[option_name] = option_value
+      elif level == QueryOptionLevels.DEPRECATED:
+        deprecated_options[option_name] = option_value
+      else:
+        advanced_options[option_name] = option_value
+    return (regular_options, advanced_options, development_options, deprecated_options)
+
+  def _print_option_group(self, query_options):
+    """Gets query options and prints them. Value is inside [] for the ones having
+    default values.
+    query_options parameter is a subset of the default_query_options map"""
+    for option_name in sorted(query_options):
+      if (option_name in self.set_query_options and
+          self.set_query_options[option_name] != query_options[option_name]):
+        print '\n'.join(["\t%s: %s" % (option_name, self.set_query_options[option_name])])
+      else:
+        print '\n'.join(["\t%s: [%s]" % (option_name, query_options[option_name])])
 
   def _print_variables(self):
     # Prints the currently defined variables.
@@ -241,6 +300,18 @@ class ImpalaShell(object, cmd.Cmd):
     print "\nShell Options"
     for x in self.VALID_SHELL_OPTIONS:
       print "\t%s: %s" % (x, self.__dict__[self.VALID_SHELL_OPTIONS[x][1]])
+
+  def _create_beeswax_query(self, args):
+    """Original command should be stored before running the method. The method is usually
+    used in do_* methods and the command is kept at precmd()."""
+    command = self.orig_cmd
+    self.orig_cmd = None
+    if not command:
+      print_to_stderr("Unexpected error: Failed to execute query due to command "\
+                      "is missing")
+      sys.exit(1)
+    return self.imp_client.create_beeswax_query("%s %s" % (command, args),
+                                                 self.set_query_options)
 
   def do_shell(self, args):
     """Run a command on the shell
@@ -265,19 +336,16 @@ class ImpalaShell(object, cmd.Cmd):
     return regexp.sub(ImpalaShell.COMMENTS_BEFORE_SET_REPLACEMENT, line, 1)
 
   def sanitise_input(self, args):
-    """Convert the command to lower case, so it's recognized"""
     # A command terminated by a semi-colon is legal. Check for the trailing
     # semi-colons and strip them from the end of the command.
     if not self.interactive:
       # Strip all the non-interactive commands of the delimiter.
       args = self._remove_comments_before_set(args)
       tokens = args.strip().split(' ')
-      tokens[0] = tokens[0].lower()
       return ' '.join(tokens).rstrip(ImpalaShell.CMD_DELIM)
     # Handle EOF if input is interactive
     tokens = args.strip().split(' ')
-    tokens[0] = tokens[0].lower()
-    if tokens[0] == 'eof':
+    if tokens[0].lower() == 'eof':
       if not self.partial_cmd:
         # The first token is the command.
         # If it's EOF, call do_quit()
@@ -292,14 +360,9 @@ class ImpalaShell(object, cmd.Cmd):
         # been cancelled.
         print '\n'
         return str()
-    # The first token is converted into lower case to route it to the
-    # appropriate command handler. This only applies to the first line of user input.
-    # Modifying tokens in subsequent lines may change the semantics of the command,
-    # so do not modify the text.
     args = self._check_for_command_completion(args)
     args = self._remove_comments_before_set(args)
     tokens = args.strip().split(' ')
-    tokens[0] = tokens[0].lower()
     args = ' '.join(tokens).strip()
     return args.rstrip(ImpalaShell.CMD_DELIM)
 
@@ -427,13 +490,13 @@ class ImpalaShell(object, cmd.Cmd):
     # Create a new connection to the impalad and cancel the query.
     for cancel_try in xrange(ImpalaShell.CANCELLATION_TRIES):
       try:
+        self.imp_client.is_query_cancelled = True
         self.query_handle_closed = True
         print_to_stderr(ImpalaShell.CANCELLATION_MESSAGE)
         new_imp_client = self._new_impala_client()
         new_imp_client.connect()
         new_imp_client.cancel_query(self.last_query_handle, False)
         self.imp_client.close_query(self.last_query_handle)
-        self._validate_database()
         break
       except Exception, e:
         # Suppress harmless errors.
@@ -487,6 +550,7 @@ class ImpalaShell(object, cmd.Cmd):
     except TException:
       print_to_stderr("Connection lost, reconnecting...")
       self._connect()
+      self._validate_database(immediately=True)
     return args.encode('utf-8')
 
   def onecmd(self, line):
@@ -502,7 +566,29 @@ class ImpalaShell(object, cmd.Cmd):
     if line == None:
       return CmdStatus.ERROR
     else:
-      return cmd.Cmd.onecmd(self, line)
+      # This code is based on the code from the standard Python library package cmd.py:
+      # https://github.com/python/cpython/blob/master/Lib/cmd.py#L192
+      # One change is lowering command before getting a function. The lowering
+      # is necessary to find a proper function and here is a right place
+      # because the lowering command in front of the finding can avoid a
+      # side effect.
+      command, arg, line = self.parseline(line)
+      if not line:
+        return self.emptyline()
+      if command is None:
+        return self.default(line)
+      self.lastcmd = line
+      if line == 'EOF' :
+        self.lastcmd = ''
+      if command == '':
+        return self.default(line)
+      else:
+        try:
+          func = getattr(self, 'do_' + command.lower())
+          self.orig_cmd = command
+        except AttributeError:
+          return self.default(line)
+        return func(arg)
 
   def postcmd(self, status, args):
     # status conveys to shell how the shell should continue execution
@@ -551,11 +637,17 @@ class ImpalaShell(object, cmd.Cmd):
         return var_name
     return None
 
+  def _print_with_set(self, print_level):
+    self._print_options(print_level)
+    print "\nVariables:"
+    self._print_variables()
+
   def do_set(self, args):
     """Set or display query options.
 
     Display query options:
-    Usage: SET
+    Usage: SET (to display the Regular options) or
+           SET ALL (to display all the options)
     Set query options:
     Usage: SET <option>=<value>
            OR
@@ -564,20 +656,21 @@ class ImpalaShell(object, cmd.Cmd):
     """
     # TODO: Expand set to allow for setting more than just query options.
     if len(args) == 0:
-      print "Query options (defaults shown in []):"
-      self._print_options(self.imp_client.default_query_options, self.set_query_options)
-      print "\nVariables:"
-      self._print_variables()
+      self._print_with_set(QueryOptionDisplayModes.REGULAR_OPTIONS_ONLY)
       return CmdStatus.SUCCESS
 
     # Remove any extra spaces surrounding the tokens.
     # Allows queries that have spaces around the = sign.
     tokens = [arg.strip() for arg in args.split("=")]
     if len(tokens) != 2:
-      print_to_stderr("Error: SET <option>=<value>")
-      print_to_stderr("       OR")
-      print_to_stderr("       SET VAR:<variable>=<value>")
-      return CmdStatus.ERROR
+      if len(tokens) == 1 and tokens[0].upper() == "ALL":
+        self._print_with_set(QueryOptionDisplayModes.ALL_OPTIONS)
+        return CmdStatus.SUCCESS
+      else:
+        print_to_stderr("Error: SET <option>=<value>")
+        print_to_stderr("       OR")
+        print_to_stderr("       SET VAR:<variable>=<value>")
+        return CmdStatus.ERROR
     option_upper = tokens[0].upper()
     # Check if it's a variable
     var_name = self._get_var_name(option_upper)
@@ -589,7 +682,7 @@ class ImpalaShell(object, cmd.Cmd):
       if option_upper not in self.imp_client.default_query_options.keys():
         print "Unknown query option: %s" % (tokens[0])
         print "Available query options, with their values (defaults shown in []):"
-        self._print_options(self.imp_client.default_query_options, self.set_query_options)
+        self._print_options(QueryOptionDisplayModes.REGULAR_OPTIONS_ONLY)
         return CmdStatus.ERROR
       self.set_query_options[option_upper] = tokens[1]
       self._print_if_verbose('%s set to %s' % (option_upper, tokens[1]))
@@ -730,10 +823,21 @@ class ImpalaShell(object, cmd.Cmd):
     self._connect()
     self._validate_database()
 
-  def _validate_database(self):
+  def _validate_database(self, immediately=False):
+    """ Issues a "USE <db>" command where <db> is the current database.
+    It is typically needed after the connection is (re-)established to the Impala daemon.
+
+    If immediately is False, it appends the USE command to self.cmdqueue.
+    If immediately is True, it executes the USE command right away.
+    """
     if self.current_db:
       self.current_db = self.current_db.strip('`')
-      self.cmdqueue.append(('use `%s`' % self.current_db) + ImpalaShell.CMD_DELIM)
+      use_current_db = ('use `%s`' % self.current_db)
+
+      if immediately:
+        self.onecmd(use_current_db)
+      else:
+        self.cmdqueue.append(use_current_db + ImpalaShell.CMD_DELIM)
 
   def _print_if_verbose(self, message):
     if self.verbose:
@@ -766,25 +870,21 @@ class ImpalaShell(object, cmd.Cmd):
       return db_table_name
 
   def do_alter(self, args):
-    query = self.imp_client.create_beeswax_query("alter %s" % args,
-                                                 self.set_query_options)
+    query = self._create_beeswax_query(args)
     return self._execute_stmt(query)
 
   def do_create(self, args):
     # We want to print the webserver link only for CTAS queries.
     print_web_link = "select" in args
-    query = self.imp_client.create_beeswax_query("create %s" % args,
-                                                 self.set_query_options)
+    query = self._create_beeswax_query(args)
     return self._execute_stmt(query, print_web_link=print_web_link)
 
   def do_drop(self, args):
-    query = self.imp_client.create_beeswax_query("drop %s" % args,
-                                                 self.set_query_options)
+    query = self._create_beeswax_query(args)
     return self._execute_stmt(query)
 
   def do_load(self, args):
-    query = self.imp_client.create_beeswax_query("load %s" % args,
-                                                 self.set_query_options)
+    query = self._create_beeswax_query(args)
     return self._execute_stmt(query)
 
   def do_profile(self, args):
@@ -800,8 +900,7 @@ class ImpalaShell(object, cmd.Cmd):
 
   def do_select(self, args):
     """Executes a SELECT... query, fetching all rows"""
-    query = self.imp_client.create_beeswax_query("select %s" % args,
-                                                 self.set_query_options)
+    query = self._create_beeswax_query(args)
     return self._execute_stmt(query, print_web_link=True)
 
   def do_compute(self, args):
@@ -809,8 +908,7 @@ class ImpalaShell(object, cmd.Cmd):
     Impala shell cannot get child query handle so it cannot
     query live progress for COMPUTE STATS query. Disable live
     progress/summary callback for COMPUTE STATS query."""
-    query = self.imp_client.create_beeswax_query("compute %s" % args,
-                                                 self.set_query_options)
+    query = self._create_beeswax_query(args)
     (prev_print_progress, prev_print_summary) = self.print_progress, self.print_summary
     (self.print_progress, self.print_summary) = False, False;
     try:
@@ -962,6 +1060,8 @@ class ImpalaShell(object, cmd.Cmd):
       except RPCException, e:
         if self.show_profiles: raise e
       return CmdStatus.SUCCESS
+    except QueryCancelledByShellException, e:
+      return CmdStatus.SUCCESS
     except RPCException, e:
       # could not complete the rpc successfully
       print_to_stderr(e)
@@ -1006,14 +1106,12 @@ class ImpalaShell(object, cmd.Cmd):
 
   def do_values(self, args):
     """Executes a VALUES(...) query, fetching all rows"""
-    query = self.imp_client.create_beeswax_query("values %s" % args,
-                                                 self.set_query_options)
+    query = self._create_beeswax_query(args)
     return self._execute_stmt(query)
 
   def do_with(self, args):
     """Executes a query with a WITH clause, fetching all rows"""
-    query = self.imp_client.create_beeswax_query("with %s" % args,
-                                                 self.set_query_options)
+    query = self._create_beeswax_query(args)
     # Set posix=True and add "'" to escaped quotes
     # to deal with escaped quotes in string literals
     lexer = shlex.shlex(query.query.lstrip(), posix=True)
@@ -1027,8 +1125,7 @@ class ImpalaShell(object, cmd.Cmd):
 
   def do_use(self, args):
     """Executes a USE... query"""
-    query = self.imp_client.create_beeswax_query("use %s" % args,
-                                                 self.set_query_options)
+    query = self._create_beeswax_query(args)
     if self._execute_stmt(query) is CmdStatus.SUCCESS:
       self.current_db = args
     else:
@@ -1036,41 +1133,41 @@ class ImpalaShell(object, cmd.Cmd):
 
   def do_show(self, args):
     """Executes a SHOW... query, fetching all rows"""
-    query = self.imp_client.create_beeswax_query("show %s" % args,
-                                                 self.set_query_options)
+    query = self._create_beeswax_query(args)
     return self._execute_stmt(query)
 
   def do_describe(self, args):
     """Executes a DESCRIBE... query, fetching all rows"""
-    query = self.imp_client.create_beeswax_query("describe %s" % args,
-                                                 self.set_query_options)
+    # original command should be overridden because the server cannot
+    # recognize "desc" as a keyword. Thus, given command should be
+    # replaced with "describe" here.
+    self.orig_cmd = "describe"
+    query = self._create_beeswax_query(args)
     return self._execute_stmt(query)
 
   def do_desc(self, args):
     return self.do_describe(args)
 
-  def __do_dml(self, stmt, args):
+  def __do_dml(self, args):
     """Executes a DML query"""
-    query = self.imp_client.create_beeswax_query("%s %s" % (stmt, args),
-                                                 self.set_query_options)
+    query = self._create_beeswax_query(args)
     return self._execute_stmt(query, is_dml=True, print_web_link=True)
 
   def do_upsert(self, args):
-    return self.__do_dml("upsert", args)
+    return self.__do_dml(args)
 
   def do_update(self, args):
-    return self.__do_dml("update", args)
+    return self.__do_dml(args)
 
   def do_delete(self, args):
-    return self.__do_dml("delete", args)
+    return self.__do_dml(args)
 
   def do_insert(self, args):
-    return self.__do_dml("insert", args)
+    return self.__do_dml(args)
 
   def do_explain(self, args):
     """Explain the query execution plan"""
-    query = self.imp_client.create_beeswax_query("explain %s" % args,
-                                                 self.set_query_options)
+    query = self._create_beeswax_query(args)
     return self._execute_stmt(query)
 
   def do_history(self, args):
@@ -1338,6 +1435,21 @@ def execute_queries_non_interactive_mode(options, query_options):
           shell.execute_query_list(queries)):
     sys.exit(1)
 
+def get_intro(options):
+  """Get introduction message for start-up. The last character should not be a return."""
+  if not options.verbose:
+    return ""
+
+  intro = WELCOME_STRING
+
+  if not options.ssl and options.creds_ok_in_clear and options.use_ldap:
+    intro += ("\n\nLDAP authentication is enabled, but the connection to Impala is "
+              "not secured by TLS.\nALL PASSWORDS WILL BE SENT IN THE CLEAR TO IMPALA.")
+
+  if options.refresh_after_connect:
+    intro += '\n'.join(REFRESH_AFTER_CONNECT_DEPRECATION_WARNING)
+  return intro
+
 if __name__ == "__main__":
   """
   There are two types of options: shell options and query_options. Both can be set in the
@@ -1402,8 +1514,9 @@ if __name__ == "__main__":
     sys.exit(1)
 
   if options.use_kerberos:
-    print_to_stderr("Starting Impala Shell using Kerberos authentication")
-    print_to_stderr("Using service name '%s'" % options.kerberos_service_name)
+    if options.verbose:
+      print_to_stderr("Starting Impala Shell using Kerberos authentication")
+      print_to_stderr("Using service name '%s'" % options.kerberos_service_name)
     # Check if the user has a ticket in the credentials cache
     try:
       if call(['klist', '-s']) != 0:
@@ -1414,9 +1527,11 @@ if __name__ == "__main__":
       print_to_stderr('klist not found on the system, install kerberos clients')
       sys.exit(1)
   elif options.use_ldap:
-    print_to_stderr("Starting Impala Shell using LDAP-based authentication")
+    if options.verbose:
+      print_to_stderr("Starting Impala Shell using LDAP-based authentication")
   else:
-    print_to_stderr("Starting Impala Shell without Kerberos authentication")
+    if options.verbose:
+      print_to_stderr("Starting Impala Shell without Kerberos authentication")
 
   options.ldap_password = None
   if options.use_ldap and options.ldap_password_cmd:
@@ -1435,10 +1550,12 @@ if __name__ == "__main__":
 
   if options.ssl:
     if options.ca_cert is None:
-      print_to_stderr("SSL is enabled. Impala server certificates will NOT be verified"\
-                      " (set --ca_cert to change)")
+      if options.verbose:
+        print_to_stderr("SSL is enabled. Impala server certificates will NOT be verified"\
+                        " (set --ca_cert to change)")
     else:
-      print_to_stderr("SSL is enabled")
+      if options.verbose:
+        print_to_stderr("SSL is enabled")
 
   if options.output_file:
     try:
@@ -1463,13 +1580,7 @@ if __name__ == "__main__":
     execute_queries_non_interactive_mode(options, query_options)
     sys.exit(0)
 
-  intro = WELCOME_STRING
-  if not options.ssl and options.creds_ok_in_clear and options.use_ldap:
-    intro += ("\n\nLDAP authentication is enabled, but the connection to Impala is "
-              "not secured by TLS.\nALL PASSWORDS WILL BE SENT IN THE CLEAR TO IMPALA.\n")
-
-  if options.refresh_after_connect:
-    intro += REFRESH_AFTER_CONNECT_DEPRECATION_WARNING
+  intro = get_intro(options)
 
   shell = ImpalaShell(options, query_options)
   while shell.is_alive:

@@ -36,8 +36,11 @@ using boost::algorithm::token_compress_on;
 using boost::algorithm::split;
 using boost::algorithm::trim;
 using std::to_string;
+using beeswax::TQueryOptionLevel;
 using namespace impala;
 using namespace strings;
+
+DECLARE_int32(idle_session_timeout);
 
 // Utility method to wrap ParseUtil::ParseMemSpec() by returning a Status instead of an
 // int.
@@ -57,7 +60,7 @@ void impala::OverlayQueryOptions(const TQueryOptions& src, const QueryOptionsMas
     TQueryOptions* dst) {
   DCHECK_GT(mask.size(), _TImpalaQueryOptions_VALUES_TO_NAMES.size()) <<
       "Size of QueryOptionsMask must be increased.";
-#define QUERY_OPT_FN(NAME, ENUM)\
+#define QUERY_OPT_FN(NAME, ENUM, LEVEL)\
   if (src.__isset.NAME && mask[TImpalaQueryOptions::ENUM]) dst->__set_##NAME(src.NAME);
   QUERY_OPTS_TABLE
 #undef QUERY_OPT_FN
@@ -65,7 +68,7 @@ void impala::OverlayQueryOptions(const TQueryOptions& src, const QueryOptionsMas
 
 void impala::TQueryOptionsToMap(const TQueryOptions& query_options,
     map<string, string>* configuration) {
-#define QUERY_OPT_FN(NAME, ENUM)\
+#define QUERY_OPT_FN(NAME, ENUM, LEVEL)\
   {\
     if (query_options.__isset.NAME) { \
       stringstream val;\
@@ -83,7 +86,7 @@ void impala::TQueryOptionsToMap(const TQueryOptions& query_options,
 static void ResetQueryOption(const int option, TQueryOptions* query_options) {
   const static TQueryOptions defaults;
   switch (option) {
-#define QUERY_OPT_FN(NAME, ENUM)\
+#define QUERY_OPT_FN(NAME, ENUM, LEVEL)\
     case TImpalaQueryOptions::ENUM:\
       query_options->__isset.NAME = defaults.__isset.NAME;\
       query_options->NAME = defaults.NAME;\
@@ -93,11 +96,18 @@ static void ResetQueryOption(const int option, TQueryOptions* query_options) {
   }
 }
 
+static TQueryOptions DefaultQueryOptions() {
+  TQueryOptions defaults;
+  // default value of idle_session_timeout is set by a command line flag.
+  defaults.__set_idle_session_timeout(FLAGS_idle_session_timeout);
+  return defaults;
+}
+
 string impala::DebugQueryOptions(const TQueryOptions& query_options) {
-  const static TQueryOptions defaults;
+  const static TQueryOptions defaults = DefaultQueryOptions();
   int i = 0;
   stringstream ss;
-#define QUERY_OPT_FN(NAME, ENUM)\
+#define QUERY_OPT_FN(NAME, ENUM, LEVEL)\
   if (query_options.__isset.NAME &&\
       (!defaults.__isset.NAME || query_options.NAME != defaults.NAME)) {\
     if (i++ > 0) ss << ",";\
@@ -568,6 +578,18 @@ Status impala::SetQueryOption(const string& key, const string& value,
         query_options->__set_max_row_size(max_row_size_bytes);
         break;
       }
+      case TImpalaQueryOptions::IDLE_SESSION_TIMEOUT: {
+        StringParser::ParseResult result;
+        const int32_t requested_timeout =
+            StringParser::StringToInt<int32_t>(value.c_str(), value.length(), &result);
+        if (result != StringParser::PARSE_SUCCESS || requested_timeout < 0) {
+          return Status(
+              Substitute("Invalid idle session timeout: '$0'. "
+                         "Only positive numbers are allowed.", value));
+        }
+        query_options->__set_idle_session_timeout(requested_timeout);
+        break;
+      }
       default:
         // We hit this DCHECK(false) if we forgot to add the corresponding entry here
         // when we add a new query option.
@@ -606,4 +628,15 @@ Status impala::ParseQueryOptions(const string& options, TQueryOptions* query_opt
   }
   if (errorStatus.msg().details().size() > 0) return errorStatus;
   return Status::OK();
+}
+
+void impala::PopulateQueryOptionLevels(QueryOptionLevels* query_option_levels)
+{
+#define QUERY_OPT_FN(NAME, ENUM, LEVEL)\
+  {\
+    (*query_option_levels)[#ENUM] = LEVEL;\
+  }
+  QUERY_OPTS_TABLE
+  QUERY_OPT_FN(support_start_over, SUPPORT_START_OVER, TQueryOptionLevel::ADVANCED)
+#undef QUERY_OPT_FN
 }

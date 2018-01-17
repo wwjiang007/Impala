@@ -466,14 +466,17 @@ void RuntimeProfile::AddInfoString(const string& key, const string& value) {
   return AddInfoStringInternal(key, value, false);
 }
 
+void RuntimeProfile::AddInfoStringRedacted(const string& key, const string& value) {
+  return AddInfoStringInternal(key, value, false, true);
+}
+
 void RuntimeProfile::AppendInfoString(const string& key, const string& value) {
   return AddInfoStringInternal(key, value, true);
 }
 
 void RuntimeProfile::AddInfoStringInternal(
-    const string& key, const string& value, bool append) {
-  // Values may contain sensitive data, such as a query.
-  const string& info = RedactCopy(value);
+    const string& key, const string& value, bool append, bool redact) {
+  const string& info = redact ? RedactCopy(value): value;
   lock_guard<SpinLock> l(info_strings_lock_);
   InfoStrings::iterator it = info_strings_.find(key);
   if (it == info_strings_.end()) {
@@ -758,7 +761,9 @@ Status RuntimeProfile::SerializeToArchiveString(stringstream* out) const {
       MakeScopeExitTrigger([&compressor]() { compressor->Close(); });
 
   vector<uint8_t> compressed_buffer;
-  compressed_buffer.resize(compressor->MaxOutputLen(serialized_buffer.size()));
+  int64_t max_compressed_size = compressor->MaxOutputLen(serialized_buffer.size());
+  DCHECK_GT(max_compressed_size, 0);
+  compressed_buffer.resize(max_compressed_size);
   int64_t result_len = compressed_buffer.size();
   uint8_t* compressed_buffer_ptr = compressed_buffer.data();
   RETURN_IF_ERROR(compressor->ProcessBlock(true, serialized_buffer.size(),

@@ -94,11 +94,10 @@ struct FieldLocation {
 ///    the codegen'd function to use.
 /// This way, we only codegen once per scanner type, rather than once per scanner object.
 //
-/// This class also encapsulates row batch management.  Subclasses should call CommitRows()
-/// after writing to the current row batch, which handles creating row batches, attaching
-/// resources (buffers and mem pools) to the current row batch, and passing row batches
-/// up to the scan node. Subclasses can also use GetMemory() to help with per-row memory
-/// management.
+/// This class also encapsulates row batch management. Subclasses should call
+/// CommitRows() after writing to the current row batch, which handles creating row
+/// batches, releasing per-batch resources, and passing row batches up to the scan node.
+/// Subclasses can also use GetMemory() to help with per-row memory management.
 /// TODO: Have a pass over all members and move them out of the base class if sensible
 /// to clarify which state each concrete scanner type actually has.
 class HdfsScanner {
@@ -316,7 +315,6 @@ class HdfsScanner {
       Tuple** tuple_mem, TupleRow** tuple_row_mem, int64_t* num_rows) WARN_UNUSED_RESULT;
 
   /// Commits 'num_rows' to 'row_batch'. Advances 'tuple_mem_' and 'tuple_' accordingly.
-  /// Attaches completed resources from 'context_' to 'row_batch' if necessary.
   /// Frees expr result allocations. Returns non-OK if 'context_' is cancelled or the
   /// query status in 'state_' is non-OK.
   Status CommitRows(int num_rows, RowBatch* row_batch) WARN_UNUSED_RESULT;
@@ -328,8 +326,12 @@ class HdfsScanner {
     return ExecNode::EvalConjuncts(conjunct_evals_->data(), conjunct_evals_->size(), row);
   }
 
-  /// Sets 'num_tuples' template tuples in the batch that 'row' points to. Assumes the
-  /// 'tuple_row' only has a single tuple. Returns the number of tuples set.
+  /// Handles the case when there are no slots materialized (e.g. count(*)) by adding
+  /// up to 'num_tuples' rows to the row batch which 'row' points to. Assumes each tuple
+  /// row only has one tuple. Set the added tuples in the row batch with the template
+  /// tuple if it's not NULL. In the rare case when there are conjuncts, evaluate them
+  /// once for each row and only add a row when they evaluate to true. Returns the number
+  /// of tuple rows added.
   int WriteTemplateTuples(TupleRow* row, int num_tuples);
 
   /// Processes batches of fields and writes them out to tuple_row_mem.
@@ -424,7 +426,7 @@ class HdfsScanner {
   /// Initialize a tuple. Inlined into the convenience version below for codegen.
   void IR_ALWAYS_INLINE InitTuple(
       const TupleDescriptor* desc, Tuple* template_tuple, Tuple* tuple) {
-    if (has_template_tuple()) {
+    if (has_template_tuple(template_tuple)) {
       InitTupleFromTemplate(template_tuple, tuple, tuple_byte_size());
     } else {
       tuple->ClearNullBits(desc->null_bytes_offset(), desc->num_null_bytes());
@@ -477,9 +479,11 @@ class HdfsScanner {
   /// Not inlined in IR so it can be replaced with a constant.
   int IR_NO_INLINE tuple_byte_size() const { return tuple_byte_size_; }
 
-  /// Returns true iff there is a template tuple with partition key values.
+  /// Returns true iff 'template_tuple' is non-NULL.
   /// Not inlined in IR so it can be replaced with a constant.
-  bool IR_NO_INLINE has_template_tuple() const { return template_tuple_ != nullptr; }
+  static bool IR_NO_INLINE has_template_tuple(Tuple* template_tuple) {
+    return template_tuple != nullptr;
+  }
 
   inline Tuple* next_tuple(int tuple_byte_size, Tuple* t) const {
     uint8_t* mem = reinterpret_cast<uint8_t*>(t);

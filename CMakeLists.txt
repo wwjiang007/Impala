@@ -49,6 +49,8 @@ endif(NOT CMAKE_BUILD_TYPE)
 STRING (TOUPPER ${CMAKE_BUILD_TYPE} CMAKE_BUILD_TYPE)
 
 message(STATUS "Build type is ${CMAKE_BUILD_TYPE}")
+# Write the build type to a file so that tests can determine the current build type.
+file(WRITE "${CMAKE_SOURCE_DIR}/.cmake_build_type" ${CMAKE_BUILD_TYPE})
 
 set(ENABLE_CODE_COVERAGE false)
 if ("${CMAKE_BUILD_TYPE}" STREQUAL "CODE_COVERAGE_DEBUG")
@@ -354,6 +356,7 @@ add_subdirectory(common/yarn-extras)
 add_subdirectory(common/protobuf)
 add_subdirectory(be)
 add_subdirectory(fe)
+add_subdirectory(impala-parent)
 add_subdirectory(ext-data-source)
 
 # Build target for all generated files which most backend code depends on
@@ -365,7 +368,7 @@ add_custom_target(shell_tarball DEPENDS gen-deps
   COMMAND "${CMAKE_SOURCE_DIR}/shell/make_shell_tarball.sh"
 )
 
-add_custom_target(cscope ALL
+add_custom_target(cscope ALL DEPENDS gen-deps
   COMMAND "${CMAKE_SOURCE_DIR}/bin/gen-cscope.sh"
 )
 

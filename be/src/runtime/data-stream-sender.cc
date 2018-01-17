@@ -275,7 +275,8 @@ Status DataStreamSender::Channel::SendCurrentBatch() {
 Status DataStreamSender::Channel::GetSendStatus() {
   WaitForRpc();
   if (!rpc_status_.ok()) {
-    LOG(ERROR) << "channel send status: " << rpc_status_.GetDetail();
+    LOG(ERROR) << "channel send to " << TNetworkAddressToString(address_) << " failed: "
+               << rpc_status_.GetDetail();
   }
   return rpc_status_;
 }
@@ -311,9 +312,9 @@ Status DataStreamSender::Channel::FlushAndSendEos(RuntimeState* state) {
   VLOG_RPC << "calling TransmitData(eos=true) to terminate channel.";
   rpc_status_ = DoTransmitDataRpc(&client, params, &res);
   if (!rpc_status_.ok()) {
-    return Status(rpc_status_.code(),
-       Substitute("TransmitData(eos=true) to $0 failed:\n $1",
-        TNetworkAddressToString(address_), rpc_status_.msg().msg()));
+    LOG(ERROR) << "Failed to send EOS to " << TNetworkAddressToString(address_)
+               << " : " << rpc_status_.GetDetail();
+    return rpc_status_;
   }
   return Status(res.status);
 }
@@ -327,8 +328,9 @@ void DataStreamSender::Channel::Teardown(RuntimeState* state) {
 
 DataStreamSender::DataStreamSender(int sender_id, const RowDescriptor* row_desc,
     const TDataStreamSink& sink, const vector<TPlanFragmentDestination>& destinations,
-    int per_channel_buffer_size)
-  : DataSink(row_desc),
+    int per_channel_buffer_size, RuntimeState* state)
+  : DataSink(row_desc,
+        Substitute("DataStreamSender (dst_id=$0)", sink.dest_node_id), state),
     sender_id_(sender_id),
     partition_type_(sink.output_partition.type),
     current_channel_idx_(0),
@@ -360,10 +362,6 @@ DataStreamSender::DataStreamSender(int sender_id, const RowDescriptor* row_desc,
     srand(reinterpret_cast<uint64_t>(this));
     random_shuffle(channels_.begin(), channels_.end());
   }
-}
-
-string DataStreamSender::GetName() {
-  return Substitute("DataStreamSender (dst_id=$0)", dest_node_id_);
 }
 
 DataStreamSender::~DataStreamSender() {

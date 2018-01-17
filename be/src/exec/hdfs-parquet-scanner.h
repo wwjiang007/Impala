@@ -188,7 +188,7 @@ class BoolColumnReader;
 ///   0), but we don't distinguish between these two cases yet.
 ///   TODO: fix this (IMPALA-2272)
 ///
-///   The column readers that materialize this structure form a tree analagous to the
+///   The column readers that materialize this structure form a tree analogous to the
 ///   materialized output:
 ///     CollectionColumnReader slot_id=0 node="repeated group list (d=2 r=1)"
 ///       CollectionColumnReader slot_id=1 node="repeated group list (d=4 r=2)"
@@ -442,7 +442,7 @@ class HdfsParquetScanner : public HdfsScanner {
   ParquetFileVersion file_version_;
 
   /// Scan range for the metadata.
-  const DiskIoMgr::ScanRange* metadata_range_;
+  const io::ScanRange* metadata_range_;
 
   /// Pool to copy dictionary page buffer into. This pool is shared across all the
   /// pages in a column chunk.
@@ -585,7 +585,7 @@ class HdfsParquetScanner : public HdfsScanner {
 
   /// Find and return the last split in the file if it is assigned to this scan node.
   /// Returns NULL otherwise.
-  static DiskIoMgr::ScanRange* FindFooterSplit(HdfsFileDesc* file);
+  static io::ScanRange* FindFooterSplit(HdfsFileDesc* file);
 
   /// Process the file footer and parse file_metadata_.  This should be called with the
   /// last FOOTER_SIZE bytes in context_.
@@ -641,6 +641,11 @@ class HdfsParquetScanner : public HdfsScanner {
   /// from mem pools to the given row batch. Closes all column readers.
   /// Should be called after completing a row group and when returning the last batch.
   void FlushRowGroupResources(RowBatch* row_batch);
+
+  /// Releases resources associated with a row group that was skipped and closes all
+  /// column readers. Should be called after skipping a row group from which no rows
+  /// were returned.
+  void ReleaseSkippedRowGroupResources();
 
   /// Evaluates whether the column reader is eligible for dictionary predicates
   bool IsDictFilterable(ParquetColumnReader* col_reader);

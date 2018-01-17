@@ -37,12 +37,14 @@
 #include "runtime/coordinator-backend-state.h"
 #include "runtime/debug-options.h"
 #include "runtime/query-state.h"
+#include "scheduling/admission-controller.h"
 #include "scheduling/scheduler.h"
 #include "util/bloom-filter.h"
 #include "util/counting-barrier.h"
 #include "util/hdfs-bulk-ops.h"
 #include "util/hdfs-util.h"
 #include "util/histogram-metric.h"
+#include "util/min-max-filter.h"
 #include "util/table-printer.h"
 
 #include "common/names.h"
@@ -79,6 +81,9 @@ Coordinator::Coordinator(
 Coordinator::~Coordinator() {
   DCHECK(released_exec_resources_)
       << "ReleaseExecResources() must be called before Coordinator is destroyed";
+  DCHECK(released_admission_control_resources_)
+      << "ReleaseAdmissionControlResources() must be called before Coordinator is "
+      << "destroyed";
   if (query_state_ != nullptr) {
     ExecEnv::GetInstance()->query_exec_mgr()->ReleaseQueryState(query_state_);
   }
@@ -95,9 +100,6 @@ Status Coordinator::Exec() {
              << " stmt=" << request.query_ctx.client_request.stmt;
   stmt_type_ = request.stmt_type;
   query_ctx_ = request.query_ctx;
-  // set descriptor table here globally
-  // TODO: remove TQueryExecRequest.desc_tbl
-  query_ctx_.__set_desc_tbl(request.desc_tbl);
   query_ctx_.__set_request_pool(schedule_.request_pool());
 
   query_profile_ =
@@ -324,7 +326,7 @@ void Coordinator::InitFilterRoutingTable() {
           f->src_fragment_instance_idxs()->insert(src_idxs.begin(), src_idxs.end());
 
         // target plan node of filter
-        } else if (plan_node.__isset.hdfs_scan_node) {
+        } else if (plan_node.__isset.hdfs_scan_node || plan_node.__isset.kudu_scan_node) {
           auto it = filter.planid_to_target_ndx.find(plan_node.node_id);
           DCHECK(it != filter.planid_to_target_ndx.end());
           const TRuntimeFilterTargetDesc& t_target = filter.targets[it->second];
@@ -556,14 +558,9 @@ Status Coordinator::FinalizeSuccessfulInsert() {
   // INSERT finalization happens in the five following steps
   // 1. If OVERWRITE, remove all the files in the target directory
   // 2. Create all the necessary partition directories.
-  DescriptorTbl* descriptor_table;
-  // TODO: add DescriptorTbl::CreateTableDescriptor() so we can create a
-  // descriptor for just the output table, calling Create() can be very
-  // expensive.
-  RETURN_IF_ERROR(
-      DescriptorTbl::Create(obj_pool(), query_ctx_.desc_tbl, &descriptor_table));
-  HdfsTableDescriptor* hdfs_table = static_cast<HdfsTableDescriptor*>(
-      descriptor_table->GetTableDescriptor(finalize_params_.table_id));
+  HdfsTableDescriptor* hdfs_table;
+  RETURN_IF_ERROR(DescriptorTbl::CreateHdfsTblDescriptor(query_ctx_.desc_tbl,
+      finalize_params_.table_id, obj_pool(), &hdfs_table));
   DCHECK(hdfs_table != nullptr)
       << "INSERT target table not known in descriptor table: "
       << finalize_params_.table_id;
@@ -671,9 +668,8 @@ Status Coordinator::FinalizeSuccessfulInsert() {
     }
   }
 
-  // Release resources on the descriptor table.
-  descriptor_table->ReleaseResources();
-  descriptor_table = nullptr;
+  // We're done with the HDFS descriptor - free up its resources.
+  hdfs_table->ReleaseResources();
   hdfs_table = nullptr;
 
   {
@@ -829,15 +825,16 @@ Status Coordinator::Wait() {
   // Execution of query fragments has finished. We don't need to hold onto query execution
   // resources while we finalize the query.
   ReleaseExecResources();
-
   // Query finalization is required only for HDFS table sinks
   if (needs_finalization_) RETURN_IF_ERROR(FinalizeQuery());
+  // Release admission control resources after we'd done the potentially heavyweight
+  // finalization.
+  ReleaseAdmissionControlResources();
 
   query_profile_->AddInfoString(
       "DML Stats", DataSink::OutputDmlStats(per_partition_status_, "\n"));
   // For DML queries, when Wait is done, the query is complete.
   ComputeQuerySummary();
-
   return status;
 }
 
@@ -868,10 +865,11 @@ Status Coordinator::GetNext(QueryResultSet* results, int max_rows, bool* eos) {
     returned_all_results_ = true;
     // release query execution resources here, since we won't be fetching more result rows
     ReleaseExecResources();
-
     // wait for all backends to complete before computing the summary
     // TODO: relocate this so GetNext() won't have to wait for backends to complete?
     RETURN_IF_ERROR(WaitForBackendCompletion());
+    // Release admission control resources after backends are finished.
+    ReleaseAdmissionControlResources();
     // if the query completed successfully, compute the summary
     if (query_status_.ok()) ComputeQuerySummary();
   }
@@ -910,7 +908,7 @@ void Coordinator::CancelInternal() {
   backend_completion_cv_.NotifyAll();
 
   ReleaseExecResourcesLocked();
-
+  ReleaseAdmissionControlResourcesLocked();
   // Report the summary with whatever progress the query made before being cancelled.
   ComputeQuerySummary();
 }
@@ -1082,6 +1080,21 @@ void Coordinator::ReleaseExecResourcesLocked() {
   // caching. The query MemTracker will be cleaned up later.
 }
 
+void Coordinator::ReleaseAdmissionControlResources() {
+  lock_guard<mutex> l(lock_);
+  ReleaseAdmissionControlResourcesLocked();
+}
+
+void Coordinator::ReleaseAdmissionControlResourcesLocked() {
+  if (released_admission_control_resources_) return;
+  LOG(INFO) << "Release admssion control resources for query "
+            << PrintId(query_ctx_.query_id);
+  AdmissionController* admission_controller =
+      ExecEnv::GetInstance()->admission_controller();
+  if (admission_controller != nullptr) admission_controller->ReleaseQuery(schedule_);
+  released_admission_control_resources_ = true;
+}
+
 void Coordinator::UpdateFilter(const TUpdateFilterParams& params) {
   DCHECK_NE(filter_mode_, TRuntimeFilterMode::OFF)
       << "UpdateFilter() called although runtime filters are disabled";
@@ -1134,16 +1147,23 @@ void Coordinator::UpdateFilter(const TUpdateFilterParams& params) {
       target_fragment_idxs.insert(target.fragment_idx);
     }
 
-    // Assign outgoing bloom filter.
-    TBloomFilter& aggregated_filter = state->bloom_filter();
-    filter_mem_tracker_->Release(aggregated_filter.directory.size());
+    if (state->is_bloom_filter()) {
+      // Assign outgoing bloom filter.
+      TBloomFilter& aggregated_filter = state->bloom_filter();
+      filter_mem_tracker_->Release(aggregated_filter.directory.size());
 
-    // TODO: Track memory used by 'rpc_params'.
-    swap(rpc_params.bloom_filter, aggregated_filter);
-    DCHECK(rpc_params.bloom_filter.always_false || rpc_params.bloom_filter.always_true ||
-        !rpc_params.bloom_filter.directory.empty());
-    DCHECK(aggregated_filter.directory.empty());
-    rpc_params.__isset.bloom_filter = true;
+      // TODO: Track memory used by 'rpc_params'.
+      swap(rpc_params.bloom_filter, aggregated_filter);
+      DCHECK(rpc_params.bloom_filter.always_false || rpc_params.bloom_filter.always_true
+          || !rpc_params.bloom_filter.directory.empty());
+      DCHECK(aggregated_filter.directory.empty());
+      rpc_params.__isset.bloom_filter = true;
+    } else {
+      DCHECK(state->is_min_max_filter());
+      MinMaxFilter::Copy(state->min_max_filter(), &rpc_params.min_max_filter);
+      rpc_params.__isset.min_max_filter = true;
+    }
+
     // Filter is complete, and can be released.
     state->Disable(filter_mem_tracker_);
   }
@@ -1169,27 +1189,40 @@ void Coordinator::FilterState::ApplyUpdate(const TUpdateFilterParams& params,
   }
 
   --pending_count_;
-  if (params.bloom_filter.always_true) {
-    Disable(coord->filter_mem_tracker_);
-  } else if (bloom_filter_.always_false) {
-    int64_t heap_space = params.bloom_filter.directory.size();
-    if (!coord->filter_mem_tracker_->TryConsume(heap_space)) {
-      VLOG_QUERY << "Not enough memory to allocate filter: "
-                 << PrettyPrinter::Print(heap_space, TUnit::BYTES)
-                 << " (query: " << coord->query_id() << ")";
-      // Disable, as one missing update means a correct filter cannot be produced.
+  if (is_bloom_filter()) {
+    DCHECK(params.__isset.bloom_filter);
+    if (params.bloom_filter.always_true) {
       Disable(coord->filter_mem_tracker_);
+    } else if (bloom_filter_.always_false) {
+      int64_t heap_space = params.bloom_filter.directory.size();
+      if (!coord->filter_mem_tracker_->TryConsume(heap_space)) {
+        VLOG_QUERY << "Not enough memory to allocate filter: "
+                   << PrettyPrinter::Print(heap_space, TUnit::BYTES)
+                   << " (query: " << coord->query_id() << ")";
+        // Disable, as one missing update means a correct filter cannot be produced.
+        Disable(coord->filter_mem_tracker_);
+      } else {
+        // Workaround for fact that parameters are const& for Thrift RPCs - yet we want to
+        // move the payload from the request rather than copy it and take double the
+        // memory cost. After this point, params.bloom_filter is an empty filter and
+        // should not be read.
+        TBloomFilter* non_const_filter = &const_cast<TBloomFilter&>(params.bloom_filter);
+        swap(bloom_filter_, *non_const_filter);
+        DCHECK_EQ(non_const_filter->directory.size(), 0);
+      }
     } else {
-      // Workaround for fact that parameters are const& for Thrift RPCs - yet we want to
-      // move the payload from the request rather than copy it and take double the memory
-      // cost. After this point, params.bloom_filter is an empty filter and should not be
-      // read.
-      TBloomFilter* non_const_filter = &const_cast<TBloomFilter&>(params.bloom_filter);
-      swap(bloom_filter_, *non_const_filter);
-      DCHECK_EQ(non_const_filter->directory.size(), 0);
+      BloomFilter::Or(params.bloom_filter, &bloom_filter_);
     }
   } else {
-    BloomFilter::Or(params.bloom_filter, &bloom_filter_);
+    DCHECK(is_min_max_filter());
+    DCHECK(params.__isset.min_max_filter);
+    if (params.min_max_filter.always_true) {
+      Disable(coord->filter_mem_tracker_);
+    } else if (min_max_filter_.always_false) {
+      MinMaxFilter::Copy(params.min_max_filter, &min_max_filter_);
+    } else {
+      MinMaxFilter::Or(params.min_max_filter, &min_max_filter_);
+    }
   }
 
   if (pending_count_ == 0 || disabled()) {
@@ -1198,11 +1231,17 @@ void Coordinator::FilterState::ApplyUpdate(const TUpdateFilterParams& params,
 }
 
 void Coordinator::FilterState::Disable(MemTracker* tracker) {
-  bloom_filter_.always_true = true;
-  bloom_filter_.always_false = false;
-  tracker->Release(bloom_filter_.directory.size());
-  bloom_filter_.directory.clear();
-  bloom_filter_.directory.shrink_to_fit();
+  if (is_bloom_filter()) {
+    bloom_filter_.always_true = true;
+    bloom_filter_.always_false = false;
+    tracker->Release(bloom_filter_.directory.size());
+    bloom_filter_.directory.clear();
+    bloom_filter_.directory.shrink_to_fit();
+  } else {
+    DCHECK(is_min_max_filter());
+    min_max_filter_.always_true = true;
+    min_max_filter_.always_false = false;
+  }
 }
 
 const TUniqueId& Coordinator::query_id() const {
